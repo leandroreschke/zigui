@@ -1,0 +1,18 @@
+.{
+    .name = .zigui,
+    .version = "0.1.0",
+    .fingerprint = 0x18d03e105668001c,
+    .minimum_zig_version = "0.17.0-dev.1745+ac8a8d0c5",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "README.md",
+        "docs",
+        "examples",
+        "shaders",
+        "src",
+        "tests",
+        "tools",
+    },
+}
