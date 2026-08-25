@@ -1844,7 +1844,8 @@ fn handleXdgSurface(self: *Context, object: client_mod.Object, opcode: u16, read
     const first = !native.configured;
     const changed = size.width != native.logical_size.width or size.height != native.logical_size.height;
     const frame_requested = native.visible and native.frame_wanted and native.frame_callback == null;
-    const event_count: usize = @intFromBool(first or changed) + @intFromBool(frame_requested);
+    const event_count = @as(usize, @intFromBool(first or changed)) +
+        @as(usize, @intFromBool(frame_requested));
     try self.preparePendingSlots(event_count);
     try protocol.xdgSurfaceAckConfigure(&self.client.connection, native.xdg_surface, serial);
     native.pending_size = null;

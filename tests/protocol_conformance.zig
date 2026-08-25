@@ -3,6 +3,7 @@ const ui = @import("zigui");
 const wayland = ui.internal_protocol_test.wayland_wire;
 const dbus = ui.internal_protocol_test.dbus_wire;
 const x11 = ui.internal_protocol_test.x11_wire;
+const x11_protocol = ui.internal_protocol_test.x11_protocol;
 
 const testing = std.testing;
 
@@ -82,4 +83,20 @@ test "X11 request construction is bounded before allocation" {
 test "X11 readers reject hostile cursors without arithmetic traps" {
     var reader: x11.Reader = .{ .bytes = &.{}, .cursor = std.math.maxInt(usize) };
     try testing.expectError(error.PlatformFailure, reader.u32());
+}
+
+test "X11 PresentPixmap request has the fixed Present 1.4 wire size" {
+    var writer = x11.Writer.init(testing.allocator);
+    defer writer.deinit();
+    const request = try x11_protocol.buildPresentPixmap(&writer, .{
+        .present = true,
+        .opcode = 146,
+        .first_event = 0,
+        .first_error = 0,
+    }, 0x100, 0x200, 7);
+
+    try testing.expectEqual(@as(usize, 72), request.len);
+    try testing.expectEqual(@as(u8, 146), request[0]);
+    try testing.expectEqual(@as(u8, 1), request[1]);
+    try testing.expectEqual(@as(u16, 18), try x11.readU16(request, 2));
 }

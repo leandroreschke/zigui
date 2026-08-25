@@ -255,7 +255,7 @@ fn buildSampledFragment(allocator: std.mem.Allocator, monochrome: bool) Error![]
     try builder.decorate(output_color, spv.Decoration.location, &.{0});
 
     const function = try builder.id();
-    try builder.entryPoint(spv.ExecutionModel.fragment, function, "main", &.{ input_color, input_uv, output_color });
+    try builder.entryPoint(spv.ExecutionModel.fragment, function, "main", &.{ image_variable, input_color, input_uv, output_color });
     try builder.executionMode(function, spv.ExecutionMode.origin_upper_left, &.{});
     const label = try builder.id();
     const sampled_image = try builder.id();

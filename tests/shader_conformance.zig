@@ -93,6 +93,10 @@ fn validateSpirv(words: []const u32, expected_model: u32) !void {
     var entry_points: usize = 0;
     var functions: usize = 0;
     var function_ends: usize = 0;
+    var global_variables: [64]u32 = undefined;
+    var global_variable_count: usize = 0;
+    var entry_interfaces: [64]u32 = undefined;
+    var entry_interface_count: usize = 0;
     while (cursor < words.len) {
         const word_count: usize = words[cursor] >> 16;
         const opcode: u16 = @truncate(words[cursor]);
@@ -102,11 +106,35 @@ fn validateSpirv(words: []const u32, expected_model: u32) !void {
             15 => {
                 try testing.expect(word_count >= 4);
                 try testing.expectEqual(expected_model, words[cursor + 1]);
+                var interface_start = cursor + 3;
+                while (interface_start < cursor + word_count) : (interface_start += 1) {
+                    const value = words[interface_start];
+                    if ((value & 0xff) == 0 or (value & 0xff00) == 0 or
+                        (value & 0xff0000) == 0 or (value & 0xff000000) == 0)
+                    {
+                        interface_start += 1;
+                        break;
+                    }
+                }
+                for (words[interface_start .. cursor + word_count]) |interface_id| {
+                    try testing.expect(entry_interface_count < entry_interfaces.len);
+                    entry_interfaces[entry_interface_count] = interface_id;
+                    entry_interface_count += 1;
+                }
                 entry_points += 1;
             },
             17 => capabilities += 1,
             54 => functions += 1,
             56 => function_ends += 1,
+            59 => {
+                try testing.expect(word_count >= 4);
+                const storage_class = words[cursor + 3];
+                if (storage_class != 7) {
+                    try testing.expect(global_variable_count < global_variables.len);
+                    global_variables[global_variable_count] = words[cursor + 2];
+                    global_variable_count += 1;
+                }
+            },
             else => {},
         }
         cursor += word_count;
@@ -117,6 +145,8 @@ fn validateSpirv(words: []const u32, expected_model: u32) !void {
     try testing.expectEqual(@as(usize, 1), entry_points);
     try testing.expect(functions >= 1);
     try testing.expectEqual(functions, function_ends);
+    for (global_variables[0..global_variable_count]) |variable_id|
+        try testing.expect(std.mem.indexOfScalar(u32, entry_interfaces[0..entry_interface_count], variable_id) != null);
 }
 
 fn normalize(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
