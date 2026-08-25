@@ -6,6 +6,7 @@
 //! scanner reads only enough OpenType metadata to build a lazy catalog.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Error = @import("../core/error.zig").Error;
 const api = @import("api.zig");
 const in_tree = @import("in_tree_backend.zig");
@@ -187,7 +188,9 @@ fn loadFile(_: ?*anyopaque, allocator: std.mem.Allocator, path: []const u8, maxi
     var mapping = file.createMemoryMap(io, .{
         .len = size,
         .protection = .{ .read = true, .write = false },
-        .populate = false,
+        // Zig 0.17's Windows NtCreateSection path otherwise supplies no
+        // section allocation attribute and fails with INVALID_PARAMETER_6.
+        .populate = builtin.os.tag == .windows,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.TextUnavailable,
@@ -208,6 +211,23 @@ fn deinitMappedSource(context: ?*anyopaque, allocator: std.mem.Allocator, _: []c
     state.mapping.destroy(state.io);
     state.file.close(state.io);
     allocator.destroy(state);
+}
+
+test "bounded font source maps a real file" {
+    const testing = std.testing;
+    const io = testing.io;
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(io, .{ .sub_path = "font.bin", .data = "font-map-regression" });
+
+    var directory_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const directory_path_length = try temporary.dir.realPath(io, &directory_path_buffer);
+    const path = try std.Io.Dir.path.join(testing.allocator, &.{ directory_path_buffer[0..directory_path_length], "font.bin" });
+    defer testing.allocator.free(path);
+
+    var source = try loadFile(null, testing.allocator, path, 1024);
+    defer source.deinit(testing.allocator);
+    try testing.expectEqualStrings("font-map-regression", source.bytes);
 }
 
 fn isFontPath(name: []const u8) bool {

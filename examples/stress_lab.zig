@@ -291,7 +291,13 @@ pub fn main() !void {
     var allocation_metrics: ui.core.metrics.Counters = .{};
     var tracked = ui.core.TrackedAllocator.init(general.allocator(), &allocation_metrics, null);
     const allocator = tracked.allocator();
-    const app = try ui.App.create(allocator, .{ .application_name = "ZigUI Stress Lab" });
+    const app = try ui.App.create(allocator, .{
+        .application_name = "ZigUI Stress Lab",
+        // The proof deliberately combines a 2,048-node retained wall with
+        // 10,000 paint-only quads in one frame. Keep that workload bounded,
+        // but give its per-window scratch arena an explicit stress budget.
+        .memory = .{ .frame_arena_bytes = 32 * 1024 * 1024 },
+    });
     var model = Model.init(app, &tracked);
     model.repairPointers();
     defer app.destroy() catch {};

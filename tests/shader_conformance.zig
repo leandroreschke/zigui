@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const ui = @import("zigui");
 const vulkan_shaders = ui.internal_shader_test.vulkan_shaders;
@@ -40,6 +41,74 @@ test "native shader sources expose every renderer entry point" {
     }
     try testing.expect(std.mem.indexOf(u8, metal_source, "present_vertex") != null);
     try testing.expect(std.mem.indexOf(u8, metal_source, "present_fragment") != null);
+    try testing.expect(std.mem.indexOf(u8, hlsl_source, "vertex_id == 1 || vertex_id == 3") != null);
+}
+
+test "Windows D3D compiler accepts every HLSL renderer entry point" {
+    if (builtin.os.tag != .windows) return;
+
+    var compiler = try ui.internal_shader_test.d3d11_compiler.Compiler.load();
+    defer compiler.deinit();
+    const entries = [_]struct { name: [*:0]const u8, target: [*:0]const u8 }{
+        .{ .name = "quad_vertex", .target = "vs_5_0" },
+        .{ .name = "quad_fragment", .target = "ps_5_0" },
+        .{ .name = "shadow_vertex", .target = "vs_5_0" },
+        .{ .name = "shadow_fragment", .target = "ps_5_0" },
+        .{ .name = "sprite_vertex", .target = "vs_5_0" },
+        .{ .name = "mono_sprite_fragment", .target = "ps_5_0" },
+        .{ .name = "color_sprite_fragment", .target = "ps_5_0" },
+        .{ .name = "external_surface_vertex", .target = "vs_5_0" },
+        .{ .name = "external_surface_fragment", .target = "ps_5_0" },
+        .{ .name = "underline_vertex", .target = "vs_5_0" },
+        .{ .name = "underline_fragment", .target = "ps_5_0" },
+        .{ .name = "path_vertex", .target = "vs_5_0" },
+        .{ .name = "path_fragment", .target = "ps_5_0" },
+        .{ .name = "composite_vertex", .target = "vs_5_0" },
+        .{ .name = "composite_fragment", .target = "ps_5_0" },
+    };
+    for (entries) |entry| {
+        var bytecode = try compiler.compile(hlsl_source, entry.name, entry.target);
+        defer bytecode.deinit();
+        try testing.expect(bytecode.bytes().len != 0);
+    }
+}
+
+test "Windows D3D renderer covers a complete triangle-strip quad" {
+    if (builtin.os.tag != .windows) return;
+
+    var provider_context: u8 = 0;
+    const renderer = try ui.internal_shader_test.d3d11_renderer.Renderer.create(
+        testing.allocator,
+        ui.internal_shader_test.d3d11NullSurfaceProvider(&provider_context),
+        .{},
+        .{},
+    );
+    defer renderer.deinit();
+
+    var scene = ui.scene.Scene.init(testing.allocator);
+    defer scene.deinit();
+    var builder = ui.scene.Builder.init(&scene, .{});
+    defer builder.deinit();
+    try builder.quad(.{
+        .bounds = ui.Rect.fromXYWH(0, 0, 4, 4),
+        .background = ui.Color.white,
+        .border_color = .transparent,
+        .border_widths = .{},
+        .radii = .{},
+    }, null);
+    try builder.finish();
+
+    var readback = (try renderer.renderOffscreen(.{
+        .width = 4,
+        .height = 4,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8,
+    }, scene.view(), testing.allocator)).?;
+    defer readback.deinit(testing.allocator);
+    for ([_][2]usize{ .{ 0, 0 }, .{ 3, 0 }, .{ 0, 3 }, .{ 3, 3 } }) |coordinate| {
+        const offset = coordinate[1] * readback.stride + coordinate[0] * 4;
+        try testing.expect(readback.pixels[offset + 3] >= 120);
+    }
 }
 
 test "native shader record declarations match the fixed Zig scene ABI" {
@@ -66,7 +135,7 @@ test "native shader record declarations match the fixed Zig scene ABI" {
         declarations[0],
         declarations[1],
         declarations[2],
-        "structSprite{Rectbounds;Rectuv_bounds;Colorcolor;uint2texture;uinttile_generation;uintformat;};",
+        "structSprite{Rectbounds;Rectuv_bounds;Colorcolor;uint2texture_id;uinttile_generation;uintformat;};",
         "structExternalSurface{Rectbounds;Rectuv_bounds;uint2surface;uintgeneration;uintcolor_space;floatopacity;floatreserved;};",
         declarations[5],
         "structGradientStop{floatoffset;float3reserved;Colorcolor;};",

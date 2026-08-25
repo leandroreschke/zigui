@@ -144,6 +144,17 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run the complete ZigUI test suite");
     test_step.dependOn(&run_unit_tests.step);
+    if (target.result.os.tag == .windows and platform == .windows and renderer == .d3d11) {
+        const windows_native = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/windows_native.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "zigui", .module = zigui }},
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(windows_native).step);
+    }
 
     // Conformance always uses the deterministic headless/null pair regardless
     // of the host selected above. This keeps shared contracts runnable on CI
@@ -166,6 +177,9 @@ pub fn build(b: *std.Build) void {
             .name = "zigui_options",
             .module = conformance_options.createModule(),
         }},
+    });
+    conformance_zigui.addAnonymousImport("zigui_hlsl_source", .{
+        .root_source_file = b.path("shaders/d3d11/zigui.hlsl"),
     });
     const conformance = b.addTest(.{
         .root_module = b.createModule(.{
