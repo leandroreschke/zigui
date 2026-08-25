@@ -277,8 +277,8 @@ pub const Store = struct {
     const Undo = union(enum) {
         created: handles.NodeId,
         retired: handles.NodeId,
-        fields: FieldUndo,
-        children: ChildrenUndo,
+        fields: *FieldUndo,
+        children: *ChildrenUndo,
     };
 
     const ReconcileTransaction = struct {
@@ -298,6 +298,20 @@ pub const Store = struct {
             try self.undo.append(self.scratch, undo);
         }
 
+        fn recordFields(self: *ReconcileTransaction, fields: FieldUndo) std.mem.Allocator.Error!void {
+            const owned = try self.scratch.create(FieldUndo);
+            errdefer self.scratch.destroy(owned);
+            owned.* = fields;
+            try self.record(.{ .fields = owned });
+        }
+
+        fn recordChildren(self: *ReconcileTransaction, children: ChildrenUndo) std.mem.Allocator.Error!void {
+            const owned = try self.scratch.create(ChildrenUndo);
+            errdefer self.scratch.destroy(owned);
+            owned.* = children;
+            try self.record(.{ .children = owned });
+        }
+
         fn rollback(self: *ReconcileTransaction, store: *Store) void {
             var index = self.undo.items.len;
             while (index != 0) {
@@ -305,7 +319,10 @@ pub const Store = struct {
                 switch (self.undo.items[index]) {
                     .created => |id| store.destroyTree(id),
                     .retired => {},
-                    .fields => |fields| rollbackFields(store, fields),
+                    .fields => |fields| {
+                        rollbackFields(store, fields.*);
+                        self.scratch.destroy(fields);
+                    },
                     .children => |children| {
                         var old_children = children.children;
                         if (store.get(children.id)) |node_record| {
@@ -317,6 +334,7 @@ pub const Store = struct {
                             old_children.deinit(store.allocator);
                             store.releaseOwned(children.old_bytes);
                         }
+                        self.scratch.destroy(children);
                     },
                 }
             }
@@ -328,14 +346,16 @@ pub const Store = struct {
                 .created => {},
                 .retired => |id| store.destroyTree(id),
                 .fields => |fields| {
-                    deinitOldFields(store.allocator, fields);
+                    deinitOldFields(store.allocator, fields.*);
                     store.releaseOwned(fields.old_allocation_bytes);
+                    self.scratch.destroy(fields);
                 },
                 .children => |children| {
                     var old_children = children.children;
                     old_children.deinit(store.allocator);
                     store.releaseOwned(children.old_bytes);
                     for (children.stale) |id| store.destroyTree(id);
+                    self.scratch.destroy(children);
                 },
             };
             self.undo.clearRetainingCapacity();
@@ -569,13 +589,13 @@ pub const Store = struct {
             .items = replacement_items,
             .capacity = replacement_items.len,
         };
-        transaction.record(.{ .children = .{
+        transaction.recordChildren(.{
             .id = id,
             .children = refreshed.children,
             .stale = stale,
             .old_bytes = refreshed.children_bytes,
             .new_bytes = replacement_bytes,
-        } }) catch |err| {
+        }) catch |err| {
             replacement.deinit(self.allocator);
             return err;
         };
@@ -757,7 +777,7 @@ pub const Store = struct {
         if (!kind_changed and !style_changed and !semantics_changed and !handlers_changed and
             !action_handlers_changed and record.parent.eql(parent) and record.component.eql(component)) return;
 
-        try transaction.record(.{ .fields = .{
+        try transaction.recordFields(.{
             .id = id,
             .parent = record.parent,
             .component = record.component,
@@ -773,7 +793,7 @@ pub const Store = struct {
             .old_record_bytes = record.owned_bytes,
             .old_allocation_bytes = old_allocation_bytes,
             .new_allocation_bytes = new_allocation_bytes,
-        } });
+        });
 
         if (next_kind) |value| {
             record.kind = value;

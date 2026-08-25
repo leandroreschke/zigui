@@ -110,7 +110,7 @@ pub const Engine = struct {
 
         if (!validLayoutSize(intrinsic)) return error.InvalidLayout;
         if (intrinsic_baseline) |baseline| {
-            if (!std.math.isFinite(baseline) or baseline < 0 or baseline > intrinsic.height)
+            if (!std.math.isFinite(baseline) or baseline < 0)
                 return error.InvalidLayout;
         }
 

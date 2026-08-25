@@ -76,6 +76,27 @@ const WindowCompositionProbe = struct {
     }
 };
 
+const LargeInitialTree = struct {
+    pub fn build(_: *LargeInitialTree, ctx: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
+        const children = try ctx.allocator.alloc(ui.NodeSpec, 2_048);
+        for (children) |*child| child.* = .{ .kind = .spacer };
+        return .{ .children = children };
+    }
+};
+
+test "initial reconciliation keeps compact undo entries within the default frame arena" {
+    const app = try ui.App.create(testing.allocator, .{
+        .application_name = "large initial reconciliation test",
+        .allow_multiple_apps_for_testing = true,
+    });
+    defer app.destroy() catch unreachable;
+
+    var model: LargeInitialTree = .{};
+    _ = try app.openWindow(.{ .platform = .{ .title = "large tree" } }, ui.Component.Descriptor.from(LargeInitialTree, &model));
+    while (try app.step(false)) {}
+    try testing.expectEqual(@as(u64, 1), (try app.metricsSnapshot()).frames_submitted);
+}
+
 test "whole-window invalidation rebuilds only that window's components" {
     const app = try ui.App.create(testing.allocator, .{
         .application_name = "window composition invalidation test",
@@ -811,6 +832,32 @@ test "flex remeasures wrapped content at its allocated main size" {
     const text = store.getConst(retained[0]).?.layout.bounds;
     try testing.expectApproxEqAbs(@as(f32, 50), text.size.width, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 40), text.size.height, 0.001);
+}
+
+test "text baselines clamp when exact constraints clip line height" {
+    var store = ui.NodeStore.init(testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+
+    const root = try store.reconcile(null, .invalid, .invalid, .{
+        .kind = .{ .text = "clipped" },
+    }, 1, scratch.allocator());
+    var measure_context: u8 = 0;
+    var engine: ui.LayoutEngine = .{
+        .scratch = scratch.allocator(),
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .measures = .{
+            .context = &measure_context,
+            .text_fn = clippedTextMeasure,
+            .custom_measure_fn = emptyCustomMeasure,
+        },
+    };
+
+    try engine.layout(&store, root, .{ .width = 32, .height = 6 });
+    const record = store.getConst(root).?;
+    try testing.expectApproxEqAbs(@as(f32, 6), record.layout.bounds.size.height, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 6), record.layout.baseline.?, 0.001);
 }
 
 test "fractional grid tracks redistribute around intrinsic minimums" {
@@ -2633,6 +2680,18 @@ fn wrappingTextMeasure(
     return .{
         .size = constraints.constrain(.{ .width = width, .height = lines * 10 }),
         .baseline = 8,
+    };
+}
+
+fn clippedTextMeasure(
+    _: *anyopaque,
+    _: []const u8,
+    _: ui.style.TextStyle,
+    constraints: ui.layout.Constraints,
+) ui.Error!ui.layout_engine.TextMeasure {
+    return .{
+        .size = constraints.constrain(.{ .width = 32, .height = 30 }),
+        .baseline = 24,
     };
 }
 

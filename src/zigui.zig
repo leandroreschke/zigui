@@ -72,6 +72,7 @@ pub const internal_protocol_test = if (builtin.is_test) struct {
     pub const wayland_wire = @import("platform/linux/wayland/wire.zig");
     pub const dbus_wire = @import("platform/linux/dbus/wire.zig");
     pub const x11_wire = @import("platform/linux/x11/wire.zig");
+    pub const x11_protocol = @import("platform/linux/x11/protocol.zig");
 } else DisabledCapability;
 
 /// Backend-neutral shader generation is exposed only to repository tests so

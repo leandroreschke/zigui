@@ -681,6 +681,16 @@ pub fn presentPixmap(
     pixmap: u32,
     serial: u32,
 ) Error!void {
+    _ = try client.send(try buildPresentPixmap(writer, extension, window, pixmap, serial), null);
+}
+
+pub fn buildPresentPixmap(
+    writer: *wire.Writer,
+    extension: Extension,
+    window: u32,
+    pixmap: u32,
+    serial: u32,
+) Error![]const u8 {
     writer.reset();
     const start = try writer.begin(extension.opcode, 1);
     try writer.u32(window);
@@ -700,7 +710,8 @@ pub fn presentPixmap(
     try writer.u32(0);
     try writer.u32(0);
     try writer.u32(0);
-    _ = try client.send(try writer.finish(start), null);
+    try writer.u32(0);
+    return writer.finish(start);
 }
 
 pub fn freePixmap(client: *client_mod.Client, writer: *wire.Writer, pixmap: u32) Error!void {
