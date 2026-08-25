@@ -72,12 +72,24 @@ pub const internal_protocol_test = if (builtin.is_test) struct {
     pub const wayland_wire = @import("platform/linux/wayland/wire.zig");
     pub const dbus_wire = @import("platform/linux/dbus/wire.zig");
     pub const x11_wire = @import("platform/linux/x11/wire.zig");
+    pub const x11_protocol = @import("platform/linux/x11/protocol.zig");
 } else DisabledCapability;
 
 /// Backend-neutral shader generation is exposed only to repository tests so
 /// the same module ownership graph can validate it on every host.
 pub const internal_shader_test = if (builtin.is_test) struct {
     pub const vulkan_shaders = @import("backend/vulkan/shaders.zig");
+    pub const d3d11_compiler = if (builtin.os.tag == .windows) @import("backend/d3d11/compiler.zig") else DisabledCapability;
+    pub const d3d11_renderer = if (builtin.os.tag == .windows) @import("backend/d3d11/renderer.zig") else DisabledCapability;
+
+    pub fn d3d11NullSurfaceProvider(context: *anyopaque) @import("platform/windows/surface.zig").Provider {
+        const Provider = struct {
+            fn window(_: *anyopaque, _: core.handles.WindowId) @import("platform/windows/abi.zig").HWND {
+                return null;
+            }
+        };
+        return .{ .context = context, .window_fn = Provider.window };
+    }
 } else DisabledCapability;
 
 pub const core = struct {

@@ -814,7 +814,7 @@ fn createWindow(raw: *anyopaque, id: handles.WindowId, options: api.WindowOption
     try self.windows.ensureUnusedCapacity(1);
     try self.xids.ensureUnusedCapacity(1);
     try self.present_events.ensureUnusedCapacity(1);
-    try self.preparePendingSlots(2);
+    try self.preparePendingSlots(3);
     const xid = try self.client.allocateId();
     const present_event = try self.client.allocateId();
     const width = dimension(options.size.width);
@@ -877,6 +877,10 @@ fn createWindow(raw: *anyopaque, id: handles.WindowId, options: api.WindowOption
     self.events.appendAssumeCapacity(.{
         .window = id,
         .event = .{ .configured = .{ .logical_size = native.logical_size, .scale_factor = native.scale_factor } },
+    });
+    self.events.appendAssumeCapacity(.{
+        .window = id,
+        .event = .{ .frame_requested = sys.monotonicNanoseconds() },
     });
     sys.wake(self.wake_fd);
     return .{ .kind = .x11, .value = xid };

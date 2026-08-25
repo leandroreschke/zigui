@@ -54,13 +54,17 @@ is not coupled into the framework repository or its dependency graph.
 
 ## Consolidated campaign result
 
-The 2026-08-24 campaign used Zig `0.17.0-dev.1745+ac8a8d0c5` and completed with
-the following repository-level results:
+The 2026-08-24 through 2026-08-25 campaign used Zig
+`0.17.0-dev.1745+ac8a8d0c5`. The Windows and Linux validation repairs were
+combined at `7eff8cd0eb91b52f6932a7fce0878ac0af60422c` and completed with the
+following repository-level results:
 
 - `zig fmt --check` passed across `build.zig`, `src`, `tests`, `examples`, and
   `tools`.
-- All 89 tests passed: 80 shared/unit/conformance tests, 6 Linux wire-format
-  protocol tests, and 3 backend shader/ABI conformance tests.
+- The target-selected suites passed in full: 94 tests on macOS, 94 on Linux,
+  and 95 on Windows. The Windows run included 82 shared/conformance tests,
+  7 protocol tests, 5 native D3D11 shader/offscreen tests, and a real Win32
+  two-window lifecycle test.
 - The 10,000-frame stress run completed 2,580,000 primitives with stable live
   bytes and zero allocations after warm-up.
 - All nine proof applications linked with every capability enabled for native
@@ -94,10 +98,27 @@ window minimize/restore/title/move/resize/hide/show operations, and cross-window
 component invalidation. The available macOS host reported one connected Studio
 Display, so physical monitor migration was not claimed.
 
-Windows and Linux native execution was not claimed from the macOS host. Their
-source, ABI, shader, protocol, full-link, and deterministic shared contracts are
-green, but live Win32/UIA/IMM32 and Wayland/X11/AT-SPI/compositor/driver checks
-remain target-machine gates. A real marked-text input-source session and forced
-native GPU device-loss session also remain live integration gates; their
-bounded shared state transitions are covered by deterministic conformance
-tests.
+Native Linux validation ran the exact combined commit on both Wayland/Vulkan
+and X11/Vulkan. All nine proof applications opened and rendered; window
+lifecycle, clipboard, text, AT-SPI, external surfaces, and custom render passes
+were healthy. Its 10,000-frame stress run completed 2,580,000 primitives with
+live bytes and allocation counts unchanged after warm-up. KDE/XWayland reported
+live windows as `_NET_WM_STATE_HIDDEN`, so minimize-state metadata remains
+inconclusive even though rendering, interaction, and process health were good.
+
+Native Windows validation ran the exact combined commit through Win32/D3D11.
+All nine full-capability proof applications built, and Hello, Text Lab, Window
+Lab, and Surface Lab opened, rendered, and remained responsive. The Hello
+action dispatched correctly, window and external-surface paths stayed healthy,
+and the 10,000-frame stress contract completed with zero post-warm-up
+allocations. A suspected heading/subtitle spacing regression reproduced on the
+earlier Windows-only commit and was therefore not introduced by the combined
+Linux changes.
+
+The remaining live gates require targeted hardware or manual assistive-input
+sessions: physical second-monitor migration, real IME composition, Explorer
+drag-and-drop, forced GPU removal/device loss, application-owned external D3D11
+texture import, and full screen-reader narration on Windows; physical monitor
+migration on the available single-display Mac; and a real marked-text input
+source plus forced Metal device loss on macOS. Their bounded shared state
+transitions remain covered by deterministic conformance tests.
