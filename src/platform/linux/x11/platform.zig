@@ -980,6 +980,7 @@ fn commandWindow(raw: *anyopaque, id: handles.WindowId, command: api.WindowComma
             .maximized => try sendWmState(self, native.xid, 1, self.atoms.net_wm_state_maximized_vert, self.atoms.net_wm_state_maximized_horz),
             .fullscreen => try sendWmState(self, native.xid, 1, self.atoms.net_wm_state_fullscreen, 0),
         },
+        .always_on_top => |enabled| try sendWmState(self, native.xid, if (enabled) 1 else 0, self.atoms.net_wm_state_above, 0),
     }
 }
 

@@ -33,6 +33,7 @@ const Window = struct {
     position: geometry.Point = .{},
     visible: bool,
     mode: api.WindowMode = .normal,
+    always_on_top: bool = false,
 };
 
 pub const Harness = struct {
@@ -231,7 +232,9 @@ pub fn createWithMemory(
             .context = context,
             .read_text_fn = readClipboard,
             .write_text_fn = writeClipboard,
+            .read_contents_fn = readClipboardContents,
             .maximum_bytes = memory.clipboard_bytes,
+            .maximum_paths = memory.file_drop_path_count,
         },
         .deinit_context = context,
         .deinit_fn = deinit,
@@ -293,6 +296,7 @@ fn createWindow(context: *anyopaque, id: handles.WindowId, options: api.WindowOp
         .size = options.size,
         .position = options.position orelse .{},
         .visible = options.visible,
+        .always_on_top = options.always_on_top,
     });
     title_owned = null;
     const handle: api.NativeHandle = .{ .kind = .headless, .value = @intCast(id.encode()) };
@@ -358,6 +362,7 @@ fn commandWindow(context: *anyopaque, id: handles.WindowId, command: api.WindowC
             } } });
         },
         .mode => |mode| window.mode = mode,
+        .always_on_top => |enabled| window.always_on_top = enabled,
     }
 }
 
@@ -392,6 +397,14 @@ fn writeClipboard(context: *anyopaque, value: []const u8) Error!void {
     const replacement = try self.allocator.dupe(u8, value);
     if (self.clipboard_text) |existing| self.allocator.free(existing);
     self.clipboard_text = replacement;
+}
+
+fn readClipboardContents(context: *anyopaque, allocator: std.mem.Allocator) Error!api.ClipboardContents {
+    const self = cast(context);
+    return .{
+        .allocator = allocator,
+        .text = if (self.clipboard_text) |value| try allocator.dupe(u8, value) else null,
+    };
 }
 
 fn deinit(context: *anyopaque) void {

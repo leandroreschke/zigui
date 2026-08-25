@@ -242,6 +242,12 @@ pub const PaintContext = struct {
             .flags = flags,
         } });
     }
+
+    /// Declares the committed window-space placement of a native media layer.
+    /// ZigUI applies it after the frame commits, outside compose and layout.
+    pub fn nativeMedia(self: *PaintContext, id: handles.NativeMediaId, bounds: geometry.Rect) Error!void {
+        try self.emit(.{ .native_media = .{ .id = id, .bounds = bounds } });
+    }
 };
 
 pub const PaintCommand = union(enum) {
@@ -266,6 +272,7 @@ pub const PaintCommand = union(enum) {
     monochrome_sprite: scene_abi.Sprite,
     color_sprite: scene_abi.Sprite,
     external_surface: scene_abi.ExternalSurface,
+    native_media: struct { id: handles.NativeMediaId, bounds: geometry.Rect },
     custom_pass: struct {
         extension: handles.RenderExtensionId,
         bounds: geometry.Rect,

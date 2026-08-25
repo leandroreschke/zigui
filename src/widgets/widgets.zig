@@ -19,5 +19,6 @@ pub const ScrollView = @import("scroll_view.zig").ScrollView;
 pub const TextField = @import("text_field.zig").TextField;
 pub const HeightIndex = @import("virtual_list.zig").HeightIndex;
 pub const VirtualList = @import("virtual_list.zig").VirtualList;
+pub const NativeMediaView = @import("native_media.zig").NativeMediaView;
 pub const SeparatorOrientation = @import("separator.zig").Orientation;
 pub const separator = @import("separator.zig").separator;

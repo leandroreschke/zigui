@@ -408,6 +408,12 @@ pub const App = struct {
         target.mode = mode;
     }
 
+    pub fn setWindowAlwaysOnTop(self: *App, id: handles.WindowId, enabled: bool) Error!void {
+        try self.assertMutationPhase();
+        if (!self.windows.contains(id)) return error.InvalidHandle;
+        try self.bundle.windows.command(id, .{ .always_on_top = enabled });
+    }
+
     pub fn displays(self: *App, allocator: std.mem.Allocator) Error!platform.OwnedDisplays {
         try self.assertMutationPhase();
         return self.bundle.displays.list(allocator);
@@ -535,6 +541,90 @@ pub const App = struct {
         if (!std.unicode.utf8ValidateSlice(value) or std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidUtf8;
         const clipboard = self.bundle.clipboard orelse return error.MissingCapability;
         try clipboard.writeText(value);
+    }
+
+    pub fn readClipboardContents(self: *App, allocator: std.mem.Allocator) Error!platform.ClipboardContents {
+        try self.assertMutationPhase();
+        const clipboard = self.bundle.clipboard orelse return error.MissingCapability;
+        return clipboard.readContents(allocator);
+    }
+
+    pub fn writeClipboardPaths(self: *App, paths: []const []const u8) Error!void {
+        try self.assertMutationPhase();
+        const clipboard = self.bundle.clipboard orelse return error.MissingCapability;
+        try clipboard.writePaths(paths);
+    }
+
+    pub fn openUrl(self: *App, url: []const u8) Error!void {
+        try self.assertMutationPhase();
+        const services = self.bundle.application_services orelse return error.MissingCapability;
+        try services.openUrl(url);
+    }
+
+    pub fn openPath(self: *App, path: []const u8) Error!void {
+        try self.assertMutationPhase();
+        const services = self.bundle.application_services orelse return error.MissingCapability;
+        try services.openPath(path);
+    }
+
+    pub fn revealPath(self: *App, path: []const u8) Error!void {
+        try self.assertMutationPhase();
+        const services = self.bundle.application_services orelse return error.MissingCapability;
+        try services.revealPath(path);
+    }
+
+    pub fn printPath(self: *App, path: []const u8) Error!void {
+        try self.assertMutationPhase();
+        const services = self.bundle.application_services orelse return error.MissingCapability;
+        try services.printPath(path);
+    }
+
+    pub fn createNativeMedia(self: *App, window_id: handles.WindowId, options: platform.NativeMediaOptions) Error!handles.NativeMediaId {
+        try self.assertMutationPhase();
+        if (!self.windows.contains(window_id)) return error.InvalidHandle;
+        const native_media = self.bundle.native_media orelse return error.MissingCapability;
+        return native_media.create(window_id, options);
+    }
+
+    pub fn setNativeMediaFrame(self: *App, id: handles.NativeMediaId, frame: geometry.Rect) Error!void {
+        try self.assertMutationPhase();
+        const native_media = self.bundle.native_media orelse return error.MissingCapability;
+        try native_media.setFrame(id, frame);
+    }
+    pub fn playNativeMedia(self: *App, id: handles.NativeMediaId) Error!void {
+        try self.assertMutationPhase();
+        const service = self.bundle.native_media orelse return error.MissingCapability;
+        try service.play(id);
+    }
+    pub fn pauseNativeMedia(self: *App, id: handles.NativeMediaId) Error!void {
+        try self.assertMutationPhase();
+        const service = self.bundle.native_media orelse return error.MissingCapability;
+        try service.pause(id);
+    }
+    pub fn seekNativeMedia(self: *App, id: handles.NativeMediaId, position_ns: u64) Error!void {
+        try self.assertMutationPhase();
+        const service = self.bundle.native_media orelse return error.MissingCapability;
+        try service.seek(id, position_ns);
+    }
+    pub fn setNativeMediaVolume(self: *App, id: handles.NativeMediaId, volume: f32) Error!void {
+        try self.assertMutationPhase();
+        const service = self.bundle.native_media orelse return error.MissingCapability;
+        try service.setVolume(id, volume);
+    }
+    pub fn setNativeMediaMuted(self: *App, id: handles.NativeMediaId, muted: bool) Error!void {
+        try self.assertMutationPhase();
+        const service = self.bundle.native_media orelse return error.MissingCapability;
+        try service.setMuted(id, muted);
+    }
+    pub fn nativeMediaState(self: *App, id: handles.NativeMediaId) Error!platform.NativeMediaState {
+        try self.assertMutationPhase();
+        const service = self.bundle.native_media orelse return error.MissingCapability;
+        return service.state(id);
+    }
+    pub fn destroyNativeMedia(self: *App, id: handles.NativeMediaId) Error!void {
+        try self.assertMutationPhase();
+        const service = self.bundle.native_media orelse return error.MissingCapability;
+        try service.destroy(id);
     }
 
     pub fn setApplicationMenu(self: *App, items: []const platform.MenuItem) Error!void {
@@ -977,7 +1067,7 @@ pub const App = struct {
                     try self.requestFrame(id);
             },
             .input => |value| try self.dispatchInput(target, &value),
-            .menu_action => |action_id| try self.dispatchMenuAction(target, action_id),
+            .menu_action => |invocation| try self.dispatchMenuAction(target, invocation),
             .accessibility_action => |request| try self.dispatchAccessibilityAction(target, request),
             .frame_requested => {
                 target.pending_frame = false;
@@ -1036,7 +1126,7 @@ pub const App = struct {
         }
     }
 
-    fn dispatchMenuAction(self: *App, target: *Window, action_id: handles.ActionId) Error!void {
+    fn dispatchMenuAction(self: *App, target: *Window, invocation: platform.MenuInvocation) Error!void {
         var update = try self.coordinator.beginUpdate();
         defer if (update.active) update.deinit() catch |err| self.recordPendingError(err);
         try target.event_arena.resetNow();
@@ -1049,8 +1139,9 @@ pub const App = struct {
         defer callback.deinit();
         const action_target = if (target.focus_manager.focused.isValid()) target.focus_manager.focused else target.anchor;
         const handled = try target.router.dispatchAction(&self.nodes, &self.coordinator, action_target, .{
-            .id = action_id,
+            .id = invocation.action,
             .source = .menu,
+            .menu_payload = invocation.payload,
         });
         if (handled) _ = self.coordinator.invalidations.markWindow(target.id);
         callback.deinit();
@@ -1286,6 +1377,7 @@ pub const App = struct {
             var timer = metrics.PhaseTimer.begin(&self.coordinator.counters, self.bundle.event_loop.clock, .present);
             defer timer.end();
             target.commitScene();
+            try self.syncNativeMediaPlacements(target.id, target.committedScene().native_media_placements.items);
             try target.hits.commitPrepared();
             hit_tree_pending = false;
             try target.focus_manager.commitPrepared(prepared_focus);
@@ -1391,6 +1483,11 @@ pub const App = struct {
         for (view.monochrome_sprites) |sprite| try self.resources.markUsed(decodeTexture(sprite.texture), submission);
         for (view.color_sprites) |sprite| try self.resources.markUsed(decodeTexture(sprite.texture), submission);
         for (view.external_surfaces) |surface_value| try self.surfaces.markUsed(decodeSurface(surface_value.surface), submission);
+    }
+
+    fn syncNativeMediaPlacements(self: *App, window_id: handles.WindowId, placements: []const @import("core/native_media.zig").Placement) Error!void {
+        if (self.bundle.native_media) |service| return service.synchronize(window_id, placements);
+        if (placements.len != 0) return error.MissingCapability;
     }
 
     fn prepareSceneResources(self: *App, view: render.SceneView) Error!void {
@@ -1557,7 +1654,22 @@ fn boundBundleServices(bundle: *platform.Bundle, memory: config.MemoryBudgets) v
         text_input.maximum_surrounding_text_bytes,
         memory.platform_text_bytes,
     );
-    if (bundle.clipboard) |*clipboard| clipboard.maximum_bytes = @min(clipboard.maximum_bytes, memory.clipboard_bytes);
+    if (bundle.clipboard) |*clipboard| {
+        clipboard.maximum_bytes = @min(clipboard.maximum_bytes, memory.clipboard_bytes);
+        clipboard.maximum_paths = @min(clipboard.maximum_paths, memory.file_drop_path_count);
+    }
+    if (bundle.application_services) |*services| services.maximum_text_bytes = @min(
+        services.maximum_text_bytes,
+        memory.platform_text_bytes,
+    );
+    if (bundle.native_media) |*native_media| native_media.maximum_source_bytes = @min(
+        native_media.maximum_source_bytes,
+        memory.platform_text_bytes,
+    );
+    if (bundle.native_media) |*native_media| native_media.maximum_placements = @min(
+        native_media.maximum_placements,
+        memory.media_source_count,
+    );
     if (bundle.menus) |*menus| {
         menus.limits.maximum_items = @min(menus.limits.maximum_items, memory.menu_item_count);
         menus.limits.maximum_depth = @min(menus.limits.maximum_depth, memory.menu_depth);
@@ -1576,7 +1688,11 @@ fn validateBundleConfiguration(bundle: platform.Bundle) Error!void {
         return error.InvalidConfiguration;
     if (bundle.text_input) |text_input| if (text_input.maximum_surrounding_text_bytes == 0)
         return error.InvalidConfiguration;
-    if (bundle.clipboard) |clipboard| if (clipboard.maximum_bytes == 0)
+    if (bundle.clipboard) |clipboard| if (clipboard.maximum_bytes == 0 or clipboard.maximum_paths == 0)
+        return error.InvalidConfiguration;
+    if (bundle.application_services) |services| if (services.maximum_text_bytes == 0)
+        return error.InvalidConfiguration;
+    if (bundle.native_media) |native_media| if (native_media.maximum_source_bytes == 0 or native_media.maximum_placements == 0)
         return error.InvalidConfiguration;
     if (bundle.menus) |menus| if (menus.limits.maximum_items == 0 or menus.limits.maximum_depth == 0 or
         menus.limits.maximum_text_bytes == 0)
@@ -1651,6 +1767,7 @@ fn sceneLimits(memory: config.MemoryBudgets) scene.Limits {
         .path_vertices = memory.scene_path_vertex_count,
         .custom_passes = memory.scene_custom_pass_count,
         .custom_payload_bytes = memory.scene_custom_payload_bytes,
+        .native_media_placements = memory.media_source_count,
     };
 }
 

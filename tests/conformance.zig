@@ -358,6 +358,20 @@ test "scene builder leaves no partial primitive when allocation fails" {
     try testing.expectEqual(@as(usize, 0), scene.quads.items.len);
 }
 
+test "native media placements are bounded unique layout declarations" {
+    var scene = ui.scene.Scene.init(testing.allocator);
+    defer scene.deinit();
+    var builder = ui.scene.Builder.init(&scene, .{ .native_media_placements = 1 });
+    defer builder.deinit();
+    const id = handles.NativeMediaId.init(2, 1);
+    const bounds = ui.Rect.fromXYWH(10, 20, 320, 180);
+    try builder.nativeMedia(id, bounds);
+    try testing.expectEqual(@as(usize, 1), scene.native_media_placements.items.len);
+    try testing.expectEqual(bounds, scene.native_media_placements.items[0].bounds);
+    try testing.expectError(error.InvalidScene, builder.nativeMedia(id, bounds));
+    try testing.expectError(error.InvalidHandle, builder.nativeMedia(.invalid, bounds));
+}
+
 test "null renderer respects affine rounded clips and produces readback" {
     const renderer = try ui.NullRenderer.create(testing.allocator);
     defer renderer.deinit();
@@ -1045,6 +1059,11 @@ test "headless platform deterministically exposes windows displays clipboard and
     const clipboard = (try harness.bundle.clipboard.?.readText(testing.allocator)).?;
     defer testing.allocator.free(clipboard);
     try testing.expectEqualStrings("clipboard", clipboard);
+    var contents = try harness.bundle.clipboard.?.readContents(testing.allocator);
+    defer contents.deinit();
+    try testing.expectEqualStrings("clipboard", contents.text.?);
+    try testing.expectEqual(@as(usize, 0), contents.paths.len);
+    try testing.expect(contents.image == null);
 
     var events: EventCollector = .{};
     const sink: ui.platform.EventSink = .{ .context = &events, .callback = EventCollector.receive };
@@ -1058,6 +1077,8 @@ test "headless platform deterministically exposes windows displays clipboard and
     try harness.bundle.windows.requestFrame(window);
     while (try harness.bundle.event_loop.step(sink, false)) {}
     try testing.expectEqual(@as(usize, 6), events.len);
+    try harness.bundle.windows.command(window, .{ .always_on_top = true });
+    try harness.bundle.windows.command(window, .{ .always_on_top = false });
     harness.bundle.windows.destroy(window);
     while (try harness.bundle.event_loop.step(sink, false)) {}
     try testing.expectEqual(@as(EventCollector.Tag, .closed), events.tags[events.len - 1]);
@@ -1402,9 +1423,12 @@ test "menu validation rejects invalid trees before invoking native code" {
         .limits = .{ .maximum_items = 2, .maximum_depth = 2, .maximum_text_bytes = 8 },
     };
     const action_id = handles.ActionId.init(1, 1);
-    const valid = [_]ui.platform.MenuItem{.{ .action = .{ .label = "Open", .action = action_id } }};
+    const valid = [_]ui.platform.MenuItem{.{ .action = .{ .label = "Open", .action = action_id, .payload = 0xfeed_beef } }};
     try menus.setApplicationMenu(&valid);
     try testing.expectEqual(@as(usize, 1), probe.set_calls);
+    try testing.expectEqual(@as(u64, 0xfeed_beef), probe.payload);
+    var invocation_event: ui.platform.WindowEvent = .{ .menu_action = .{ .action = action_id, .payload = 0xfeed_beef } };
+    try ui.platform.validateWindowEvent(&invocation_event);
 
     const too_many = [_]ui.platform.MenuItem{ .separator, .separator, .separator };
     try testing.expectError(error.BudgetExceeded, menus.setApplicationMenu(&too_many));
@@ -1416,6 +1440,51 @@ test "menu validation rejects invalid trees before invoking native code" {
     const deep = [_]ui.platform.MenuItem{.{ .submenu = .{ .label = "D", .items = &middle } }};
     try testing.expectError(error.BudgetExceeded, menus.setApplicationMenu(&deep));
     try testing.expectEqual(@as(usize, 1), probe.set_calls);
+}
+
+test "application and native media services validate inputs before platform calls" {
+    var clipboard_probe: ClipboardPathProbe = .{};
+    const clipboard = clipboard_probe.service();
+    const clipboard_paths = [_][]const u8{ "/tmp/first.txt", "/tmp/second.txt" };
+    try clipboard.writePaths(&clipboard_paths);
+    try testing.expectEqual(@as(usize, 1), clipboard_probe.calls);
+    try testing.expectEqual(@as(usize, 2), clipboard_probe.path_count);
+    try testing.expectError(error.InvalidConfiguration, clipboard.writePaths(&.{}));
+    try testing.expectError(error.InvalidUtf8, clipboard.writePaths(&.{"bad\x00path"}));
+
+    var applications: ApplicationServiceProbe = .{};
+    const services = applications.service();
+    try services.openUrl("https://example.com/item");
+    try services.openPath("/tmp/item");
+    try services.revealPath("/tmp/item");
+    try services.printPath("/tmp/item.pdf");
+    try testing.expectEqual(@as(usize, 4), applications.calls);
+    try testing.expectError(error.InvalidConfiguration, services.openUrl(""));
+    try testing.expectError(error.InvalidUtf8, services.openPath("bad\x00path"));
+
+    var media_probe: NativeMediaProbe = .{};
+    const native_media = media_probe.service();
+    const window = handles.WindowId.init(3, 1);
+    const id = try native_media.create(window, .{
+        .source = .{ .file = "/tmp/movie.mov" },
+        .frame = ui.Rect.fromXYWH(10, 20, 320, 180),
+        .volume = 0.75,
+    });
+    try native_media.setFrame(id, ui.Rect.fromXYWH(0, 0, 640, 360));
+    const placements = [_]ui.core.native_media.Placement{.{ .id = id, .bounds = ui.Rect.fromXYWH(12, 18, 300, 170) }};
+    try native_media.synchronize(window, &placements);
+    try native_media.pause(id);
+    try native_media.play(id);
+    try native_media.seek(id, 42);
+    try native_media.setVolume(id, 0.25);
+    try native_media.setMuted(id, true);
+    const state = try native_media.state(id);
+    try testing.expect(state.playing);
+    try testing.expectEqual(@as(f32, 0.25), state.volume);
+    try testing.expect(state.muted);
+    try native_media.destroy(id);
+    try testing.expectEqual(@as(usize, 10), media_probe.calls);
+    try testing.expectError(error.InvalidConfiguration, native_media.setVolume(id, 2));
 }
 
 test "headless queued payloads are deep copied and aggregate bounded" {
@@ -2751,10 +2820,15 @@ const EffectProbe = struct {
 const MenuProbe = struct {
     set_calls: usize = 0,
     show_calls: usize = 0,
+    payload: u64 = 0,
 
-    fn set(context: *anyopaque, _: []const ui.platform.MenuItem) ui.Error!void {
+    fn set(context: *anyopaque, items: []const ui.platform.MenuItem) ui.Error!void {
         const self: *MenuProbe = @ptrCast(@alignCast(context));
         self.set_calls += 1;
+        if (items.len != 0) switch (items[0]) {
+            .action => |item| self.payload = item.payload,
+            else => {},
+        };
     }
 
     fn show(
@@ -2765,6 +2839,114 @@ const MenuProbe = struct {
     ) ui.Error!void {
         const self: *MenuProbe = @ptrCast(@alignCast(context));
         self.show_calls += 1;
+    }
+};
+
+const ApplicationServiceProbe = struct {
+    calls: usize = 0,
+
+    fn service(self: *ApplicationServiceProbe) ui.platform.ApplicationServices {
+        return .{
+            .context = self,
+            .open_url_fn = call,
+            .open_path_fn = call,
+            .reveal_path_fn = call,
+            .print_path_fn = call,
+            .maximum_text_bytes = 128,
+        };
+    }
+
+    fn call(context: *anyopaque, _: []const u8) ui.Error!void {
+        const self: *ApplicationServiceProbe = @ptrCast(@alignCast(context));
+        self.calls += 1;
+    }
+};
+
+const ClipboardPathProbe = struct {
+    calls: usize = 0,
+    path_count: usize = 0,
+
+    fn service(self: *ClipboardPathProbe) ui.platform.Clipboard {
+        return .{
+            .context = self,
+            .read_text_fn = readText,
+            .write_text_fn = writeText,
+            .write_paths_fn = writePaths,
+            .maximum_bytes = 128,
+            .maximum_paths = 4,
+        };
+    }
+
+    fn readText(_: *anyopaque, _: std.mem.Allocator) ui.Error!?[]u8 {
+        return null;
+    }
+
+    fn writeText(_: *anyopaque, _: []const u8) ui.Error!void {}
+
+    fn writePaths(context: *anyopaque, paths: []const []const u8) ui.Error!void {
+        const self: *ClipboardPathProbe = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        self.path_count = paths.len;
+    }
+};
+
+const NativeMediaProbe = struct {
+    calls: usize = 0,
+    volume: f32 = 0.75,
+    muted: bool = false,
+
+    fn service(self: *NativeMediaProbe) ui.platform.NativeMedia {
+        return .{
+            .context = self,
+            .create_fn = create,
+            .set_frame_fn = setFrame,
+            .synchronize_fn = synchronize,
+            .play_fn = play,
+            .pause_fn = pause,
+            .seek_fn = seek,
+            .set_volume_fn = setVolume,
+            .set_muted_fn = setMuted,
+            .state_fn = state,
+            .destroy_fn = destroy,
+        };
+    }
+
+    fn count(context: *anyopaque) *NativeMediaProbe {
+        const self: *NativeMediaProbe = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        return self;
+    }
+    fn create(context: *anyopaque, _: handles.WindowId, _: ui.platform.NativeMediaOptions) ui.Error!handles.NativeMediaId {
+        _ = count(context);
+        return handles.NativeMediaId.init(1, 1);
+    }
+    fn setFrame(context: *anyopaque, _: handles.NativeMediaId, _: ui.Rect) ui.Error!void {
+        _ = count(context);
+    }
+    fn synchronize(context: *anyopaque, _: handles.WindowId, _: []const ui.core.native_media.Placement) ui.Error!void {
+        _ = count(context);
+    }
+    fn play(context: *anyopaque, _: handles.NativeMediaId) ui.Error!void {
+        _ = count(context);
+    }
+    fn pause(context: *anyopaque, _: handles.NativeMediaId) ui.Error!void {
+        _ = count(context);
+    }
+    fn seek(context: *anyopaque, _: handles.NativeMediaId, _: u64) ui.Error!void {
+        _ = count(context);
+    }
+    fn setVolume(context: *anyopaque, _: handles.NativeMediaId, volume: f32) ui.Error!void {
+        count(context).volume = volume;
+    }
+    fn setMuted(context: *anyopaque, _: handles.NativeMediaId, muted: bool) ui.Error!void {
+        count(context).muted = muted;
+    }
+    fn state(context: *anyopaque, _: handles.NativeMediaId) ui.Error!ui.platform.NativeMediaState {
+        const self = count(context);
+        return .{ .playing = true, .position_ns = 42, .duration_ns = 84, .volume = self.volume, .muted = self.muted };
+    }
+    fn destroy(context: *anyopaque, _: handles.NativeMediaId) ui.Error!void {
+        _ = count(context);
     }
 };
 

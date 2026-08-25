@@ -4,6 +4,7 @@ const Error = @import("../../core/error.zig").Error;
 const clock = @import("../../core/clock.zig");
 const geometry = @import("../../core/geometry.zig");
 const handles = @import("../../core/handle.zig");
+const native_media_placement = @import("../../core/native_media.zig");
 const input = @import("../../input/event.zig");
 const api = @import("../api.zig");
 const event_memory = @import("../event_memory.zig");
@@ -30,6 +31,7 @@ extern "c" fn CVDisplayLinkIsRunning(link: CVDisplayLinkRef) bool;
 extern "c" fn CVDisplayLinkRelease(link: CVDisplayLinkRef) void;
 extern "c" var _dispatch_main_q: u8;
 extern "c" fn dispatch_async_f(queue: objc.Id, context: ?*anyopaque, work: *const fn (?*anyopaque) callconv(.c) void) void;
+extern "c" var NSPasteboardURLReadingFileURLsOnlyKey: objc.Id;
 
 const MachTimebaseInfo = extern struct { numerator: u32, denominator: u32 };
 const CVDisplayLinkRef = ?*anyopaque;
@@ -96,6 +98,30 @@ const NativeWindow = struct {
     }
 };
 
+const CMTime = extern struct {
+    value: i64 = 0,
+    timescale: i32 = 0,
+    flags: u32 = 0,
+    epoch: i64 = 0,
+};
+
+const NativeMediaPlayer = struct {
+    window: handles.WindowId,
+    player: objc.Id,
+    layer: objc.Id,
+    scene_managed: bool = false,
+
+    fn deinit(self: *NativeMediaPlayer) void {
+        objc.send(void, self.player, "pause", .{});
+        objc.send(void, self.layer, "removeFromSuperlayer", .{});
+        objc.release(self.layer);
+        objc.release(self.player);
+        self.* = undefined;
+    }
+};
+
+const NativeMediaPool = handles.SlotPool(NativeMediaPlayer, handles.NativeMediaId);
+
 const Pending = struct {
     window: handles.WindowId,
     event: api.WindowEvent,
@@ -118,6 +144,8 @@ pub const Context = struct {
     application: objc.Id,
     view_class: objc.Class,
     windows: std.AutoHashMap(u64, NativeWindow),
+    native_media_players: NativeMediaPool,
+    maximum_native_media_players: usize,
     events: std.ArrayList(Pending) = .empty,
     event_cursor: usize = 0,
     maximum_events: usize,
@@ -144,6 +172,7 @@ pub const Context = struct {
         maximum_file_drop_paths: usize,
         maximum_clipboard_bytes: usize,
         maximum_retained_text_bytes: usize,
+        maximum_native_media_players: usize,
     ) Error!*Context {
         if (pthread_main_np() == 0) return error.ThreadAffinity;
         var pool = objc.AutoreleasePool.init();
@@ -171,6 +200,8 @@ pub const Context = struct {
             .application = application,
             .view_class = view_class,
             .windows = std.AutoHashMap(u64, NativeWindow).init(allocator),
+            .native_media_players = NativeMediaPool.init(allocator),
+            .maximum_native_media_players = maximum_native_media_players,
             .maximum_events = maximum_events,
             .maximum_windows = maximum_windows,
             .maximum_event_payload_bytes = maximum_event_payload_bytes,
@@ -199,6 +230,9 @@ pub const Context = struct {
             state.release();
             self.display_link_state = null;
         }
+        var media_iterator = self.native_media_players.iterator();
+        while (media_iterator.next()) |entry| entry.value.deinit();
+        self.native_media_players.deinit();
         var iterator = self.windows.iterator();
         while (iterator.next()) |entry| entry.value_ptr.deinit(self);
         self.windows.deinit();
@@ -492,6 +526,7 @@ pub fn create(allocator: std.mem.Allocator, app_config: config.AppConfig) Error!
         app_config.memory.file_drop_path_count,
         app_config.memory.clipboard_bytes,
         app_config.memory.platform_retained_text_bytes,
+        app_config.memory.media_source_count,
     );
     errdefer context.deinit();
     const renderer = try metal.Renderer.create(
@@ -565,7 +600,10 @@ pub fn create(allocator: std.mem.Allocator, app_config: config.AppConfig) Error!
             .context = context,
             .read_text_fn = readClipboard,
             .write_text_fn = writeClipboard,
+            .read_contents_fn = readClipboardContents,
+            .write_paths_fn = writeClipboardPaths,
             .maximum_bytes = app_config.memory.clipboard_bytes,
+            .maximum_paths = app_config.memory.file_drop_path_count,
         },
         .menus = .{
             .context = context,
@@ -587,6 +625,29 @@ pub fn create(allocator: std.mem.Allocator, app_config: config.AppConfig) Error!
                 .maximum_suggested_name_bytes = app_config.memory.platform_text_bytes,
             },
         },
+        .application_services = .{
+            .context = context,
+            .open_url_fn = openExternalUrl,
+            .open_path_fn = openExternalPath,
+            .reveal_path_fn = revealExternalPath,
+            .print_path_fn = printExternalPath,
+            .maximum_text_bytes = app_config.memory.platform_text_bytes,
+        },
+        .native_media = if (comptime config.media_enabled) .{
+            .context = context,
+            .create_fn = createNativeMedia,
+            .set_frame_fn = setNativeMediaFrame,
+            .synchronize_fn = synchronizeNativeMedia,
+            .play_fn = playNativeMedia,
+            .pause_fn = pauseNativeMedia,
+            .seek_fn = seekNativeMedia,
+            .set_volume_fn = setNativeMediaVolume,
+            .set_muted_fn = setNativeMediaMuted,
+            .state_fn = nativeMediaState,
+            .destroy_fn = destroyNativeMedia,
+            .maximum_source_bytes = app_config.memory.platform_text_bytes,
+            .maximum_placements = app_config.memory.media_source_count,
+        } else null,
         .deinit_context = context,
         .deinit_fn = deinitContext,
     };
@@ -800,9 +861,146 @@ fn createWindow(raw: *anyopaque, id: handles.WindowId, options: api.WindowOption
 
 fn destroyWindow(raw: *anyopaque, id: handles.WindowId) void {
     const self = cast(raw);
+    destroyNativeMediaForWindow(self, id);
     var removed = self.windows.fetchRemove(id.encode()) orelse return;
     removed.value.deinit(self);
     self.queue(id, .closed);
+}
+
+fn createNativeMedia(raw: *anyopaque, window_id: handles.WindowId, options: api.NativeMediaOptions) Error!handles.NativeMediaId {
+    const self = cast(raw);
+    const window = self.windows.getPtr(window_id.encode()) orelse return error.InvalidHandle;
+    if (self.native_media_players.live_count >= self.maximum_native_media_players) return error.BudgetExceeded;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const url = switch (options.source) {
+        .file => |path| try fileUrl(path),
+        .url => |value| objc.send(objc.Id, objc.class("NSURL"), "URLWithString:", .{objc.nsString(value)}) orelse return error.InvalidConfiguration,
+    };
+    const player = objc.send(objc.Id, objc.class("AVPlayer"), "playerWithURL:", .{url}) orelse return error.PlatformFailure;
+    _ = objc.retain(player);
+    errdefer objc.release(player);
+    const layer = objc.send(objc.Id, objc.class("AVPlayerLayer"), "playerLayerWithPlayer:", .{player}) orelse return error.PlatformFailure;
+    _ = objc.retain(layer);
+    errdefer objc.release(layer);
+    objc.send(void, layer, "setFrame:", .{nativeMediaRect(window, options.frame)});
+    objc.send(void, layer, "setVideoGravity:", .{objc.nsString("AVLayerVideoGravityResizeAspect")});
+    objc.send(void, player, "setVolume:", .{options.volume});
+    objc.send(void, player, "setMuted:", .{options.muted});
+    const entry: NativeMediaPlayer = .{ .window = window_id, .player = player, .layer = layer };
+    const id = try self.native_media_players.insert(entry);
+    objc.send(void, window.layer, "addSublayer:", .{layer});
+    if (options.autoplay) objc.send(void, player, "play", .{});
+    return id;
+}
+
+fn setNativeMediaFrame(raw: *anyopaque, id: handles.NativeMediaId, frame: geometry.Rect) Error!void {
+    const self = cast(raw);
+    const entry = self.native_media_players.get(id) orelse return error.InvalidHandle;
+    const window = self.windows.getPtr(entry.window.encode()) orelse return error.WindowClosed;
+    entry.scene_managed = false;
+    objc.send(void, entry.layer, "setFrame:", .{nativeMediaRect(window, frame)});
+    objc.send(void, entry.layer, "setZPosition:", .{@as(f64, 0)});
+    objc.send(void, entry.layer, "setHidden:", .{false});
+}
+
+fn synchronizeNativeMedia(raw: *anyopaque, window_id: handles.WindowId, placements: []const native_media_placement.Placement) Error!void {
+    const self = cast(raw);
+    const window = self.windows.getPtr(window_id.encode()) orelse return error.WindowClosed;
+    for (placements) |placement| {
+        const entry = self.native_media_players.get(placement.id) orelse return error.InvalidHandle;
+        if (!entry.window.eql(window_id)) return error.InvalidHandle;
+    }
+    var iterator = self.native_media_players.iterator();
+    while (iterator.next()) |entry| if (entry.value.window.eql(window_id) and entry.value.scene_managed)
+        objc.send(void, entry.value.layer, "setHidden:", .{true});
+    for (placements, 0..) |placement, index| {
+        const entry = self.native_media_players.get(placement.id).?;
+        entry.scene_managed = true;
+        objc.send(void, entry.layer, "setFrame:", .{nativeMediaRect(window, placement.bounds)});
+        objc.send(void, entry.layer, "setZPosition:", .{@as(f64, @floatFromInt(index + 1))});
+        objc.send(void, entry.layer, "setHidden:", .{false});
+    }
+}
+
+fn playNativeMedia(raw: *anyopaque, id: handles.NativeMediaId) Error!void {
+    const entry = cast(raw).native_media_players.get(id) orelse return error.InvalidHandle;
+    objc.send(void, entry.player, "play", .{});
+}
+
+fn pauseNativeMedia(raw: *anyopaque, id: handles.NativeMediaId) Error!void {
+    const entry = cast(raw).native_media_players.get(id) orelse return error.InvalidHandle;
+    objc.send(void, entry.player, "pause", .{});
+}
+
+fn seekNativeMedia(raw: *anyopaque, id: handles.NativeMediaId, position_ns: u64) Error!void {
+    const entry = cast(raw).native_media_players.get(id) orelse return error.InvalidHandle;
+    const value: i64 = @intCast(@min(position_ns, @as(u64, std.math.maxInt(i64))));
+    objc.send(void, entry.player, "seekToTime:", .{CMTime{ .value = value, .timescale = std.time.ns_per_s, .flags = 1 }});
+}
+
+fn setNativeMediaVolume(raw: *anyopaque, id: handles.NativeMediaId, volume: f32) Error!void {
+    const entry = cast(raw).native_media_players.get(id) orelse return error.InvalidHandle;
+    objc.send(void, entry.player, "setVolume:", .{volume});
+}
+
+fn setNativeMediaMuted(raw: *anyopaque, id: handles.NativeMediaId, muted: bool) Error!void {
+    const entry = cast(raw).native_media_players.get(id) orelse return error.InvalidHandle;
+    objc.send(void, entry.player, "setMuted:", .{muted});
+}
+
+fn nativeMediaState(raw: *anyopaque, id: handles.NativeMediaId) Error!api.NativeMediaState {
+    const entry = cast(raw).native_media_players.get(id) orelse return error.InvalidHandle;
+    const current = objc.send(CMTime, entry.player, "currentTime", .{});
+    const item = objc.send(objc.Id, entry.player, "currentItem", .{});
+    const duration = if (item != null) objc.send(CMTime, item, "duration", .{}) else CMTime{};
+    return .{
+        .playing = objc.send(f32, entry.player, "rate", .{}) != 0,
+        .position_ns = timeNanoseconds(current) orelse 0,
+        .duration_ns = timeNanoseconds(duration),
+        .volume = objc.send(f32, entry.player, "volume", .{}),
+        .muted = objc.send(bool, entry.player, "isMuted", .{}),
+    };
+}
+
+fn destroyNativeMedia(raw: *anyopaque, id: handles.NativeMediaId) Error!void {
+    var removed = cast(raw).native_media_players.remove(id) orelse return error.InvalidHandle;
+    removed.deinit();
+}
+
+fn destroyNativeMediaForWindow(self: *Context, window: handles.WindowId) void {
+    while (true) {
+        var matching_id: ?handles.NativeMediaId = null;
+        var iterator = self.native_media_players.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value.window.eql(window)) {
+                matching_id = entry.id;
+                break;
+            }
+        }
+        const id = matching_id orelse break;
+        if (self.native_media_players.remove(id)) |removed_value| {
+            var removed = removed_value;
+            removed.deinit();
+        }
+    }
+}
+
+fn nativeMediaRect(window: *const NativeWindow, frame: geometry.Rect) types.Rect {
+    const flipped = objc.send(bool, window.layer, "isGeometryFlipped", .{});
+    return .{
+        .origin = .{
+            .x = frame.origin.x,
+            .y = if (flipped) frame.origin.y else window.logical_size.height - frame.origin.y - frame.size.height,
+        },
+        .size = .{ .width = frame.size.width, .height = frame.size.height },
+    };
+}
+
+fn timeNanoseconds(value: CMTime) ?u64 {
+    if (value.flags & 1 == 0 or value.timescale <= 0 or value.value < 0) return null;
+    const result = (@as(u128, @intCast(value.value)) * std.time.ns_per_s) / @as(u32, @intCast(value.timescale));
+    return @intCast(@min(result, std.math.maxInt(u64)));
 }
 
 fn showWindow(raw: *anyopaque, id: handles.WindowId, visible: bool) Error!void {
@@ -897,6 +1095,7 @@ fn commandWindow(raw: *anyopaque, id: handles.WindowId, command: api.WindowComma
             .fullscreen => if (objc.send(usize, window.ns_window, "styleMask", .{}) & types.WindowStyle.fullscreen == 0)
                 objc.send(void, window.ns_window, "toggleFullScreen:", .{@as(objc.Id, null)}),
         },
+        .always_on_top => |enabled| objc.send(void, window.ns_window, "setLevel:", .{@as(isize, if (enabled) 3 else 0)}),
     }
 }
 
@@ -1039,6 +1238,129 @@ fn writeClipboard(_: *anyopaque, text: []const u8) Error!void {
     if (!objc.send(bool, pasteboard, "setString:forType:", .{ objc.nsString(text), objc.nsString("public.utf8-plain-text") })) return error.PlatformFailure;
 }
 
+fn writeClipboardPaths(_: *anyopaque, paths: []const []const u8) Error!void {
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const urls = objc.send(objc.Id, objc.class("NSMutableArray"), "arrayWithCapacity:", .{paths.len}) orelse return error.PlatformFailure;
+    for (paths) |path| objc.send(void, urls, "addObject:", .{try fileUrl(path)});
+    const pasteboard = objc.send(objc.Id, objc.class("NSPasteboard"), "generalPasteboard", .{}) orelse return error.PlatformFailure;
+    _ = objc.send(isize, pasteboard, "clearContents", .{});
+    if (!objc.send(bool, pasteboard, "writeObjects:", .{urls})) return error.PlatformFailure;
+}
+
+fn readClipboardContents(raw: *anyopaque, allocator: std.mem.Allocator) Error!api.ClipboardContents {
+    const self = cast(raw);
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const pasteboard = objc.send(objc.Id, objc.class("NSPasteboard"), "generalPasteboard", .{}) orelse return error.PlatformFailure;
+    var result: api.ClipboardContents = .{ .allocator = allocator };
+    errdefer result.deinit();
+
+    if (objc.send(objc.Id, pasteboard, "stringForType:", .{objc.nsString("public.utf8-plain-text")})) |string| {
+        const value = objc.utf8(string);
+        if (value.len > self.maximum_clipboard_bytes) return error.BudgetExceeded;
+        result.text = try allocator.dupe(u8, value);
+    }
+
+    var paths: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (paths.items) |path| allocator.free(@constCast(path));
+        paths.deinit(allocator);
+    }
+    const file_url_options = objc.send(objc.Id, objc.class("NSDictionary"), "dictionaryWithObject:forKey:", .{
+        objc.send(objc.Id, objc.class("NSNumber"), "numberWithBool:", .{true}), NSPasteboardURLReadingFileURLsOnlyKey,
+    });
+    const file_urls = objc.send(objc.Id, pasteboard, "readObjectsForClasses:options:", .{
+        objc.arrayWithObject(objc.class("NSURL")), file_url_options,
+    });
+    if (file_urls != null and objc.send(usize, file_urls, "count", .{}) != 0) {
+        const count = objc.send(usize, file_urls, "count", .{});
+        if (count > self.maximum_file_drop_paths) return error.BudgetExceeded;
+        try paths.ensureTotalCapacity(allocator, count);
+        for (0..count) |index| {
+            const url = objc.send(objc.Id, file_urls, "objectAtIndex:", .{index});
+            if (!objc.send(bool, url, "isFileURL", .{})) continue;
+            const path = objc.utf8(objc.send(objc.Id, url, "path", .{}));
+            if (path.len == 0) continue;
+            paths.appendAssumeCapacity(try allocator.dupe(u8, path));
+        }
+    } else {
+        const legacy = objc.send(objc.Id, pasteboard, "propertyListForType:", .{objc.nsString("NSFilenamesPboardType")});
+        if (legacy != null and objc.send(bool, legacy, "isKindOfClass:", .{objc.class("NSArray")})) {
+            const count = objc.send(usize, legacy, "count", .{});
+            if (count > self.maximum_file_drop_paths) return error.BudgetExceeded;
+            try paths.ensureTotalCapacity(allocator, count);
+            for (0..count) |index| {
+                const path = objc.utf8(objc.send(objc.Id, legacy, "objectAtIndex:", .{index}));
+                if (path.len == 0) continue;
+                paths.appendAssumeCapacity(try allocator.dupe(u8, path));
+            }
+        }
+    }
+    result.paths = try paths.toOwnedSlice(allocator);
+    paths = .empty;
+
+    var image_data = objc.send(objc.Id, pasteboard, "dataForType:", .{objc.nsString("public.png")});
+    if (image_data == null) {
+        const tiff = objc.send(objc.Id, pasteboard, "dataForType:", .{objc.nsString("public.tiff")});
+        if (tiff != null) {
+            const representation = objc.send(objc.Id, objc.class("NSBitmapImageRep"), "imageRepWithData:", .{tiff});
+            if (representation != null) image_data = objc.send(objc.Id, representation, "representationUsingType:properties:", .{
+                @as(usize, 4), objc.send(objc.Id, objc.class("NSDictionary"), "dictionary", .{}),
+            });
+        }
+    }
+    if (image_data != null) {
+        const length = objc.send(usize, image_data, "length", .{});
+        if (length > self.maximum_clipboard_bytes) return error.BudgetExceeded;
+        if (length != 0) {
+            const bytes = objc.send(?[*]const u8, image_data, "bytes", .{}) orelse return error.PlatformFailure;
+            result.image = .{ .format = .png, .bytes = try allocator.dupe(u8, bytes[0..length]) };
+        }
+    }
+    const promise_receiver = objc.class("NSFilePromiseReceiver");
+    result.contains_promised_files = promise_receiver != null and objc.send(bool, pasteboard, "canReadObjectForClasses:options:", .{
+        objc.arrayWithObject(promise_receiver), @as(objc.Id, null),
+    });
+    return result;
+}
+
+fn openExternalUrl(_: *anyopaque, value: []const u8) Error!void {
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const url = objc.send(objc.Id, objc.class("NSURL"), "URLWithString:", .{objc.nsString(value)}) orelse return error.InvalidConfiguration;
+    const workspace = objc.send(objc.Id, objc.class("NSWorkspace"), "sharedWorkspace", .{}) orelse return error.PlatformFailure;
+    if (!objc.send(bool, workspace, "openURL:", .{url})) return error.PlatformFailure;
+}
+
+fn fileUrl(path: []const u8) Error!objc.Id {
+    return objc.send(objc.Id, objc.class("NSURL"), "fileURLWithPath:", .{objc.nsString(path)}) orelse error.InvalidConfiguration;
+}
+
+fn openExternalPath(_: *anyopaque, path: []const u8) Error!void {
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const workspace = objc.send(objc.Id, objc.class("NSWorkspace"), "sharedWorkspace", .{}) orelse return error.PlatformFailure;
+    if (!objc.send(bool, workspace, "openURL:", .{try fileUrl(path)})) return error.PlatformFailure;
+}
+
+fn revealExternalPath(_: *anyopaque, path: []const u8) Error!void {
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const workspace = objc.send(objc.Id, objc.class("NSWorkspace"), "sharedWorkspace", .{}) orelse return error.PlatformFailure;
+    objc.send(void, workspace, "activateFileViewerSelectingURLs:", .{objc.arrayWithObject(try fileUrl(path))});
+}
+
+fn printExternalPath(_: *anyopaque, path: []const u8) Error!void {
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const workspace = objc.send(objc.Id, objc.class("NSWorkspace"), "sharedWorkspace", .{}) orelse return error.PlatformFailure;
+    const opened = objc.send(bool, workspace, "openURLs:withAppBundleIdentifier:options:additionalEventParamDescriptor:launchIdentifiers:", .{
+        objc.arrayWithObject(try fileUrl(path)), @as(objc.Id, null), @as(usize, 2), @as(objc.Id, null), @as(?*objc.Id, null),
+    });
+    if (!opened) return error.PlatformFailure;
+}
+
 fn setApplicationMenu(raw: *anyopaque, items: []const api.MenuItem) Error!void {
     const self = cast(raw);
     var pool = objc.AutoreleasePool.init();
@@ -1128,6 +1450,8 @@ fn appendMenuItems(self: *Context, menu: objc.Id, items: []const api.MenuItem) E
             defer objc.release(item);
             objc.send(void, item, "setTarget:", .{self.menu_target});
             objc.send(void, item, "setTag:", .{@as(isize, @bitCast(action_item.action.encode()))});
+            const payload = objc.send(objc.Id, objc.class("NSNumber"), "numberWithUnsignedLongLong:", .{action_item.payload});
+            objc.send(void, item, "setRepresentedObject:", .{payload});
             objc.send(void, item, "setEnabled:", .{action_item.enabled});
             objc.send(void, item, "setState:", .{@as(isize, if (action_item.checked) 1 else 0)});
             objc.send(void, menu, "addItem:", .{item});
@@ -1237,6 +1561,8 @@ fn menuAction(target: objc.Id, _: objc.Sel, sender: objc.Id) callconv(.c) void {
     const self = (objc.getIvar(?*Context, target, "_ziguiContext") orelse null) orelse return;
     const encoded: u64 = @bitCast(objc.send(isize, sender, "tag", .{}));
     const action_id: handles.ActionId = .{ .index = @truncate(encoded), .generation = @truncate(encoded >> 32) };
+    const represented = objc.send(objc.Id, sender, "representedObject", .{});
+    const payload = if (represented != null) objc.send(u64, represented, "unsignedLongLongValue", .{}) else 0;
     const key_window = objc.send(objc.Id, self.application, "keyWindow", .{});
     var selected: ?handles.WindowId = null;
     var iterator = self.windows.iterator();
@@ -1247,7 +1573,7 @@ fn menuAction(target: objc.Id, _: objc.Sel, sender: objc.Id) callconv(.c) void {
             break;
         }
     }
-    if (selected) |window| self.queue(window, .{ .menu_action = action_id });
+    if (selected) |window| self.queue(window, .{ .menu_action = .{ .action = action_id, .payload = payload } });
 }
 
 const Method = struct { name: [*:0]const u8, implementation: objc.Imp, encoding: [*:0]const u8 };

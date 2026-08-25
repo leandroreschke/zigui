@@ -23,6 +23,10 @@ pub const ActionEvent = struct {
     id: handles.ActionId,
     source: Source,
     key_event: ?event.KeyEvent = null,
+    /// Opaque application-owned value supplied by a native menu item. It is
+    /// zero for keyboard, accessibility, and ordinary application-menu
+    /// dispatch unless the menu definition explicitly supplies a payload.
+    menu_payload: u64 = 0,
 
     pub const Source = enum { keyboard, menu, accessibility, programmatic };
 };

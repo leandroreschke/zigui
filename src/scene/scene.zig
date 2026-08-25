@@ -1,6 +1,8 @@
 const std = @import("std");
 const Error = @import("../core/error.zig").Error;
 const geometry = @import("../core/geometry.zig");
+const handles = @import("../core/handle.zig");
+const native_media = @import("../core/native_media.zig");
 const custom = @import("../compose/custom.zig");
 const abi = @import("abi.zig");
 const render = @import("../render/api.zig");
@@ -17,6 +19,7 @@ pub const Limits = struct {
     path_vertices: usize = 8_000_000,
     custom_passes: usize = 65_536,
     custom_payload_bytes: usize = 64 * 1024 * 1024,
+    native_media_placements: usize = 4_096,
 };
 
 pub const Scene = struct {
@@ -36,6 +39,7 @@ pub const Scene = struct {
     external_surfaces: std.ArrayList(abi.ExternalSurface) = .empty,
     custom_passes: std.ArrayList(abi.CustomPass) = .empty,
     custom_payload: std.ArrayList(u8) = .empty,
+    native_media_placements: std.ArrayList(native_media.Placement) = .empty,
     generation: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Scene {
@@ -58,6 +62,7 @@ pub const Scene = struct {
         self.external_surfaces.deinit(self.allocator);
         self.custom_passes.deinit(self.allocator);
         self.custom_payload.deinit(self.allocator);
+        self.native_media_placements.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -77,6 +82,7 @@ pub const Scene = struct {
         self.external_surfaces.clearRetainingCapacity();
         self.custom_passes.clearRetainingCapacity();
         self.custom_payload.clearRetainingCapacity();
+        self.native_media_placements.clearRetainingCapacity();
         self.generation +%= 1;
         if (self.generation == 0) self.generation = 1;
     }
@@ -391,6 +397,14 @@ pub const Builder = struct {
         self.commitOperation(plan, .custom_passes, start, 1, none_index, extension.index);
     }
 
+    pub fn nativeMedia(self: *Builder, id: handles.NativeMediaId, bounds: geometry.Rect) Error!void {
+        if (!id.isValid()) return error.InvalidHandle;
+        if (!validRect(bounds) or bounds.size.width <= 0 or bounds.size.height <= 0) return error.InvalidScene;
+        for (self.scene.native_media_placements.items) |placement| if (placement.id.eql(id)) return error.InvalidScene;
+        if (self.scene.native_media_placements.items.len >= self.limits.native_media_placements) return error.BudgetExceeded;
+        try self.scene.native_media_placements.append(self.scene.allocator, .{ .id = id, .bounds = bounds });
+    }
+
     pub fn emitCustom(context: *anyopaque, command: custom.PaintCommand) Error!void {
         const self: *Builder = @ptrCast(@alignCast(context));
         switch (command) {
@@ -421,6 +435,7 @@ pub const Builder = struct {
             .monochrome_sprite => |value| try self.monochromeSprite(value),
             .color_sprite => |value| try self.colorSprite(value),
             .external_surface => |value| try self.externalSurface(value),
+            .native_media => |value| try self.nativeMedia(value.id, value.bounds),
             .custom_pass => |value| try self.customPass(value.extension, value.bounds, value.payload, value.flags),
         }
     }
