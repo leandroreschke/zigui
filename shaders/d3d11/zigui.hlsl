@@ -8,7 +8,7 @@ struct Affine { float m11; float m12; float m21; float m22; float tx; float ty; 
 struct Quad { Rect bounds; Color background; Color border_color; Insets border_widths; Radii radii; };
 struct Shadow { Rect bounds; Color color; Radii radii; Point offset; float blur_radius; float spread; };
 struct Underline { Rect bounds; Color color; float thickness; float wave_amplitude; float wave_period; float reserved; };
-struct Sprite { Rect bounds; Rect uv_bounds; Color color; uint2 texture; uint tile_generation; uint format; };
+struct Sprite { Rect bounds; Rect uv_bounds; Color color; uint2 texture_id; uint tile_generation; uint format; };
 struct ExternalSurface { Rect bounds; Rect uv_bounds; uint2 surface; uint generation; uint color_space; float opacity; float reserved; };
 struct Material { uint kind; uint stop_start; uint stop_count; uint reserved; Color color; Point start; Point end; Affine gradient_transform; };
 struct GradientStop { float offset; float3 reserved; Color color; };
@@ -60,38 +60,38 @@ struct PathOut {
     float4 color : COLOR;
 };
 
-float2 transform_point(Affine transform, float2 point) {
+float2 transform_point(Affine transform, float2 position) {
     return float2(
-        point.x * transform.m11 + point.y * transform.m21 + transform.tx,
-        point.x * transform.m12 + point.y * transform.m22 + transform.ty);
+        position.x * transform.m11 + position.y * transform.m21 + transform.tx,
+        position.x * transform.m12 + position.y * transform.m22 + transform.ty);
 }
 
-float2 active_transform(float2 point) {
-    return float2(dot(float3(point, 1.0), transform_x.xyz), dot(float3(point, 1.0), transform_y.xyz));
+float2 active_transform(float2 position) {
+    return float2(dot(float3(position, 1.0), transform_x.xyz), dot(float3(position, 1.0), transform_y.xyz));
 }
 
-float4 clip_position(float2 point) {
-    float2 local = point - viewport_origin;
+float4 clip_position(float2 position) {
+    float2 local = position - viewport_origin;
     return float4(local.x / viewport.x * 2.0 - 1.0, 1.0 - local.y / viewport.y * 2.0, 0.0, 1.0);
 }
 
 float2 corner(uint vertex_id) {
-    return float2((vertex_id == 1 || vertex_id == 2) ? 1.0 : 0.0, vertex_id >= 2 ? 1.0 : 0.0);
+    return float2((vertex_id == 1 || vertex_id == 3) ? 1.0 : 0.0, vertex_id >= 2 ? 1.0 : 0.0);
 }
 
-float rounded_distance(float2 point, Rect bounds, Radii radii) {
+float rounded_distance(float2 position, Rect bounds, Radii radii) {
     float2 center = float2(bounds.origin.x + bounds.size.width * 0.5, bounds.origin.y + bounds.size.height * 0.5);
-    bool left = point.x < center.x;
-    bool top = point.y < center.y;
+    bool left = position.x < center.x;
+    bool top = position.y < center.y;
     float radius = top ? (left ? radii.top_left : radii.top_right) : (left ? radii.bottom_left : radii.bottom_right);
     radius = clamp(radius, 0.0, min(bounds.size.width, bounds.size.height) * 0.5);
     float2 half_size = float2(bounds.size.width, bounds.size.height) * 0.5;
-    float2 q = abs(point - center) - half_size + radius;
+    float2 q = abs(position - center) - half_size + radius;
     return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
 }
 
-float rounded_mask(float2 point, Rect bounds, Radii radii) {
-    return 1.0 - smoothstep(-0.75, 0.75, rounded_distance(point, bounds, radii));
+float rounded_mask(float2 position, Rect bounds, Radii radii) {
+    return 1.0 - smoothstep(-0.75, 0.75, rounded_distance(position, bounds, radii));
 }
 
 float clip_mask(float2 transformed, uint index) {
@@ -105,9 +105,9 @@ float clip_mask(float2 transformed, uint index) {
     return result;
 }
 
-float2 radial_parameter(float2 point, float2 c0, float r0, float2 c1, float r1) {
+float2 radial_parameter(float2 position, float2 c0, float r0, float2 c1, float r1) {
     float2 centers = c1 - c0;
-    float2 relative = point - c0;
+    float2 relative = position - c0;
     float radius_delta = r1 - r0;
     float a = dot(centers, centers) - radius_delta * radius_delta;
     float b = -2.0 * (dot(relative, centers) + r0 * radius_delta);
@@ -128,7 +128,7 @@ float2 radial_parameter(float2 point, float2 c0, float r0, float2 c1, float r1) 
     return first_valid ? float2(first, 1.0) : float2(0.0, 0.0);
 }
 
-float4 material_color(float2 point, uint index, Color fallback) {
+float4 material_color(float2 position, uint index, Color fallback) {
     if (index == 0xffffffff) return float4(fallback.r, fallback.g, fallback.b, fallback.a);
     Material material = materials[index];
     if (material.kind == 1) return float4(material.color.r, material.color.g, material.color.b, material.color.a);
@@ -137,9 +137,9 @@ float4 material_color(float2 point, uint index, Color fallback) {
     if (material.kind == 2) {
         float2 start = float2(material.start.x, material.start.y);
         float2 delta = float2(material.end.x, material.end.y) - start;
-        t = clamp(dot(point - start, delta) / max(dot(delta, delta), 0.00001), 0.0, 1.0);
+        t = clamp(dot(position - start, delta) / max(dot(delta, delta), 0.00001), 0.0, 1.0);
     } else {
-        float2 local = transform_point(material.gradient_transform, point);
+        float2 local = transform_point(material.gradient_transform, position);
         float2 radial = radial_parameter(local, float2(material.start.x, material.start.y), material.color.r,
             float2(material.end.x, material.end.y), material.color.g);
         if (radial.y == 0.0) return float4(0.0, 0.0, 0.0, 0.0);
