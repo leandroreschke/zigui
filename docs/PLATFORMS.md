@@ -7,12 +7,16 @@ absent instead of installing a hidden fallback.
 | Contract | macOS | Windows | Wayland | X11 | Headless |
 | --- | --- | --- | --- | --- | --- |
 | Window/event loop | AppKit | Win32 | in-tree Wayland client | in-tree X11 client | deterministic queue |
+| Always-on-top windows | NSWindow level | Win32 topmost | unsupported | `_NET_WM_STATE_ABOVE` | deterministic state |
 | Renderer | Metal | D3D11 | Vulkan | Vulkan | CPU reference |
 | Text engine | in-tree | in-tree | in-tree | in-tree | in-tree when enabled |
 | Native IME | `NSTextInputClient` | IMM32 | text-input-v3 when advertised | XIM wire protocol | absent |
 | Accessibility | NSAccessibility | UI Automation | AT-SPI over in-tree D-Bus | AT-SPI over in-tree D-Bus | semantic tree only |
 | Clipboard text | NSPasteboard | Win32 clipboard | data-device when advertised | X selections | deterministic memory clipboard |
+| Rich clipboard | read text/file paths/PNG, detect promises, write file paths | absent | absent | absent | text snapshot |
 | Open/save dialogs | AppKit panels | Win32 common dialogs | XDG desktop portal when reachable | XDG desktop portal when reachable | absent |
+| Open/reveal/print service | NSWorkspace/Finder | absent | absent | absent | absent |
+| Native media layer | AVPlayerLayer when media enabled | absent | absent | absent | absent |
 | Native application/context menus | yes | yes | absent; use ZigUI controls | absent; use ZigUI controls | absent |
 | Incoming file drag/drop | entered, moved, exited, dropped | dropped | entered, moved, exited, dropped | entered, moved, exited, dropped | injectable input events |
 | Display enumeration | CoreGraphics/AppKit | monitor APIs | output protocol | RandR | one deterministic display |
@@ -42,6 +46,22 @@ external helper process is used.
 The Windows legacy file-drop contract provides a completed list, not native
 hover phases. ZigUI emits `file_drop_performed` for that path. Applications
 must not infer that entered/updated events exist on every platform.
+
+macOS exposes `ApplicationServices` for opening URLs/files, revealing files in
+Finder, and asking the owning application to print a document. Rich clipboard
+snapshots own their text, file paths, and PNG bytes and explicitly report the
+presence of promised-file representations. macOS can also publish bounded file
+paths as native file URLs. These values are bounded by the normal clipboard and
+file-path budgets.
+
+With `-Dmedia=true`, macOS also exposes a bounded `NativeMedia` service backed
+by AVPlayer and AVPlayerLayer. Its handles are tied to a ZigUI window and offer
+frame updates, play/pause/seek, volume, mute, state, and deterministic teardown.
+`widgets.NativeMediaView` synchronizes final committed layout bounds without
+mutating platform state during component composition. The layer is a native
+overlay above the Metal scene and does not inherit ZigUI clips or transforms;
+applications keep controls outside its rectangle or provide their own
+scene-integrated external surface source when GPU compositing order is required.
 
 ## Surface and device lifecycle
 

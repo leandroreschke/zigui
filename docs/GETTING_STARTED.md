@@ -154,6 +154,29 @@ grapheme-safe selection, word/line navigation, pointer selection, IME marked
 text, clipboard editing, and bounded undo/redo history. Password fields never
 copy their contents to the clipboard.
 
+Native context-menu definitions may attach an opaque `u64` payload to each
+action item. ZigUI copies that value into `ActionEvent.menu_payload`, allowing
+an application to identify the originating record without maintaining a
+global action-to-selection bridge. Keyboard and accessibility actions receive
+zero unless a native menu supplied a payload.
+
+`App.readClipboardContents` returns one allocator-owned snapshot containing
+available text, native file paths, encoded PNG bytes, and promised-file
+detection. `App.writeClipboardPaths` publishes native file URLs when that
+optional clipboard operation is available. `App.openUrl`, `openPath`,
+`revealPath`, and `printPath` use the
+platform's optional application-services contract. A missing native service is
+reported as `error.MissingCapability`; ZigUI never launches a helper fallback.
+
+On macOS with `-Dmedia=true`, `App.createNativeMedia` creates a bounded native
+AVPlayerLayer attached to a ZigUI window. The returned generational handle
+supports frame updates, play/pause/seek, volume, mute, state queries, and
+explicit destruction. Closing the owner window destroys any remaining native
+players. For layout-driven presentation, keep a `widgets.NativeMediaView` at a
+stable address and expose it as a custom node; its paint declaration moves the
+native layer to the final committed bounds. Do not call native-media services
+from component build, measure, arrange, prepare, or paint hooks.
+
 ## Tasks
 
 ZigUI deliberately owns no thread pool or async runtime. An application may

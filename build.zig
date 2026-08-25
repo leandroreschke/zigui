@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
     const enable_accessibility = b.option(bool, "a11y", "Compile native accessibility adapters") orelse true;
     const enable_images = b.option(bool, "images", "Compile image resource support") orelse false;
     const enable_svg = b.option(bool, "svg", "Compile the optional SVG provider") orelse false;
-    const enable_media = b.option(bool, "media", "Compile external media-surface providers") orelse false;
+    const enable_media = b.option(bool, "media", "Compile media sources and optional native playback adapters") orelse false;
     const enable_inspector = b.option(bool, "inspector", "Compile the optional UI inspector") orelse false;
     const enable_tracing = b.option(bool, "tracing", "Compile detailed runtime tracing") orelse false;
 
@@ -76,7 +76,7 @@ pub fn build(b: *std.Build) void {
             .module = options.createModule(),
         }},
     });
-    linkPlatform(zigui, platform);
+    linkPlatform(zigui, platform, enable_media);
     if (platform == .macos and renderer == .metal) addMetalLibrary(b, zigui, metal_toolchain);
     if (renderer == .d3d11) zigui.addAnonymousImport("zigui_hlsl_source", .{
         .root_source_file = b.path("shaders/d3d11/zigui.hlsl"),
@@ -281,7 +281,7 @@ fn validateCombination(platform: Platform, renderer: Renderer) void {
     if (!valid) @panic("invalid ZigUI platform and renderer combination");
 }
 
-fn linkPlatform(module: *std.Build.Module, platform: Platform) void {
+fn linkPlatform(module: *std.Build.Module, platform: Platform, enable_media: bool) void {
     switch (platform) {
         .auto => unreachable,
         .headless => {},
@@ -293,6 +293,10 @@ fn linkPlatform(module: *std.Build.Module, platform: Platform) void {
             module.linkFramework("Foundation", .{});
             module.linkFramework("Metal", .{});
             module.linkFramework("QuartzCore", .{});
+            if (enable_media) {
+                module.linkFramework("AVFoundation", .{});
+                module.linkFramework("CoreMedia", .{});
+            }
             module.linkSystemLibrary("objc", .{});
         },
         .windows => {

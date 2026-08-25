@@ -57,6 +57,9 @@ pub const SvgId = Handle(struct {
 pub const MediaId = Handle(struct {
     const name = "Media";
 });
+pub const NativeMediaId = Handle(struct {
+    const name = "NativeMedia";
+});
 pub const RenderExtensionId = Handle(struct {
     const name = "RenderExtension";
 });

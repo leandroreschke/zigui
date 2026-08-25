@@ -39,6 +39,7 @@ const OwnedMenuItem = union(enum) {
     action: struct {
         label: []u8,
         action: handles.ActionId,
+        payload: u64,
         command: u32,
         enabled: bool,
         checked: bool,
@@ -111,7 +112,7 @@ pub const Context = struct {
     class_registered: bool = false,
     com_initialized: bool = false,
     application_items: []OwnedMenuItem = &.{},
-    menu_actions: std.AutoHashMap(u32, handles.ActionId),
+    menu_actions: std.AutoHashMap(u32, api.MenuInvocation),
     next_menu_command: u32 = 0x1000,
     accessibility: ?*windows_a11y.Adapter = null,
 
@@ -136,7 +137,7 @@ pub const Context = struct {
             .thread_id = win.GetCurrentThreadId(),
             .performance_frequency = frequency,
             .windows = std.AutoHashMap(u64, *NativeWindow).init(allocator),
-            .menu_actions = std.AutoHashMap(u32, handles.ActionId).init(allocator),
+            .menu_actions = std.AutoHashMap(u32, api.MenuInvocation).init(allocator),
             .maximum_events = maximum_events,
             .maximum_windows = maximum_windows,
             .maximum_event_payload_bytes = maximum_event_payload_bytes,
@@ -718,6 +719,10 @@ fn commandWindow(raw: *anyopaque, id: handles.WindowId, command: api.WindowComma
             },
             .fullscreen => try enterFullscreen(native),
         },
+        .always_on_top => |enabled| {
+            const insert_after = if (enabled) win.HWND_TOPMOST else win.HWND_NOTOPMOST;
+            if (win.SetWindowPos(native.hwnd, insert_after, 0, 0, 0, 0, win.SWP_NOMOVE | win.SWP_NOSIZE | win.SWP_NOACTIVATE) == 0) return error.PlatformFailure;
+        },
     }
 }
 
@@ -939,7 +944,7 @@ fn writeClipboard(raw: *anyopaque, text: []const u8) Error!void {
 
 fn setApplicationMenu(raw: *anyopaque, items: []const api.MenuItem) Error!void {
     const self = cast(raw);
-    var actions = std.AutoHashMap(u32, handles.ActionId).init(self.allocator);
+    var actions = std.AutoHashMap(u32, api.MenuInvocation).init(self.allocator);
     errdefer actions.deinit();
     var next: u32 = 0x1000;
     const owned = try cloneMenuItems(self.allocator, items, &actions, &next);
@@ -984,7 +989,7 @@ fn setApplicationMenu(raw: *anyopaque, items: []const api.MenuItem) Error!void {
 fn cloneMenuItems(
     allocator: std.mem.Allocator,
     source: []const api.MenuItem,
-    actions: *std.AutoHashMap(u32, handles.ActionId),
+    actions: *std.AutoHashMap(u32, api.MenuInvocation),
     next: *u32,
 ) Error![]OwnedMenuItem {
     const result = try allocator.alloc(OwnedMenuItem, source.len);
@@ -1002,10 +1007,11 @@ fn cloneMenuItems(
                 next.* += 1;
                 const label = try allocator.dupe(u8, definition.label);
                 errdefer allocator.free(label);
-                try actions.put(command, definition.action);
+                try actions.put(command, .{ .action = definition.action, .payload = definition.payload });
                 break :action .{ .action = .{
                     .label = label,
                     .action = definition.action,
+                    .payload = definition.payload,
                     .command = command,
                     .enabled = definition.enabled,
                     .checked = definition.checked,
@@ -1068,7 +1074,7 @@ fn detachAndDestroyMenu(window: *NativeWindow) void {
 fn showContextMenu(raw: *anyopaque, id: handles.WindowId, point: geometry.Point, items: []const api.MenuItem) Error!void {
     const self = cast(raw);
     const native = self.windows.get(id.encode()) orelse return error.InvalidHandle;
-    var actions = std.AutoHashMap(u32, handles.ActionId).init(self.allocator);
+    var actions = std.AutoHashMap(u32, api.MenuInvocation).init(self.allocator);
     defer actions.deinit();
     var next: u32 = 1;
     const menu = try buildMenu(self.allocator, items, &actions, &next, true);
@@ -1079,13 +1085,13 @@ fn showContextMenu(raw: *anyopaque, id: handles.WindowId, point: geometry.Point,
     };
     if (win.ClientToScreen(native.hwnd, &screen) == 0) return error.PlatformFailure;
     const command = win.TrackPopupMenu(menu, win.TPM_RETURNCMD | win.TPM_RIGHTBUTTON, screen.x, screen.y, 0, native.hwnd, null);
-    if (actions.get(command)) |action_id| self.queue(id, .{ .menu_action = action_id });
+    if (actions.get(command)) |invocation| self.queue(id, .{ .menu_action = invocation });
 }
 
 fn buildMenu(
     allocator: std.mem.Allocator,
     items: []const api.MenuItem,
-    actions: *std.AutoHashMap(u32, handles.ActionId),
+    actions: *std.AutoHashMap(u32, api.MenuInvocation),
     next: *u32,
     popup: bool,
 ) Error!win.HMENU {
@@ -1098,7 +1104,7 @@ fn buildMenu(
             if (next.* > 0xffff) return error.OutOfSlots;
             const command = next.*;
             next.* += 1;
-            try actions.put(command, definition.action);
+            try actions.put(command, .{ .action = definition.action, .payload = definition.payload });
             const label = try std.unicode.utf8ToUtf16LeAllocZ(allocator, definition.label);
             defer allocator.free(label);
             var flags = win.MF_STRING;
@@ -1354,7 +1360,7 @@ fn windowProcedure(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam
         },
         win.WM_COMMAND => {
             const command: u32 = win.lowWord(wparam);
-            if (self.menu_actions.get(command)) |action_id| self.queue(window.id, .{ .menu_action = action_id });
+            if (self.menu_actions.get(command)) |invocation| self.queue(window.id, .{ .menu_action = invocation });
             return 0;
         },
         else => return win.DefWindowProcW(hwnd, message, wparam, lparam),

@@ -77,4 +77,7 @@ progressive or unspecified interlace and mono, 4:2:0, 4:2:2, or 4:4:4 chroma.
 It converts frames to uploadable RGBA8 in-tree. The media interfaces also admit
 application-owned native GPU surfaces without imposing a decoder dependency.
 Other containers and compressed codecs require an application provider; ZigUI
-does not launch system decoders or bundle codec libraries.
+does not launch helper subprocesses or bundle codec libraries. On macOS builds
+with media enabled, the optional native-media service can instead hand a local
+file or URL to AVFoundation and present it through a window-bound AVPlayerLayer,
+including native audio ownership, seek, volume, and mute controls.

@@ -28,6 +28,9 @@ pub const HGLOBAL = HANDLE;
 pub const HDROP = HANDLE;
 pub const HIMC = HANDLE;
 
+pub const HWND_TOPMOST: HWND = @ptrFromInt(std.math.maxInt(usize));
+pub const HWND_NOTOPMOST: HWND = @ptrFromInt(std.math.maxInt(usize) - 1);
+
 pub const POINT = extern struct { x: LONG = 0, y: LONG = 0 };
 pub const SIZE = extern struct { cx: LONG = 0, cy: LONG = 0 };
 pub const RECT = extern struct { left: LONG = 0, top: LONG = 0, right: LONG = 0, bottom: LONG = 0 };

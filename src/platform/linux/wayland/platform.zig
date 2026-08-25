@@ -1116,6 +1116,7 @@ fn commandWindow(raw: *anyopaque, id: handles.WindowId, command: api.WindowComma
         // The Wayland toplevel protocol intentionally gives placement and
         // arbitrary resize authority to the compositor.
         .move, .resize => return error.Unsupported,
+        .always_on_top => return error.Unsupported,
         .mode => |mode| switch (mode) {
             .normal => {
                 try protocol.xdgToplevelSetMaximized(&self.client.connection, native.toplevel, false);

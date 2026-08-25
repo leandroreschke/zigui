@@ -37,6 +37,7 @@ pub const errors = @import("core/error.zig");
 pub const geometry = @import("core/geometry.zig");
 pub const handles = @import("core/handle.zig");
 pub const memory = @import("core/memory.zig");
+pub const native_media = @import("core/native_media.zig");
 pub const metrics = @import("core/metrics.zig");
 pub const TrackedAllocator = @import("core/tracked_allocator.zig").TrackedAllocator;
 
