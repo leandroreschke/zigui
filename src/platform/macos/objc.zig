@@ -84,6 +84,13 @@ pub fn arrayWithObject(value: Id) Id {
     return send(Id, class("NSArray"), "arrayWithObject:", .{value});
 }
 
+/// Builds an NSArray through the fixed-arity count API. The convenient
+/// `arrayWithObjects:` selector is variadic; dispatching it through a typed
+/// objc_msgSend function pointer is not ABI-safe on every macOS build.
+pub fn arrayWithObjects(objects: []const Id) Id {
+    return send(Id, class("NSArray"), "arrayWithObjects:count:", .{ objects.ptr, objects.len });
+}
+
 pub fn setIvar(comptime T: type, object: Id, name: [*:0]const u8, value: T) bool {
     const raw_object = object orelse return false;
     const target_class = object_getClass(object) orelse return false;
@@ -163,4 +170,13 @@ fn usesStructReturn(comptime Return: type) bool {
         .@"struct", .@"union" => @sizeOf(Return) > 16,
         else => false,
     };
+}
+
+test "macOS object arrays use fixed-arity Objective-C dispatch" {
+    var pool = AutoreleasePool.init();
+    defer pool.deinit();
+
+    const values = [_]Id{ nsString("first"), nsString("second") };
+    const array = arrayWithObjects(values[0..]) orelse return error.PlatformFailure;
+    try std.testing.expectEqual(@as(usize, values.len), send(usize, array, "count", .{}));
 }

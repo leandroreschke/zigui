@@ -1017,7 +1017,8 @@ fn layoutEqual(a: layout.LayoutStyle, b: layout.LayoutStyle) bool {
 
 fn paintEqual(a: style.PaintStyle, b: style.PaintStyle) bool {
     if (!brushEqual(a.background, b.background) or !std.meta.eql(a.border, b.border) or
-        !std.meta.eql(a.radii, b.radii) or a.opacity != b.opacity or !std.meta.eql(a.transform, b.transform) or
+        !std.meta.eql(a.radii, b.radii) or !std.meta.eql(a.backdrop_effect, b.backdrop_effect) or
+        a.opacity != b.opacity or !std.meta.eql(a.transform, b.transform) or
         a.shadows.count != b.shadows.count) return false;
     return sliceMetaEqual(style.ShadowStyle, a.shadows.values[0..a.shadows.count], b.shadows.values[0..b.shadows.count]);
 }
@@ -1094,6 +1095,11 @@ fn validateStyle(value: style.Style) Error!void {
         !std.math.isFinite(paint.opacity) or paint.opacity < 0 or paint.opacity > 1 or
         !validTransform(paint.transform) or paint.shadows.count > paint.shadows.values.len)
         return error.InvalidConfiguration;
+    if (paint.backdrop_effect) |effect| {
+        if (!std.math.isFinite(effect.blur_radius) or effect.blur_radius < 0 or effect.blur_radius > 128 or
+            !std.math.isFinite(effect.saturation) or effect.saturation < 0 or effect.saturation > 4)
+            return error.InvalidConfiguration;
+    }
     for (paint.shadows.values[0..paint.shadows.count]) |shadow| {
         if (!validColor(shadow.color) or !validPoint(shadow.offset) or
             !std.math.isFinite(shadow.blur_radius) or shadow.blur_radius < 0 or !std.math.isFinite(shadow.spread))

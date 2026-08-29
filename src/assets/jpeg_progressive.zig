@@ -572,12 +572,15 @@ const BitReader = struct {
         return @intCast(try self.readBits(1));
     }
     fn readBits(self: *BitReader, count: u6) Error!u32 {
+        if (count == 0 or count > 32) return error.InvalidImage;
         while (self.count < count) {
             self.bits = (self.bits << 8) | try self.readByte();
             self.count += 8;
         }
         self.count -= count;
-        return @truncate(self.bits >> @intCast(self.count));
+        const value: u32 = @truncate(self.bits >> @intCast(self.count));
+        const mask = if (count == 32) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(count)) - 1;
+        return value & mask;
     }
     fn readByte(self: *BitReader) Error!u8 {
         if (self.offset >= self.bytes.len) return error.InvalidImage;
@@ -609,6 +612,15 @@ const BitReader = struct {
         self.offset += 1;
     }
 };
+
+test "bit reader returns only the requested high bits" {
+    var bits: BitReader = .{ .bytes = &.{ 0b10110110, 0b01101001 } };
+    try std.testing.expectEqual(@as(u32, 0b101), try bits.readBits(3));
+    try std.testing.expectEqual(@as(u1, 1), try bits.readBit());
+    try std.testing.expectEqual(@as(u32, 0b0110), try bits.readBits(4));
+    try std.testing.expectEqual(@as(u32, 0b01101001), try bits.readBits(8));
+    try std.testing.expectError(error.InvalidImage, bits.readBits(0));
+}
 
 fn receiveExtend(bits: *BitReader, count: u8) Error!i32 {
     if (count == 0) return 0;

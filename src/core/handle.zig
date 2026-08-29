@@ -87,6 +87,15 @@ pub const SubscriptionId = Handle(struct {
 pub const ActionId = Handle(struct {
     const name = "Action";
 });
+pub const PromisedFileBatchId = Handle(struct {
+    const name = "PromisedFileBatch";
+});
+pub const PromisedFileOperationId = Handle(struct {
+    const name = "PromisedFileOperation";
+});
+pub const PageCaptureRequestId = Handle(struct {
+    const name = "PageCaptureRequest";
+});
 
 pub fn SlotPool(comptime T: type, comptime Id: type) type {
     return struct {

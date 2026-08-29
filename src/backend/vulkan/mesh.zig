@@ -165,6 +165,7 @@ pub const Mesh = struct {
             const kind = std.enums.fromInt(scene_abi.OperationKind, operation.kind) orelse return error.InvalidScene;
             switch (kind) {
                 .push_clip, .pop_clip => continue,
+                .backdrop_effect => return error.Unsupported,
                 .push_layer => {
                     if (depth + 1 >= targets.len or operation.start >= view.layers.len) return error.InvalidScene;
                     depth += 1;
@@ -267,6 +268,7 @@ pub const Mesh = struct {
                 .transform = transform,
                 .clip = try self.resolvedClipBounds(operation.clip),
             } }),
+            .backdrop_effect => return error.Unsupported,
             .push_clip, .pop_clip, .push_layer, .pop_layer => unreachable,
         }
     }

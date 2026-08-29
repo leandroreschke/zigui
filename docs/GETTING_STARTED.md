@@ -121,6 +121,16 @@ suspended and its dependencies and tasks are detached; when the parent is
 destroyed, children are recursively destroyed. A child cannot be mounted under
 another parent or window.
 
+Application-owned visual timelines can opt a component into the native
+display cadence with `ui.Component.Descriptor.fromWithFrame(T, &model)`. The
+model implements `frame(now_ns) !ui.Component.FrameUpdate`; the timestamp uses
+the platform event-loop clock, `dirty` identifies the retained work changed by
+that sample, and `request_next_frame` keeps the native display scheduler active
+only while more samples are required. Ordinary components are not scanned.
+Easing, semantic targets, interruption, and reduced-motion policy remain in
+the application. The hook runs before composition in a phase where App service
+mutation is rejected, so it cannot re-enter window or resource ownership.
+
 ## Standard controls and custom elements
 
 `ui.widgets` supplies the common desktop controls: button, toggle, radio,
@@ -160,6 +170,22 @@ an application to identify the originating record without maintaining a
 global action-to-selection bridge. Keyboard and accessibility actions receive
 zero unless a native menu supplied a payload.
 
+Desktop shortcuts that belong to a surrounding workspace but must yield to an
+editable field can use `App.bindActionExcludingTextInput`. The router derives
+that state from the committed focused semantic role (`text_field` or
+`search_field`) before resolving keyboard bindings. The exclusion applies only
+to keyboard resolution; menu, accessibility, and programmatic actions retain
+their ordinary context dispatch.
+
+Native menu topology remains application-owned. A macOS application group may
+include an explicit `quit_application` item when it needs the standard Quit
+action with a product-specific label; ZigUI synthesizes an app-named Quit only
+when that action is absent. Likewise, a top-level `Window` submenu is installed
+as the application's native windows menu without adding another framework
+Window menu. When no Window submenu is supplied, ZigUI provides the standard
+Minimize, Zoom, Enter Full Screen, and Bring All to Front fallback. System menu
+actions retain AppKit ownership, selectors, and key equivalents in both cases.
+
 `App.readClipboardContents` returns one allocator-owned snapshot containing
 available text, native file paths, encoded PNG bytes, and promised-file
 detection. `App.writeClipboardPaths` publishes native file URLs when that
@@ -172,10 +198,18 @@ On macOS with `-Dmedia=true`, `App.createNativeMedia` creates a bounded native
 AVPlayerLayer attached to a ZigUI window. The returned generational handle
 supports frame updates, play/pause/seek, volume, mute, state queries, and
 explicit destruction. Closing the owner window destroys any remaining native
-players. For layout-driven presentation, keep a `widgets.NativeMediaView` at a
+players. State queries report platform-neutral `loading`, `ready`, or `failed`
+readiness, a `has_presented_frame` signal independent of playback rate, and may
+include a bounded inline-owned `error_description` for a failed item, so
+product code can render its own status treatment without native object access.
+For layout-driven presentation, keep a `widgets.NativeMediaView` at a
 stable address and expose it as a custom node; its paint declaration moves the
 native layer to the final committed bounds. Do not call native-media services
 from component build, measure, arrange, prepare, or paint hooks.
+Read-only `App.nativeMediaState` queries are allowed from a registered
+component frame hook so playback controls can sample at the platform display
+cadence. Playback, seek, volume, mute, frame, creation, and destruction remain
+serialized mutations and are rejected from that hook.
 
 ## Tasks
 

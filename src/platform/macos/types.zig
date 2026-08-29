@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub const CGFloat = f64;
 
 pub const Point = extern struct { x: CGFloat = 0, y: CGFloat = 0 };
@@ -5,7 +7,7 @@ pub const Size = extern struct { width: CGFloat = 0, height: CGFloat = 0 };
 pub const Rect = extern struct { origin: Point = .{}, size: Size = .{} };
 pub const Range = extern struct { location: usize, length: usize };
 
-pub const not_found = ~@as(usize, 0);
+pub const not_found: usize = @intCast(std.math.maxInt(isize));
 pub const any_event_mask = ~@as(u64, 0);
 pub const backing_store_buffered: usize = 2;
 

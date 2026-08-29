@@ -101,8 +101,29 @@ pub const Painter = struct {
         }
 
         const has_transform = !std.meta.eql(borrowed.paint.transform, geometry.Affine2D.identity);
-        const has_layer = has_transform or borrowed.paint.opacity < 0.9999;
-        if (has_layer) _ = try self.builder.pushLayer(borrowed.paint.opacity, .normal, borrowed.paint.transform.around(record.layout.bounds.origin));
+        const has_opacity = borrowed.paint.opacity < 0.9999;
+        const has_layer = has_transform or has_opacity;
+        var transform_layer = false;
+        var opacity_layer = false;
+        if (borrowed.paint.backdrop_effect) |effect| {
+            if (has_transform) {
+                _ = try self.builder.pushLayer(1, .normal, borrowed.paint.transform.around(record.layout.bounds.origin));
+                transform_layer = true;
+            }
+            try self.builder.backdropEffect(.{
+                .bounds = record.layout.bounds,
+                .radii = borrowed.paint.radii,
+                .blur_radius = effect.blur_radius,
+                .saturation = effect.saturation,
+                .opacity = borrowed.paint.opacity,
+            });
+            if (has_opacity) {
+                _ = try self.builder.pushLayer(borrowed.paint.opacity, .normal, .identity);
+                opacity_layer = true;
+            }
+        } else if (has_layer) {
+            _ = try self.builder.pushLayer(borrowed.paint.opacity, .normal, borrowed.paint.transform.around(record.layout.bounds.origin));
+        }
 
         for (borrowed.paint.shadows.values[0..borrowed.paint.shadows.count]) |shadow| {
             if (shadow.color.a <= 0) continue;
@@ -181,7 +202,9 @@ pub const Painter = struct {
         for (record.children.items) |child| try self.paintNode(nodes, child, false, portals);
         if (scroll_layer) try self.builder.popLayer();
         if (clips) try self.builder.popClip();
-        if (has_layer) try self.builder.popLayer();
+        if (opacity_layer) try self.builder.popLayer();
+        if (transform_layer) try self.builder.popLayer();
+        if (borrowed.paint.backdrop_effect == null and has_layer) try self.builder.popLayer();
     }
 
     fn materialForBrush(self: *Painter, brush: compose_style.Brush, bounds: geometry.Rect) Error!?u32 {

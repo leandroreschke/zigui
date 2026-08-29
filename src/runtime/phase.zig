@@ -21,6 +21,7 @@ pub const State = struct {
     current: Phase = .idle,
     callback_depth: u32 = 0,
     transaction_depth: u32 = 0,
+    frame_callback_depth: u32 = 0,
 
     pub fn transition(self: *State, next: Phase) Error!void {
         if (!isAllowed(self.current, next)) return error.FramePhaseViolation;
@@ -38,6 +39,16 @@ pub const State = struct {
             return error.FramePhaseViolation;
         }
         self.transaction_depth += 1;
+        return .{ .state = self };
+    }
+
+    /// Marks the narrow component frame-hook interval. Frame hooks may poll
+    /// renderer services and hand completed owned work to the task host, but
+    /// ordinary retained build callbacks remain mutation-free.
+    pub fn enterFrameCallback(self: *State) Error!FrameCallbackGuard {
+        if (self.current != .composing or self.frame_callback_depth != 0)
+            return error.FramePhaseViolation;
+        self.frame_callback_depth += 1;
         return .{ .state = self };
     }
 
@@ -60,6 +71,17 @@ pub const State = struct {
             if (!self.active) return;
             self.active = false;
             self.state.transaction_depth -= 1;
+        }
+    };
+
+    pub const FrameCallbackGuard = struct {
+        state: *State,
+        active: bool = true,
+
+        pub fn deinit(self: *FrameCallbackGuard) void {
+            if (!self.active) return;
+            self.active = false;
+            self.state.frame_callback_depth -= 1;
         }
     };
 };

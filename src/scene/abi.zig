@@ -14,6 +14,7 @@ pub const OperationKind = enum(u32) {
     color_sprites,
     external_surfaces,
     custom_passes,
+    backdrop_effect,
 };
 
 pub const BlendMode = enum(u32) { normal, multiply, screen, overlay, plus_lighter };
@@ -86,6 +87,14 @@ pub const Shadow = extern struct {
     spread: f32,
 };
 
+pub const BackdropEffect = extern struct {
+    bounds: geometry.Rect,
+    radii: geometry.CornerRadii = .{},
+    blur_radius: f32 = 0,
+    saturation: f32 = 1,
+    opacity: f32 = 1,
+};
+
 pub const PathVertex = extern struct {
     position: geometry.Point,
     control: geometry.Point,
@@ -150,6 +159,7 @@ comptime {
     std.debug.assert(@offsetOf(GradientStop, "color") == 16);
     std.debug.assert(@sizeOf(PathVertex) == 24);
     std.debug.assert(@offsetOf(PathVertex, "kind") == 16);
+    std.debug.assert(@sizeOf(BackdropEffect) == 44);
     std.debug.assert(@sizeOf(Sprite) == 64);
     std.debug.assert(@sizeOf(CustomPass) == 40);
 }

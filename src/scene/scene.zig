@@ -15,6 +15,7 @@ pub const Limits = struct {
     gradient_stops: usize = 1_048_576,
     clips: usize = 131_072,
     layers: usize = 131_072,
+    backdrop_effects: usize = 131_072,
     primitives: usize = 4_000_000,
     path_vertices: usize = 8_000_000,
     custom_passes: usize = 65_536,
@@ -39,6 +40,7 @@ pub const Scene = struct {
     external_surfaces: std.ArrayList(abi.ExternalSurface) = .empty,
     custom_passes: std.ArrayList(abi.CustomPass) = .empty,
     custom_payload: std.ArrayList(u8) = .empty,
+    backdrop_effects: std.ArrayList(abi.BackdropEffect) = .empty,
     native_media_placements: std.ArrayList(native_media.Placement) = .empty,
     generation: u64 = 0,
 
@@ -62,6 +64,7 @@ pub const Scene = struct {
         self.external_surfaces.deinit(self.allocator);
         self.custom_passes.deinit(self.allocator);
         self.custom_payload.deinit(self.allocator);
+        self.backdrop_effects.deinit(self.allocator);
         self.native_media_placements.deinit(self.allocator);
         self.* = undefined;
     }
@@ -82,6 +85,7 @@ pub const Scene = struct {
         self.external_surfaces.clearRetainingCapacity();
         self.custom_passes.clearRetainingCapacity();
         self.custom_payload.clearRetainingCapacity();
+        self.backdrop_effects.clearRetainingCapacity();
         self.native_media_placements.clearRetainingCapacity();
         self.generation +%= 1;
         if (self.generation == 0) self.generation = 1;
@@ -104,6 +108,7 @@ pub const Scene = struct {
             .external_surfaces = self.external_surfaces.items,
             .custom_passes = self.custom_passes.items,
             .custom_payload = self.custom_payload.items,
+            .backdrop_effects = self.backdrop_effects.items,
         };
     }
 };
@@ -305,6 +310,16 @@ pub const Builder = struct {
         self.commitOperation(plan, .shadows, start, 1, none_index, none_index);
     }
 
+    pub fn backdropEffect(self: *Builder, value: abi.BackdropEffect) Error!void {
+        try self.ensurePrimitive(self.scene.backdrop_effects.items.len);
+        try self.ensure(self.scene.backdrop_effects.items.len, 1, self.limits.backdrop_effects);
+        const start: u32 = @intCast(self.scene.backdrop_effects.items.len);
+        const plan = try self.prepareCurrentOperation(.backdrop_effect, start, 1, none_index, none_index);
+        try self.scene.backdrop_effects.ensureUnusedCapacity(self.scene.allocator, 1);
+        self.scene.backdrop_effects.appendAssumeCapacity(value);
+        self.commitOperation(plan, .backdrop_effect, start, 1, none_index, none_index);
+    }
+
     pub fn quad(self: *Builder, value: abi.Quad, material: ?u32) Error!void {
         try self.ensurePrimitive(self.scene.quads.items.len);
         const start: u32 = @intCast(self.scene.quads.items.len);
@@ -398,11 +413,15 @@ pub const Builder = struct {
     }
 
     pub fn nativeMedia(self: *Builder, id: handles.NativeMediaId, bounds: geometry.Rect) Error!void {
+        try self.nativeMediaWithVisibility(id, bounds, true);
+    }
+
+    pub fn nativeMediaWithVisibility(self: *Builder, id: handles.NativeMediaId, bounds: geometry.Rect, visible: bool) Error!void {
         if (!id.isValid()) return error.InvalidHandle;
         if (!validRect(bounds) or bounds.size.width <= 0 or bounds.size.height <= 0) return error.InvalidScene;
         for (self.scene.native_media_placements.items) |placement| if (placement.id.eql(id)) return error.InvalidScene;
         if (self.scene.native_media_placements.items.len >= self.limits.native_media_placements) return error.BudgetExceeded;
-        try self.scene.native_media_placements.append(self.scene.allocator, .{ .id = id, .bounds = bounds });
+        try self.scene.native_media_placements.append(self.scene.allocator, .{ .id = id, .bounds = bounds, .visible = visible });
     }
 
     pub fn emitCustom(context: *anyopaque, command: custom.PaintCommand) Error!void {
@@ -431,11 +450,12 @@ pub const Builder = struct {
             },
             .path => |value| try self.path(value.value, value.vertices, null),
             .shadow => |value| try self.shadow(value),
+            .backdrop_effect => |value| try self.backdropEffect(value),
             .underline => |value| try self.underline(value),
             .monochrome_sprite => |value| try self.monochromeSprite(value),
             .color_sprite => |value| try self.colorSprite(value),
             .external_surface => |value| try self.externalSurface(value),
-            .native_media => |value| try self.nativeMedia(value.id, value.bounds),
+            .native_media => |value| try self.nativeMediaWithVisibility(value.id, value.bounds, value.visible),
             .custom_pass => |value| try self.customPass(value.extension, value.bounds, value.payload, value.flags),
         }
     }
@@ -542,6 +562,7 @@ pub fn validate(view: render.SceneView) Error!void {
         view.external_surfaces.len,
         view.custom_passes.len,
         view.custom_payload.len,
+        view.backdrop_effects.len,
     }) |length| if (length > std.math.maxInt(u32)) return error.BudgetExceeded;
     var active_clip: u32 = none_index;
     var active_layer: u32 = none_index;
@@ -563,6 +584,7 @@ pub fn validate(view: render.SceneView) Error!void {
             .color_sprites => view.color_sprites.len,
             .external_surfaces => view.external_surfaces.len,
             .custom_passes => view.custom_passes.len,
+            .backdrop_effect => view.backdrop_effects.len,
         };
         if (end > length) return error.InvalidScene;
         switch (kind) {
@@ -599,6 +621,9 @@ pub fn validate(view: render.SceneView) Error!void {
             else => {
                 if (operation.clip != active_clip or operation.layer != active_layer) return error.InvalidScene;
                 const may_have_material = kind == .quads or kind == .paths;
+                if (kind == .backdrop_effect and
+                    (operation.count != 1 or operation.material != none_index or operation.reserved != none_index))
+                    return error.InvalidScene;
                 if (!may_have_material and operation.material != none_index) return error.InvalidScene;
                 switch (kind) {
                     .monochrome_sprites => for (view.monochrome_sprites[operation.start..][0..operation.count]) |sprite|
@@ -688,6 +713,14 @@ pub fn validate(view: render.SceneView) Error!void {
     for (view.custom_passes) |pass| {
         if (!validRect(pass.bounds) or pass.extension == 0 or
             @as(usize, pass.payload_start) + @as(usize, pass.payload_length) > view.custom_payload.len)
+            return error.InvalidScene;
+    }
+    for (view.backdrop_effects) |effect| {
+        if (!validRect(effect.bounds) or !finiteRadii(effect.radii) or
+            !std.math.isFinite(effect.blur_radius) or effect.blur_radius < 0 or
+            effect.blur_radius > 128 or !std.math.isFinite(effect.saturation) or
+            effect.saturation < 0 or effect.saturation > 4 or
+            !std.math.isFinite(effect.opacity) or effect.opacity < 0 or effect.opacity > 1)
             return error.InvalidScene;
     }
     try validateEffectiveGeometry(view);
@@ -807,6 +840,8 @@ fn validateEffectiveGeometry(view: render.SceneView) Error!void {
                 try validateTransformedRect(transform, surface.bounds),
             .custom_passes => for (view.custom_passes[start..][0..count]) |pass|
                 try validateTransformedRect(transform, pass.bounds),
+            .backdrop_effect => for (view.backdrop_effects[start..][0..count]) |effect|
+                try validateTransformedRect(transform, effect.bounds),
             .push_clip, .pop_clip, .push_layer, .pop_layer => unreachable,
         }
     }

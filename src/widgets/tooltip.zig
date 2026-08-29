@@ -22,7 +22,7 @@ pub const Tooltip = struct {
         if (children.len == 2) {
             const text_children = try ctx.allocator.dupe(node.Spec, &.{node.Spec{
                 .kind = .{ .text = self.text },
-                .style = .{ .text = .{ .font_size = self.theme.font_size - 1, .color = self.theme.text, .wrap = .none } },
+                .style = .{ .text = .{ .font_families = self.theme.font_families, .font_size = self.theme.font_size - 1, .color = self.theme.text, .wrap = .none } },
             }});
             children[1] = .{
                 .kind = .container,

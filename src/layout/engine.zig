@@ -162,7 +162,14 @@ pub const Engine = struct {
             const child_style = child_record.borrowedStyle().layout;
             if (isOutOfFlow(child_style) or child_style.display == .none) continue;
             const margins = resolveEdges(child_style.margin, constraints.maximum);
-            var child_size = try self.measureNode(nodes, child, .{ .maximum = constraints.maximum });
+            var child_constraints: style.Constraints = .{ .maximum = constraints.maximum };
+            if (scrolls_main_axis) setMainSize(&child_constraints.maximum, horizontal, std.math.inf(f32));
+            var child_size = try self.measureNode(nodes, child, child_constraints);
+            const declared_main = if (horizontal)
+                child_style.width.resolve(constraints.maximum.width)
+            else
+                child_style.height.resolve(constraints.maximum.height);
+            if (scrolls_main_axis) if (declared_main) |value| setMainSize(&child_size, horizontal, value);
             const minimum_main = if (horizontal)
                 child_style.min_width.resolve(constraints.maximum.width) orelse 0
             else
@@ -494,6 +501,8 @@ pub const Engine = struct {
         const node_style = record.borrowedStyle().layout;
         const horizontal = isHorizontal(node_style.direction);
         const reverse = node_style.direction == .row_reverse or node_style.direction == .column_reverse;
+        const available_main = mainSize(content.size, horizontal);
+        const scrolls_main_axis = if (horizontal) node_style.overflow_x == .scroll else node_style.overflow_y == .scroll;
         var measured: std.ArrayList(MeasuredChild) = .empty;
         defer measured.deinit(self.scratch);
         for (record.children.items) |child| {
@@ -501,7 +510,14 @@ pub const Engine = struct {
             const child_style = child_record.borrowedStyle().layout;
             if (isOutOfFlow(child_style) or child_style.display == .none) continue;
             const margins = resolveEdges(child_style.margin, content.size);
-            var measured_size = try self.measureNode(nodes, child, .{ .maximum = content.size });
+            var child_constraints: style.Constraints = .{ .maximum = content.size };
+            if (scrolls_main_axis) setMainSize(&child_constraints.maximum, horizontal, std.math.inf(f32));
+            var measured_size = try self.measureNode(nodes, child, child_constraints);
+            const declared_main = if (horizontal)
+                child_style.width.resolve(content.size.width)
+            else
+                child_style.height.resolve(content.size.height);
+            if (scrolls_main_axis) if (declared_main) |value| setMainSize(&measured_size, horizontal, value);
             const minimum_main = if (horizontal)
                 child_style.min_width.resolve(content.size.width) orelse 0
             else
@@ -530,8 +546,6 @@ pub const Engine = struct {
 
         var lines: std.ArrayList(FlexLine) = .empty;
         defer lines.deinit(self.scratch);
-        const available_main = mainSize(content.size, horizontal);
-        const scrolls_main_axis = if (horizontal) node_style.overflow_x == .scroll else node_style.overflow_y == .scroll;
         const main_gap = mainSize(node_style.gap, horizontal);
         const cross_gap = crossSize(node_style.gap, horizontal);
         const wrapping = node_style.wrap != .no_wrap;

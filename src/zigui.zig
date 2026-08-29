@@ -6,6 +6,7 @@ const DisabledCapability = struct {
 };
 
 pub const layout = @import("layout/style.zig");
+pub const appearance = @import("core/appearance.zig");
 pub const layout_engine = @import("layout/engine.zig");
 pub const LayoutEngine = @import("layout/engine.zig").Engine;
 pub const input = @import("input/event.zig");
@@ -92,10 +93,20 @@ pub const internal_shader_test = if (builtin.is_test) struct {
     }
 } else DisabledCapability;
 
+/// Native backend modules are exposed only to their dedicated repository
+/// conformance roots; applications never depend on this test-only surface.
+pub const internal_backend_test = if (builtin.is_test) struct {
+    pub const metal_renderer = if (builtin.os.tag == .macos and config.compiled_renderer == .metal)
+        @import("backend/metal/renderer.zig")
+    else
+        DisabledCapability;
+} else DisabledCapability;
+
 pub const core = struct {
     pub const clock = @import("core/clock.zig");
     pub const errors = @import("core/error.zig");
     pub const geometry = @import("core/geometry.zig");
+    pub const appearance = @import("core/appearance.zig");
     pub const handles = @import("core/handle.zig");
     pub const memory = @import("core/memory.zig");
     pub const native_media = @import("core/native_media.zig");
@@ -112,3 +123,4 @@ pub const Color = core.geometry.Color;
 pub const CornerRadii = core.geometry.CornerRadii;
 pub const Affine2D = core.geometry.Affine2D;
 pub const ScaleFactor = core.geometry.ScaleFactor;
+pub const Appearance = core.appearance.Appearance;

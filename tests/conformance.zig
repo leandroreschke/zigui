@@ -4,6 +4,232 @@ const ui = @import("zigui");
 const testing = std.testing;
 const handles = ui.core.handles;
 
+const WindowCloseProbe = struct {
+    app: ?*ui.App = null,
+    calls: usize = 0,
+    window: ?handles.WindowId = null,
+    observed_live_window: bool = false,
+    observed_native_window: bool = false,
+
+    fn closeRequested(raw: *anyopaque, window: handles.WindowId) ui.Error!void {
+        const self: *WindowCloseProbe = @ptrCast(@alignCast(raw));
+        const app = self.app orelse return error.InvalidConfiguration;
+        self.calls += 1;
+        self.window = window;
+        self.observed_live_window = try app.hasWindow(window);
+        self.observed_native_window = app.bundle.windows.nativeHandle(window) != null;
+    }
+};
+
+const FramePulseProbe = struct {
+    app: ?*ui.App = null,
+    native_media: ?handles.NativeMediaId = null,
+    builds: usize = 0,
+    frames: usize = 0,
+    media_state_reads: usize = 0,
+    active: bool = false,
+    stop_at_ns: u64 = 0,
+    timestamps: [4]u64 = @splat(0),
+
+    pub fn build(self: *FramePulseProbe, _: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
+        self.builds += 1;
+        return .{};
+    }
+
+    pub fn frame(self: *FramePulseProbe, now_ns: u64) ui.Error!ui.Component.FrameUpdate {
+        if (!self.active) return .{};
+        if (self.native_media) |id| {
+            _ = try self.app.?.nativeMediaState(id);
+            self.media_state_reads += 1;
+        }
+        if (self.frames < self.timestamps.len) self.timestamps[self.frames] = now_ns;
+        self.frames += 1;
+        if (now_ns >= self.stop_at_ns) self.active = false;
+        return .{
+            // The frame hook is an explicit custom-paint timeline. Its
+            // retained tree is stable, so this must not rebuild components or
+            // rerun layout on every display tick.
+            .dirty = .{ .compose = false, .layout = false, .paint = true, .hit_test = false, .semantics = false, .resources = false },
+            .request_next_frame = self.active,
+        };
+    }
+};
+
+const OffscreenPollFrameProbe = struct {
+    app: *ui.App,
+    request: ui.render.OffscreenRequestId,
+    allocator: std.mem.Allocator,
+    component: handles.ComponentId = .invalid,
+    task_counts: *TaskContextCounts,
+    polls: usize = 0,
+    pending_polls: usize = 0,
+    ready: bool = false,
+    failed: bool = false,
+
+    pub fn build(self: *OffscreenPollFrameProbe, ctx: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
+        self.component = ctx.component;
+        return .{ .kind = .spacer };
+    }
+
+    pub fn frame(self: *OffscreenPollFrameProbe, _: u64) ui.Error!ui.Component.FrameUpdate {
+        if (self.request == 0) return .{};
+        self.polls += 1;
+        const result = self.app.pollOffscreen(self.request, self.allocator) catch {
+            self.failed = true;
+            return .{};
+        };
+        switch (result) {
+            .pending => self.pending_polls += 1,
+            .ready => |readback| {
+                var owned = readback;
+                owned.deinit(self.allocator);
+                const task = TaskContext.create(self.task_counts) catch {
+                    self.failed = true;
+                    return .{};
+                };
+                _ = self.app.spawnTask(self.component, task, TaskContext.run, TaskContext.apply, TaskContext.drop) catch {
+                    self.failed = true;
+                    return .{};
+                };
+                self.ready = true;
+            },
+            .failed, .cancelled => self.failed = true,
+        }
+        return .{
+            .dirty = .{ .compose = false, .layout = false, .paint = true, .hit_test = false, .semantics = false, .resources = false },
+            .request_next_frame = !self.ready and !self.failed,
+        };
+    }
+};
+
+const PageCapturePollFrameProbe = struct {
+    app: *ui.App,
+    request: ui.platform.PageCaptureRequestId = .invalid,
+    allocator: std.mem.Allocator,
+    polls: usize = 0,
+    pending_polls: usize = 0,
+    completed: bool = false,
+    failed: bool = false,
+
+    pub fn build(_: *PageCapturePollFrameProbe, _: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
+        return .{ .kind = .spacer };
+    }
+
+    pub fn frame(self: *PageCapturePollFrameProbe, _: u64) ui.Error!ui.Component.FrameUpdate {
+        if (!self.request.isValid() or self.completed or self.failed) return .{};
+        self.polls += 1;
+        const result = self.app.pollPageCapture(self.request, self.allocator) catch {
+            self.failed = true;
+            return .{};
+        };
+        switch (result) {
+            .pending => self.pending_polls += 1,
+            .terminal => |*completion| {
+                var owned = completion.*;
+                owned.deinit();
+                self.completed = true;
+            },
+        }
+        return .{
+            .dirty = .{ .compose = false, .layout = false, .paint = true, .hit_test = false, .semantics = false, .resources = false },
+            .request_next_frame = !self.completed and !self.failed,
+        };
+    }
+};
+
+const PromisedPollFrameProbe = struct {
+    app: *ui.App,
+    operation: ui.platform.PromisedFileOperationId = .invalid,
+    allocator: std.mem.Allocator,
+    polls: usize = 0,
+    pending_polls: usize = 0,
+    completed: bool = false,
+    failed: bool = false,
+
+    pub fn build(_: *PromisedPollFrameProbe, _: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
+        return .{ .kind = .spacer };
+    }
+
+    pub fn frame(self: *PromisedPollFrameProbe, _: u64) ui.Error!ui.Component.FrameUpdate {
+        if (!self.operation.isValid()) return .{};
+        self.polls += 1;
+        const result = self.app.pollPromisedFiles(self.operation, self.allocator) catch {
+            self.failed = true;
+            return .{};
+        };
+        switch (result) {
+            .pending => self.pending_polls += 1,
+            .terminal => |*completion| {
+                var owned = completion.*;
+                owned.deinit();
+                self.completed = true;
+            },
+        }
+        return .{
+            .dirty = .{ .compose = false, .layout = false, .paint = true, .hit_test = false, .semantics = false, .resources = false },
+            .request_next_frame = !self.completed and !self.failed,
+        };
+    }
+};
+
+const BuildPhaseServiceProbe = struct {
+    app: *ui.App,
+    request: ui.render.OffscreenRequestId,
+    task_counts: *TaskContextCounts,
+    spawn_error: ?ui.Error = null,
+    poll_error: ?ui.Error = null,
+
+    pub fn build(self: *BuildPhaseServiceProbe, ctx: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
+        const task = try TaskContext.create(self.task_counts);
+        _ = self.app.spawnTask(ctx.component, task, TaskContext.run, TaskContext.apply, TaskContext.drop) catch |err| {
+            self.spawn_error = err;
+        };
+        _ = self.app.pollOffscreen(self.request, testing.allocator) catch |err| {
+            self.poll_error = err;
+        };
+        return .{ .kind = .spacer };
+    }
+};
+
+const BuildPageCaptureProbe = struct {
+    app: *ui.App,
+    request: ui.platform.PageCaptureRequestId,
+    poll_error: ?ui.Error = null,
+
+    pub fn build(self: *BuildPageCaptureProbe, _: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
+        _ = self.app.pollPageCapture(self.request, testing.allocator) catch |err| {
+            self.poll_error = err;
+        };
+        return .{ .kind = .spacer };
+    }
+};
+
+const FocusCloseProbe = struct {
+    app: ?*ui.App = null,
+    calls: usize = 0,
+    handlers: [1]ui.input.Handler = undefined,
+
+    pub fn build(self: *FocusCloseProbe, _: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
+        self.handlers[0] = .{ .context = self, .callback = focusEvent, .phase = .bubble };
+        return .{
+            .style = .{ .interaction = .{ .focusable = true, .autofocus = true } },
+            .handlers = &self.handlers,
+        };
+    }
+
+    fn focusEvent(
+        raw: *anyopaque,
+        _: *ui.input.Dispatch,
+        event: *const ui.input.Event,
+        context: *ui.input.Context,
+    ) ui.Error!void {
+        const self: *FocusCloseProbe = @ptrCast(@alignCast(raw));
+        if (event.* != .focus_in) return;
+        self.calls += 1;
+        try self.app.?.closeWindow(context.window);
+    }
+};
+
 test "generational handles reject stale identities and reuse slots" {
     const Pool = handles.SlotPool(u32, handles.NodeId);
     var pool = Pool.init(testing.allocator);
@@ -69,9 +295,78 @@ test "state dependencies invalidate only recorded retained components" {
 
 const WindowCompositionProbe = struct {
     builds: usize = 0,
+    component: handles.ComponentId = .invalid,
 
-    pub fn build(self: *WindowCompositionProbe, _: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
+    pub fn build(self: *WindowCompositionProbe, ctx: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
         self.builds +|= 1;
+        self.component = ctx.component;
+        return .{ .kind = .spacer };
+    }
+};
+
+const CustomEventInvalidationProbe = struct {
+    builds: usize = 0,
+    measures: usize = 0,
+    arranges: usize = 0,
+    prepares: usize = 0,
+    paints: usize = 0,
+    semantics_calls: usize = 0,
+    events: usize = 0,
+    request_narrow: bool = true,
+
+    pub fn build(self: *CustomEventInvalidationProbe, _: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
+        self.builds += 1;
+        return .{
+            .kind = .{ .custom = ui.custom.Node.from(CustomEventInvalidationProbe, self) },
+            .style = .{ .layout = .{ .width = .{ .points = 320 }, .height = .{ .points = 240 } } },
+        };
+    }
+
+    pub fn measure(self: *CustomEventInvalidationProbe, _: *ui.custom.MeasureContext, _: ui.layout.Constraints) ui.Error!ui.Size {
+        self.measures += 1;
+        return .{ .width = 320, .height = 240 };
+    }
+
+    pub fn arrange(self: *CustomEventInvalidationProbe, _: *ui.custom.ArrangeContext, _: ui.Rect) ui.Error!void {
+        self.arranges += 1;
+    }
+
+    pub fn prepare(self: *CustomEventInvalidationProbe, _: *ui.custom.PrepareContext, _: ui.Rect) ui.Error!void {
+        self.prepares += 1;
+    }
+
+    pub fn paint(self: *CustomEventInvalidationProbe, context: *ui.custom.PaintContext, bounds: ui.Rect) ui.Error!void {
+        self.paints += 1;
+        try context.quad(.{ .bounds = bounds, .background = ui.Color.rgba8(40, 48, 64, 255), .border_color = .transparent, .border_widths = .{}, .radii = .{} });
+    }
+
+    pub fn semantics(self: *CustomEventInvalidationProbe, writer: *ui.custom.SemanticsWriter, bounds: ui.Rect) ui.Error!void {
+        self.semantics_calls += 1;
+        _ = try writer.append(1, .{ .role = .button, .label = "custom invalidation probe", .bounds = bounds, .actions = &.{.activate} });
+    }
+
+    pub fn event(self: *CustomEventInvalidationProbe, dispatch: *ui.input.Dispatch, value: *const ui.input.Event, context: *ui.input.Context) ui.Error!void {
+        if (value.* != .pointer_down) return;
+        self.events += 1;
+        dispatch.handled = true;
+        if (self.request_narrow) try context.invalidate(.{
+            .compose = false,
+            .layout = false,
+            .paint = true,
+            .hit_test = false,
+            .semantics = true,
+            .resources = false,
+        });
+    }
+};
+
+const AppearanceProbe = struct {
+    builds: usize = 0,
+    last: ui.Appearance = .system,
+
+    pub fn build(self: *AppearanceProbe, ctx: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
+        self.builds += 1;
+        self.last = ctx.appearance;
         return .{ .kind = .spacer };
     }
 };
@@ -83,6 +378,51 @@ const LargeInitialTree = struct {
         return .{ .children = children };
     }
 };
+
+test "custom handled events preserve explicit narrow invalidation" {
+    var text_backend_instance = try ui.InTreeTextBackend.createInstance(
+        testing.allocator,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64,
+        64,
+        64 * 1024,
+    );
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, text_backend_instance.interface());
+    const bundle = harness.bundle;
+    harness.bundle = undefined;
+    const app = try ui.App.createWithBundle(testing.allocator, .{
+        .application_name = "custom event invalidation test",
+        .allow_multiple_apps_for_testing = true,
+    }, bundle);
+    defer app.destroy() catch unreachable;
+
+    var model: CustomEventInvalidationProbe = .{};
+    const window = try app.openWindow(.{ .platform = .{ .title = "custom event invalidation", .size = .{ .width = 320, .height = 240 } } }, ui.Component.Descriptor.from(CustomEventInvalidationProbe, &model));
+    while (try app.step(false)) {}
+    const settled = model;
+
+    try harness.post(window, .{ .input = .{ .pointer_down = .{ .position = .{ .x = 20, .y = 20 }, .button = .primary } } });
+    while (try app.step(false)) {}
+    try testing.expectEqual(@as(usize, 1), model.events);
+    try testing.expectEqual(settled.builds, model.builds);
+    try testing.expectEqual(settled.measures, model.measures);
+    try testing.expectEqual(settled.arranges, model.arranges);
+    try testing.expectEqual(settled.prepares, model.prepares);
+    try testing.expectEqual(settled.paints + 1, model.paints);
+    try testing.expectEqual(settled.semantics_calls + 1, model.semantics_calls);
+
+    model.request_narrow = false;
+    try harness.post(window, .{ .input = .{ .pointer_down = .{ .position = .{ .x = 24, .y = 24 }, .button = .primary } } });
+    while (try app.step(false)) {}
+    try testing.expectEqual(@as(usize, 2), model.events);
+    try testing.expect(model.builds > settled.builds);
+    try testing.expect(model.measures > settled.measures);
+    try testing.expect(model.arranges > settled.arranges);
+    try testing.expect(model.prepares > settled.prepares);
+    try testing.expect(model.paints > settled.paints + 1);
+    try testing.expect(model.semantics_calls > settled.semantics_calls + 1);
+}
 
 test "initial reconciliation keeps compact undo entries within the default frame arena" {
     const app = try ui.App.create(testing.allocator, .{
@@ -119,6 +459,865 @@ test "whole-window invalidation rebuilds only that window's components" {
     try testing.expectEqual(second_builds + 1, second.builds);
 }
 
+test "delayed component invalidation wakes only at its deadline" {
+    var text_backend_instance = try ui.InTreeTextBackend.createInstance(
+        testing.allocator,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64,
+        64,
+        64 * 1024,
+    );
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, text_backend_instance.interface());
+    const bundle = harness.bundle;
+    harness.bundle = undefined;
+    const app = try ui.App.createWithBundle(testing.allocator, .{
+        .application_name = "delayed invalidation test",
+        .allow_multiple_apps_for_testing = true,
+    }, bundle);
+    defer app.destroy() catch unreachable;
+
+    var model: WindowCompositionProbe = .{};
+    _ = try app.openWindow(.{ .platform = .{ .title = "delayed invalidation" } }, ui.Component.Descriptor.from(WindowCompositionProbe, &model));
+    while (try app.step(false)) {}
+    const settled_builds = model.builds;
+    const deadline = 3 * std.time.ns_per_s;
+    try app.invalidateComponentAt(model.component, .{}, deadline);
+
+    try testing.expect(!(try app.step(false)));
+    try testing.expectEqual(settled_builds, model.builds);
+    harness.advance(deadline - 1);
+    try testing.expect(!(try app.step(false)));
+    try testing.expectEqual(settled_builds, model.builds);
+    harness.advance(1);
+    try testing.expect(try app.step(false));
+    while (try app.step(false)) {}
+    try testing.expectEqual(settled_builds + 1, model.builds);
+}
+
+test "appearance is resolved for composition and duplicate events do not repaint" {
+    var text_backend_instance = try ui.InTreeTextBackend.createInstance(
+        testing.allocator,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64,
+        64,
+        64 * 1024,
+    );
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, text_backend_instance.interface());
+    const bundle = harness.bundle;
+    harness.bundle = undefined;
+    const app = try ui.App.createWithBundle(testing.allocator, .{
+        .application_name = "appearance conformance test",
+        .allow_multiple_apps_for_testing = true,
+    }, bundle);
+    defer app.destroy() catch unreachable;
+
+    var model: AppearanceProbe = .{};
+    const window = try app.openWindow(.{ .platform = .{ .title = "appearance" } }, ui.Component.Descriptor.from(AppearanceProbe, &model));
+    while (try app.step(false)) {}
+    try testing.expectEqual(ui.Appearance.light, model.last);
+    try testing.expectEqual(@as(usize, 1), model.builds);
+    const settled = try app.metricsSnapshot();
+
+    try harness.post(window, .{ .appearance_changed = .dark });
+    while (try app.step(false)) {}
+    try testing.expectEqual(ui.Appearance.dark, model.last);
+    try testing.expectEqual(@as(usize, 2), model.builds);
+    const changed = try app.metricsSnapshot();
+    try testing.expectEqual(settled.frames_submitted + 1, changed.frames_submitted);
+
+    try harness.post(window, .{ .appearance_changed = .dark });
+    while (try app.step(false)) {}
+    const duplicate = try app.metricsSnapshot();
+    try testing.expectEqual(@as(usize, 2), model.builds);
+    try testing.expectEqual(changed.frames_submitted, duplicate.frames_submitted);
+}
+
+test "window mode follows resolved platform events and deduplicates no-op transitions" {
+    var text_backend_instance = try ui.InTreeTextBackend.createInstance(
+        testing.allocator,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64,
+        64,
+        64 * 1024,
+    );
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, text_backend_instance.interface());
+    const bundle = harness.bundle;
+    harness.bundle = undefined;
+    const app = try ui.App.createWithBundle(testing.allocator, .{
+        .application_name = "window mode conformance test",
+        .allow_multiple_apps_for_testing = true,
+    }, bundle);
+    defer app.destroy() catch unreachable;
+
+    var model: AppearanceProbe = .{};
+    const window = try app.openWindow(.{ .platform = .{ .title = "window mode" } }, ui.Component.Descriptor.from(AppearanceProbe, &model));
+    while (try app.step(false)) {}
+    try testing.expectEqual(ui.platform.WindowMode.normal, try app.windowMode(window));
+    const settled = try app.metricsSnapshot();
+
+    // A platform command is asynchronous from App's perspective: the getter
+    // remains at the last confirmed value until the queued event is handled.
+    try app.setWindowMode(window, .maximized);
+    try testing.expectEqual(ui.platform.WindowMode.normal, try app.windowMode(window));
+    while (try app.step(false)) {}
+    try testing.expectEqual(ui.platform.WindowMode.maximized, try app.windowMode(window));
+    const maximized = try app.metricsSnapshot();
+    try testing.expectEqual(settled.frames_submitted + 1, maximized.frames_submitted);
+
+    // Headless command adapters and native callbacks must not produce a
+    // second transition when the resolved mode is already current.
+    try app.setWindowMode(window, .maximized);
+    while (try app.step(false)) {}
+    const duplicate_command = try app.metricsSnapshot();
+    try testing.expectEqual(maximized.frames_submitted, duplicate_command.frames_submitted);
+
+    try harness.post(window, .{ .mode_changed = .fullscreen });
+    while (try app.step(false)) {}
+    try testing.expectEqual(ui.platform.WindowMode.fullscreen, try app.windowMode(window));
+    const fullscreen = try app.metricsSnapshot();
+    try testing.expectEqual(maximized.frames_submitted + 1, fullscreen.frames_submitted);
+
+    try harness.post(window, .{ .mode_changed = .fullscreen });
+    while (try app.step(false)) {}
+    const duplicate_event = try app.metricsSnapshot();
+    try testing.expectEqual(fullscreen.frames_submitted, duplicate_event.frames_submitted);
+}
+
+test "component frame hook follows the platform clock and stops requesting frames" {
+    var text_backend_instance = try ui.InTreeTextBackend.createInstance(
+        testing.allocator,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64,
+        64,
+        64 * 1024,
+    );
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, text_backend_instance.interface());
+    var native_media_probe: NativeMediaProbe = .{};
+    var bundle = harness.bundle;
+    bundle.native_media = native_media_probe.service();
+    harness.bundle = undefined;
+    const app = try ui.App.createWithBundle(testing.allocator, .{
+        .application_name = "component frame hook test",
+    }, bundle);
+    defer app.destroy() catch unreachable;
+
+    var model: FramePulseProbe = .{ .app = app };
+    const window = try app.openWindow(.{ .platform = .{ .title = "frame hook" } }, ui.Component.Descriptor.fromWithFrame(FramePulseProbe, &model));
+    model.native_media = try app.createNativeMedia(window, .{
+        .source = .{ .file = "/tmp/frame-hook.mov" },
+        .frame = ui.Rect.fromXYWH(0, 0, 320, 180),
+    });
+    defer app.destroyNativeMedia(model.native_media.?) catch unreachable;
+    while (try app.step(false)) {}
+    const settled_builds = model.builds;
+
+    model.active = true;
+    model.stop_at_ns = 16 * std.time.ns_per_ms;
+    try app.invalidateWindow(window);
+    try testing.expect(try app.step(false));
+    harness.advance(8 * std.time.ns_per_ms);
+    try testing.expect(try app.step(false));
+    harness.advance(8 * std.time.ns_per_ms);
+    try testing.expect(try app.step(false));
+
+    try testing.expectEqual(@as(usize, 3), model.frames);
+    try testing.expectEqual(@as(usize, 3), model.media_state_reads);
+    try testing.expectEqual(@as(u64, 0), model.timestamps[0]);
+    try testing.expectEqual(@as(u64, 8 * std.time.ns_per_ms), model.timestamps[1]);
+    try testing.expectEqual(@as(u64, 16 * std.time.ns_per_ms), model.timestamps[2]);
+    // The first invalidated frame still composes; subsequent display-driven
+    // frames remain paint-only and reuse the retained tree.
+    try testing.expectEqual(settled_builds + 1, model.builds);
+    try testing.expect(!model.active);
+    try testing.expect(!(try app.step(false)));
+}
+
+test "App records presented timestamps and leaves presentation counters idle" {
+    const app = try ui.App.create(testing.allocator, .{
+        .application_name = "presentation metrics test",
+        .allow_multiple_apps_for_testing = true,
+    });
+    defer app.destroy() catch unreachable;
+
+    var model: WindowCompositionProbe = .{};
+    _ = try app.openWindow(.{ .platform = .{ .title = "presentation metrics" } }, ui.Component.Descriptor.from(WindowCompositionProbe, &model));
+    while (try app.step(false)) {}
+
+    const settled = try app.metricsSnapshot();
+    try testing.expect(settled.presentation.presented_count > 0);
+    try testing.expectEqual(@as(u32, 60_000), settled.presentation.refresh_millihertz);
+    try testing.expectEqual(settled.frames_presented, settled.presentation.presented_count);
+    try testing.expect(settled.presentation.latest_timestamp_ns != null);
+
+    // No dirty window means no event-loop redraw or submission. This is the
+    // observable idle proof used alongside the bounded timestamp ring.
+    try testing.expect(!(try app.step(false)));
+    const idle = try app.metricsSnapshot();
+    try testing.expectEqual(settled.frames_submitted, idle.frames_submitted);
+    try testing.expectEqual(settled.frames_presented, idle.frames_presented);
+    try testing.expectEqual(settled.presentation.presented_count, idle.presentation.presented_count);
+    try testing.expectEqual(settled.presentation.dropped_count, idle.presentation.dropped_count);
+}
+
+test "window close callback runs before the framework destroys the window" {
+    var probe: WindowCloseProbe = .{};
+    const app = try ui.App.create(testing.allocator, .{
+        .application_name = "window close callback test",
+        .window_close_callback = .{ .context = &probe, .callback = WindowCloseProbe.closeRequested },
+    });
+    defer app.destroy() catch unreachable;
+    probe.app = app;
+
+    var model: WindowCompositionProbe = .{};
+    const window = try app.openWindow(.{ .platform = .{ .title = "close callback", .visible = false } }, ui.Component.Descriptor.from(WindowCompositionProbe, &model));
+    try app.closeWindow(window);
+
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    try testing.expectEqual(window, probe.window.?);
+    try testing.expect(probe.observed_live_window);
+    try testing.expect(probe.observed_native_window);
+    try testing.expect(!(try app.hasWindow(window)));
+}
+
+test "native close request invokes the public callback before destruction" {
+    var text_backend_instance = try ui.InTreeTextBackend.createInstance(
+        testing.allocator,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64,
+        64,
+        64 * 1024,
+    );
+    const text_backend = text_backend_instance.interface();
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, text_backend);
+    const bundle = harness.bundle;
+    harness.bundle = undefined;
+
+    var probe: WindowCloseProbe = .{};
+    const app = try ui.App.createWithBundle(testing.allocator, .{
+        .application_name = "native close callback test",
+        .window_close_callback = .{ .context = &probe, .callback = WindowCloseProbe.closeRequested },
+    }, bundle);
+    defer app.destroy() catch unreachable;
+    probe.app = app;
+
+    var model: WindowCompositionProbe = .{};
+    const window = try app.openWindow(.{ .platform = .{ .title = "native close callback" } }, ui.Component.Descriptor.from(WindowCompositionProbe, &model));
+    while (try app.step(false)) {}
+    try harness.post(window, .close_requested);
+    while (try app.step(false)) {}
+
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    try testing.expectEqual(window, probe.window.?);
+    try testing.expect(probe.observed_live_window);
+    try testing.expect(probe.observed_native_window);
+    try testing.expect(!(try app.hasWindow(window)));
+}
+
+test "focus callback can close window without invalid deferred composition cleanup" {
+    const app = try ui.App.create(testing.allocator, .{
+        .application_name = "focus close cleanup test",
+        .allow_multiple_apps_for_testing = true,
+    });
+    defer app.destroy() catch unreachable;
+
+    var probe: FocusCloseProbe = .{ .app = app };
+    const window = try app.openWindow(
+        .{ .platform = .{ .title = "focus close cleanup" } },
+        ui.Component.Descriptor.from(FocusCloseProbe, &probe),
+    );
+    while (try app.step(false)) {}
+
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    try testing.expect(!(try app.hasWindow(window)));
+}
+
+test "App exposes backend-neutral offscreen scene readback" {
+    var text_backend_instance = try ui.InTreeTextBackend.createInstance(
+        testing.allocator,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64,
+        64,
+        64 * 1024,
+    );
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, text_backend_instance.interface());
+    const bundle = harness.bundle;
+    harness.bundle = undefined;
+    const app = try ui.App.createWithBundle(testing.allocator, .{
+        .application_name = "offscreen App API test",
+    }, bundle);
+    defer app.destroy() catch unreachable;
+
+    var scene = ui.scene.Scene.init(testing.allocator);
+    defer scene.deinit();
+    var builder = ui.scene.Builder.init(&scene, .{});
+    defer builder.deinit();
+    try builder.quad(.{
+        .bounds = ui.Rect.fromXYWH(0, 0, 4, 4),
+        .background = ui.Color.rgba(1, 0, 0, 1),
+        .border_color = .transparent,
+        .border_widths = .{},
+        .radii = .{},
+    }, null);
+    try builder.finish();
+
+    var readback = (try app.renderOffscreen(.{
+        .width = 4,
+        .height = 4,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8_srgb,
+    }, scene.view(), testing.allocator)).?;
+    defer readback.deinit(testing.allocator);
+    try testing.expect(pixel(readback, 2, 2)[0] > 240);
+    try testing.expect(pixel(readback, 2, 2)[3] > 240);
+}
+
+test "async offscreen readback copies scene and consumes terminal result once" {
+    var memory: ui.config.MemoryBudgets = .{};
+    memory.offscreen_request_count = 1;
+    const renderer = try ui.NullRenderer.createWithMemory(testing.allocator, memory);
+    defer renderer.deinit();
+
+    var source = ui.scene.Scene.init(testing.allocator);
+    const id = blk: {
+        var builder = ui.scene.Builder.init(&source, .{});
+        defer builder.deinit();
+        try builder.quad(.{
+            .bounds = ui.Rect.fromXYWH(0, 0, 4, 4),
+            .background = ui.Color.rgba(1, 0, 0, 1),
+            .border_color = .transparent,
+            .border_widths = .{},
+            .radii = .{},
+        }, null);
+        try builder.finish();
+        break :blk try renderer.beginOffscreen(.{
+            .width = 4,
+            .height = 4,
+            .scale_factor = try ui.ScaleFactor.init(1),
+            .format = .rgba8_srgb,
+        }, source.view());
+    };
+    // The request owns a complete copy, so destroying the producer scene is
+    // safe before the backend reports readiness.
+    source.deinit();
+
+    try testing.expectError(error.BudgetExceeded, renderer.beginOffscreen(.{
+        .width = 4,
+        .height = 4,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8_srgb,
+    }, .{
+        .operations = &.{},
+        .materials = &.{},
+        .gradient_stops = &.{},
+        .clips = &.{},
+        .layers = &.{},
+        .shadows = &.{},
+        .quads = &.{},
+        .paths = &.{},
+        .path_vertices = &.{},
+        .underlines = &.{},
+        .monochrome_sprites = &.{},
+        .color_sprites = &.{},
+        .external_surfaces = &.{},
+        .custom_passes = &.{},
+        .custom_payload = &.{},
+    }));
+
+    try testing.expectEqual(ui.render.OffscreenPoll.pending, try renderer.pollOffscreen(id, testing.allocator));
+    const result = try renderer.pollOffscreen(id, testing.allocator);
+    switch (result) {
+        .ready => |readback| {
+            var owned = readback;
+            defer owned.deinit(testing.allocator);
+            try testing.expect(pixel(owned, 2, 2)[0] > 240);
+            try testing.expect(pixel(owned, 2, 2)[3] > 240);
+        },
+        else => return error.TestExpectedEqual,
+    }
+    try testing.expectError(error.InvalidHandle, renderer.pollOffscreen(id, testing.allocator));
+}
+
+test "async offscreen cancellation retains ownership until terminal poll" {
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    defer renderer.deinit();
+    const id = try renderer.beginOffscreen(.{
+        .width = 2,
+        .height = 2,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8_srgb,
+    }, .{
+        .operations = &.{},
+        .materials = &.{},
+        .gradient_stops = &.{},
+        .clips = &.{},
+        .layers = &.{},
+        .shadows = &.{},
+        .quads = &.{},
+        .paths = &.{},
+        .path_vertices = &.{},
+        .underlines = &.{},
+        .monochrome_sprites = &.{},
+        .color_sprites = &.{},
+        .external_surfaces = &.{},
+        .custom_passes = &.{},
+        .custom_payload = &.{},
+    });
+    try renderer.cancelOffscreen(id);
+    try testing.expectEqual(ui.render.OffscreenPoll.pending, try renderer.pollOffscreen(id, testing.allocator));
+    try testing.expectEqual(ui.render.OffscreenPoll.cancelled, try renderer.pollOffscreen(id, testing.allocator));
+    try testing.expectError(error.InvalidHandle, renderer.cancelOffscreen(id));
+}
+
+test "App permits asynchronous offscreen polling from a component frame hook" {
+    var memory: ui.config.MemoryBudgets = .{};
+    memory.offscreen_request_count = 1;
+    const app = try ui.App.create(testing.allocator, .{
+        .application_name = "async offscreen frame poll test",
+        .allow_multiple_apps_for_testing = true,
+        .memory = memory,
+    });
+    defer app.destroy() catch unreachable;
+
+    var task_counts: TaskContextCounts = .{};
+    var probe: OffscreenPollFrameProbe = .{
+        .app = app,
+        .request = 0,
+        .allocator = testing.allocator,
+        .task_counts = &task_counts,
+    };
+    const window = try app.openWindow(
+        .{ .platform = .{ .title = "async offscreen frame poll" } },
+        ui.Component.Descriptor.fromWithFrame(OffscreenPollFrameProbe, &probe),
+    );
+    while (try app.step(false)) {}
+    var host_probe: TaskHostProbe = .{ .mode = .complete };
+    try app.installTaskHost(host_probe.host());
+
+    probe.request = try app.beginOffscreen(.{
+        .width = 2,
+        .height = 2,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8_srgb,
+    }, .{
+        .operations = &.{},
+        .materials = &.{},
+        .gradient_stops = &.{},
+        .clips = &.{},
+        .layers = &.{},
+        .shadows = &.{},
+        .quads = &.{},
+        .paths = &.{},
+        .path_vertices = &.{},
+        .underlines = &.{},
+        .monochrome_sprites = &.{},
+        .color_sprites = &.{},
+        .external_surfaces = &.{},
+        .custom_passes = &.{},
+        .custom_payload = &.{},
+    });
+    try app.invalidateWindow(window);
+
+    var steps: usize = 0;
+    while (try app.step(false)) {
+        steps += 1;
+        if (probe.ready or probe.failed or steps >= 16) break;
+    }
+    try testing.expect(probe.pending_polls >= 1);
+    try testing.expect(probe.ready);
+    try testing.expect(!probe.failed);
+    try testing.expectEqual(@as(usize, 1), task_counts.runs);
+    _ = try app.drainTaskCompletions();
+    try testing.expectEqual(@as(usize, 1), task_counts.applies);
+    try testing.expectEqual(@as(usize, 1), task_counts.drops);
+}
+
+test "App page capture mirrors terminal ownership and generational release" {
+    var memory: ui.config.MemoryBudgets = .{};
+    memory.offscreen_request_count = 1;
+    const app = try ui.App.create(testing.allocator, .{
+        .application_name = "page capture App API test",
+        .allow_multiple_apps_for_testing = true,
+        .memory = memory,
+    });
+    defer app.destroy() catch unreachable;
+
+    const request = try app.beginPageCapture(.{
+        .url = "https://example.com/preview",
+        .size = .{ .width = 320, .height = 180 },
+    });
+    try testing.expect(request.isValid());
+    try testing.expectError(error.ResourceBusy, app.releasePageCapture(request));
+    try testing.expectEqual(ui.platform.PageCapturePoll.pending, try app.pollPageCapture(request, testing.allocator));
+
+    var terminal = try app.pollPageCapture(request, testing.allocator);
+    switch (terminal) {
+        .pending => return error.TestUnexpectedResult,
+        .terminal => |*completion| {
+            defer completion.deinit();
+            try testing.expectEqual(ui.platform.PageCaptureTerminalStatus.completed, completion.status);
+            try testing.expect(completion.result != null);
+        },
+    }
+    try testing.expectError(error.InvalidHandle, app.pollPageCapture(request, testing.allocator));
+    try app.releasePageCapture(request);
+    try testing.expectError(error.InvalidHandle, app.releasePageCapture(request));
+
+    const canceled = try app.beginPageCapture(.{ .url = "https://example.com/canceled" });
+    try app.cancelPageCapture(canceled);
+    var canceled_terminal = try app.pollPageCapture(canceled, testing.allocator);
+    switch (canceled_terminal) {
+        .pending => return error.TestUnexpectedResult,
+        .terminal => |*completion| {
+            defer completion.deinit();
+            try testing.expectEqual(ui.platform.PageCaptureTerminalStatus.canceled, completion.status);
+            try testing.expect(completion.result == null);
+        },
+    }
+    try app.releasePageCapture(canceled);
+}
+
+test "App permits nonblocking page capture polling from a component frame hook" {
+    var memory: ui.config.MemoryBudgets = .{};
+    memory.offscreen_request_count = 1;
+    const app = try ui.App.create(testing.allocator, .{
+        .application_name = "page capture frame poll test",
+        .allow_multiple_apps_for_testing = true,
+        .memory = memory,
+    });
+    defer app.destroy() catch unreachable;
+
+    var probe: PageCapturePollFrameProbe = .{ .app = app, .allocator = testing.allocator };
+    const window = try app.openWindow(
+        .{ .platform = .{ .title = "page capture frame poll" } },
+        ui.Component.Descriptor.fromWithFrame(PageCapturePollFrameProbe, &probe),
+    );
+    while (try app.step(false)) {}
+
+    probe.request = try app.beginPageCapture(.{ .url = "https://example.com/frame" });
+    try app.invalidateWindow(window);
+    var steps: usize = 0;
+    while (try app.step(false)) {
+        steps += 1;
+        if (probe.completed or probe.failed or steps >= 8) break;
+    }
+    try testing.expectEqual(@as(usize, 1), probe.pending_polls);
+    try testing.expectEqual(@as(usize, 2), probe.polls);
+    try testing.expect(probe.completed);
+    try testing.expect(!probe.failed);
+    try app.releasePageCapture(probe.request);
+}
+
+test "App permits nonblocking promised-file polling from a component frame hook" {
+    var text_backend_instance = try ui.InTreeTextBackend.createInstance(
+        testing.allocator,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64,
+        64,
+        64 * 1024,
+    );
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, text_backend_instance.interface());
+    const bundle = harness.bundle;
+    harness.bundle = undefined;
+    const app = try ui.App.createWithBundle(testing.allocator, .{
+        .application_name = "promised file frame poll test",
+        .allow_multiple_apps_for_testing = true,
+    }, bundle);
+    defer app.destroy() catch unreachable;
+
+    const descriptors = [_]ui.platform.PromisedFileDescriptor{
+        .{ .suggested_name = "frame.txt", .content_type = "public.plain-text" },
+    };
+    const outcomes = [_]ui.HeadlessPlatform.FakePromisedOutcome{
+        .{ .path = "/tmp/promised/frame.txt" },
+    };
+    const batch = try harness.addPromisedBatch(&descriptors, &outcomes);
+
+    var probe: PromisedPollFrameProbe = .{
+        .app = app,
+        .allocator = testing.allocator,
+    };
+    const window = try app.openWindow(
+        .{ .platform = .{ .title = "promised file frame poll" } },
+        ui.Component.Descriptor.fromWithFrame(PromisedPollFrameProbe, &probe),
+    );
+    while (try app.step(false)) {}
+
+    probe.operation = try app.beginPromisedFiles(batch, "/tmp/promised-frame-destination");
+    try app.releasePromisedFileBatch(batch);
+    try app.invalidateWindow(window);
+    var steps: usize = 0;
+    while (try app.step(false)) {
+        steps += 1;
+        if (probe.completed or probe.failed or steps >= 8) break;
+    }
+    try testing.expectEqual(@as(usize, 1), probe.pending_polls);
+    try testing.expectEqual(@as(usize, 2), probe.polls);
+    try testing.expect(probe.completed);
+    try testing.expect(!probe.failed);
+    // Completion release is a state mutation and must be performed by the
+    // event/update path after the frame hook has consumed its value.
+    try app.releasePromisedFileOperation(probe.operation);
+}
+
+test "ordinary retained build cannot poll offscreen or spawn tasks" {
+    var memory: ui.config.MemoryBudgets = .{};
+    memory.offscreen_request_count = 1;
+    const app = try ui.App.create(testing.allocator, .{
+        .application_name = "build service phase guard test",
+        .allow_multiple_apps_for_testing = true,
+        .memory = memory,
+    });
+    defer app.destroy() catch unreachable;
+
+    const request = try app.beginOffscreen(.{
+        .width = 1,
+        .height = 1,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8_srgb,
+    }, .{
+        .operations = &.{},
+        .materials = &.{},
+        .gradient_stops = &.{},
+        .clips = &.{},
+        .layers = &.{},
+        .shadows = &.{},
+        .quads = &.{},
+        .paths = &.{},
+        .path_vertices = &.{},
+        .underlines = &.{},
+        .monochrome_sprites = &.{},
+        .color_sprites = &.{},
+        .external_surfaces = &.{},
+        .custom_passes = &.{},
+        .custom_payload = &.{},
+    });
+    var task_counts: TaskContextCounts = .{};
+    var probe: BuildPhaseServiceProbe = .{
+        .app = app,
+        .request = request,
+        .task_counts = &task_counts,
+    };
+    _ = try app.openWindow(
+        .{ .platform = .{ .title = "build service phase guard" } },
+        ui.Component.Descriptor.from(BuildPhaseServiceProbe, &probe),
+    );
+    while (try app.step(false)) {}
+
+    try testing.expectEqual(error.FramePhaseViolation, probe.spawn_error.?);
+    try testing.expectEqual(error.FramePhaseViolation, probe.poll_error.?);
+    try testing.expectEqual(@as(usize, 1), task_counts.drops);
+    try app.cancelOffscreen(request);
+}
+
+test "ordinary retained build cannot poll page capture" {
+    var memory: ui.config.MemoryBudgets = .{};
+    memory.offscreen_request_count = 1;
+    const app = try ui.App.create(testing.allocator, .{
+        .application_name = "page capture phase guard test",
+        .allow_multiple_apps_for_testing = true,
+        .memory = memory,
+    });
+    defer app.destroy() catch unreachable;
+
+    const request = try app.beginPageCapture(.{ .url = "https://example.com/phase" });
+    var probe: BuildPageCaptureProbe = .{ .app = app, .request = request };
+    _ = try app.openWindow(
+        .{ .platform = .{ .title = "page capture phase guard" } },
+        ui.Component.Descriptor.from(BuildPageCaptureProbe, &probe),
+    );
+    while (try app.step(false)) {}
+
+    try testing.expectEqual(error.FramePhaseViolation, probe.poll_error.?);
+    try app.cancelPageCapture(request);
+}
+
+test "frame callback scope guard resets after every exit" {
+    var state: ui.runtime_phase.State = .{ .current = .composing };
+    {
+        var guard = try state.enterFrameCallback();
+        try testing.expectEqual(@as(u32, 1), state.frame_callback_depth);
+        guard.deinit();
+    }
+    try testing.expectEqual(@as(u32, 0), state.frame_callback_depth);
+    var second = try state.enterFrameCallback();
+    second.deinit();
+    try testing.expectEqual(@as(u32, 0), state.frame_callback_depth);
+}
+
+test "async null offscreen retains referenced textures through resource retirement" {
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    defer renderer.deinit();
+    const texture = handles.TextureId.init(17, 1);
+    try renderer.createTexture(texture, .{ .width = 2, .height = 2, .format = .rgba8 });
+    defer renderer.destroyTexture(texture, 0) catch {};
+    const texels = [_]u8{
+        255, 0, 0, 255, 255, 0, 0, 255,
+        255, 0, 0, 255, 255, 0, 0, 255,
+    };
+    try renderer.writeTexture(texture, .{ .width = 2, .height = 2 }, &texels, 8);
+
+    var scene = ui.scene.Scene.init(testing.allocator);
+    const id = blk: {
+        var builder = ui.scene.Builder.init(&scene, .{});
+        defer builder.deinit();
+        try builder.colorSprite(.{
+            .bounds = ui.Rect.fromXYWH(0, 0, 4, 4),
+            .uv_bounds = ui.Rect.fromXYWH(0, 0, 1, 1),
+            .color = .white,
+            .texture = texture.encode(),
+            .tile_generation = texture.generation,
+            .format = @backingInt(ui.scene_abi.TextureFormat.rgba8),
+        });
+        try builder.finish();
+        break :blk try renderer.beginOffscreen(.{
+            .width = 4,
+            .height = 4,
+            .scale_factor = try ui.ScaleFactor.init(1),
+            .format = .rgba8,
+        }, scene.view());
+    };
+    // Retiring the producer's texture must not invalidate the pending request.
+    try renderer.destroyTexture(texture, 0);
+    scene.deinit();
+
+    try testing.expectEqual(ui.render.OffscreenPoll.pending, try renderer.pollOffscreen(id, testing.allocator));
+    const result = try renderer.pollOffscreen(id, testing.allocator);
+    switch (result) {
+        .ready => |readback| {
+            var owned = readback;
+            defer owned.deinit(testing.allocator);
+            try testing.expect(pixel(owned, 2, 2)[0] > 240);
+            try testing.expect(pixel(owned, 2, 2)[3] > 240);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "SceneSnapshot has a strong allocation-failure guarantee" {
+    try testing.checkAllAllocationFailures(testing.allocator, sceneSnapshotAllocationProbe, .{});
+}
+
+test "App drains pending asynchronous offscreen requests during teardown" {
+    var memory: ui.config.MemoryBudgets = .{};
+    memory.offscreen_request_count = 1;
+    const app = try ui.App.create(testing.allocator, .{
+        .application_name = "async offscreen lifecycle test",
+        .memory = memory,
+    });
+    var destroyed = false;
+    defer if (!destroyed) app.destroy() catch unreachable;
+
+    const id = try app.beginOffscreen(.{
+        .width = 2,
+        .height = 2,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8_srgb,
+    }, .{
+        .operations = &.{},
+        .materials = &.{},
+        .gradient_stops = &.{},
+        .clips = &.{},
+        .layers = &.{},
+        .shadows = &.{},
+        .quads = &.{},
+        .paths = &.{},
+        .path_vertices = &.{},
+        .underlines = &.{},
+        .monochrome_sprites = &.{},
+        .color_sprites = &.{},
+        .external_surfaces = &.{},
+        .custom_passes = &.{},
+        .custom_payload = &.{},
+    });
+    try testing.expect(id != 0);
+    try app.cancelOffscreen(id);
+    try app.destroy();
+    destroyed = true;
+}
+
+test "App clears asynchronous offscreen registry across device recovery" {
+    var memory: ui.config.MemoryBudgets = .{};
+    memory.offscreen_request_count = 1;
+    var text_backend_instance = try ui.InTreeTextBackend.createInstance(
+        testing.allocator,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64,
+        64,
+        64 * 1024,
+    );
+    var harness = try ui.HeadlessPlatform.createWithMemory(testing.allocator, text_backend_instance.interface(), memory);
+    const bundle = harness.bundle;
+    harness.bundle = undefined;
+    const app = try ui.App.createWithBundle(testing.allocator, .{
+        .application_name = "async offscreen recovery test",
+        .allow_multiple_apps_for_testing = true,
+        .memory = memory,
+    }, bundle);
+    defer app.destroy() catch unreachable;
+
+    var model: WindowCompositionProbe = .{};
+    const window = try app.openWindow(.{ .platform = .{ .title = "async offscreen recovery" } }, ui.Component.Descriptor.from(WindowCompositionProbe, &model));
+    while (try app.step(false)) {}
+    _ = try app.beginOffscreen(.{
+        .width = 2,
+        .height = 2,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8_srgb,
+    }, .{
+        .operations = &.{},
+        .materials = &.{},
+        .gradient_stops = &.{},
+        .clips = &.{},
+        .layers = &.{},
+        .shadows = &.{},
+        .quads = &.{},
+        .paths = &.{},
+        .path_vertices = &.{},
+        .underlines = &.{},
+        .monochrome_sprites = &.{},
+        .color_sprites = &.{},
+        .external_surfaces = &.{},
+        .custom_passes = &.{},
+        .custom_payload = &.{},
+    });
+
+    try harness.post(window, .device_lost);
+    while (try app.step(false)) {}
+
+    const recovered_id = try app.beginOffscreen(.{
+        .width = 2,
+        .height = 2,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8_srgb,
+    }, .{
+        .operations = &.{},
+        .materials = &.{},
+        .gradient_stops = &.{},
+        .clips = &.{},
+        .layers = &.{},
+        .shadows = &.{},
+        .quads = &.{},
+        .paths = &.{},
+        .path_vertices = &.{},
+        .underlines = &.{},
+        .monochrome_sprites = &.{},
+        .color_sprites = &.{},
+        .external_surfaces = &.{},
+        .custom_passes = &.{},
+        .custom_payload = &.{},
+    });
+    try testing.expect(recovered_id != 0);
+    try app.cancelOffscreen(recovered_id);
+}
+
 test "a frame token cannot consume invalidation raised during that frame" {
     var counters: ui.core.metrics.Counters = .{};
     var tracker = ui.runtime_invalidation.Tracker.init(testing.allocator, &counters);
@@ -133,6 +1332,114 @@ test "a frame token cannot consume invalidation raised during that frame" {
     const latest = tracker.windowToken(window).?;
     try testing.expect(tracker.consumeWindowToken(window, latest));
     try testing.expect(!tracker.isWindowDirty(window));
+}
+
+test "dirty phase plans preserve dependency boundaries" {
+    const paint: ui.layout.Dirty = .{
+        .compose = false,
+        .layout = false,
+        .paint = true,
+        .hit_test = false,
+        .semantics = false,
+        .resources = false,
+    };
+    const paint_plan = ui.runtime_invalidation.PhasePlan.fromDirty(paint);
+    try testing.expect(!paint_plan.compose);
+    try testing.expect(!paint_plan.layout);
+    try testing.expect(!paint_plan.prepare);
+    try testing.expect(paint_plan.scene);
+    try testing.expect(!paint_plan.hit_test);
+    try testing.expect(!paint_plan.focus);
+    try testing.expect(!paint_plan.semantics);
+    try testing.expect(!paint_plan.resources);
+    try testing.expect(paint_plan.submit);
+    try testing.expect(paint_plan.toDirty().paint);
+
+    const layout_dirty: ui.layout.Dirty = .{
+        .compose = false,
+        .layout = true,
+        .paint = false,
+        .hit_test = false,
+        .semantics = false,
+        .resources = false,
+    };
+    const layout_plan = ui.runtime_invalidation.PhasePlan.fromDirty(layout_dirty);
+    try testing.expect(!layout_plan.compose);
+    try testing.expect(layout_plan.layout);
+    try testing.expect(layout_plan.prepare);
+    try testing.expect(layout_plan.scene);
+    try testing.expect(layout_plan.hit_test);
+    try testing.expect(layout_plan.focus);
+    try testing.expect(layout_plan.semantics);
+    try testing.expect(!layout_plan.resources);
+    try testing.expect(layout_plan.toDirty().layout);
+
+    const resources: ui.layout.Dirty = .{
+        .compose = false,
+        .layout = false,
+        .paint = false,
+        .hit_test = false,
+        .semantics = false,
+        .resources = true,
+    };
+    const resources_plan = ui.runtime_invalidation.PhasePlan.fromDirty(resources);
+    try testing.expect(!resources_plan.compose);
+    try testing.expect(!resources_plan.layout);
+    try testing.expect(resources_plan.prepare);
+    try testing.expect(resources_plan.scene);
+    try testing.expect(resources_plan.resources);
+    try testing.expect(resources_plan.submit);
+    try testing.expect(resources_plan.toDirty().resources);
+
+    const semantic: ui.layout.Dirty = .{
+        .compose = false,
+        .layout = false,
+        .paint = false,
+        .hit_test = false,
+        .semantics = true,
+        .resources = false,
+    };
+    const semantic_plan = ui.runtime_invalidation.PhasePlan.fromDirty(semantic);
+    try testing.expect(!semantic_plan.compose);
+    try testing.expect(!semantic_plan.layout);
+    try testing.expect(!semantic_plan.scene);
+    try testing.expect(!semantic_plan.hit_test);
+    try testing.expect(semantic_plan.semantics);
+    try testing.expect(semantic_plan.submit);
+}
+
+test "ordinary component marks stay conservative while frame marks restore on failure" {
+    var counters: ui.core.metrics.Counters = .{};
+    var tracker = ui.runtime_invalidation.Tracker.init(testing.allocator, &counters);
+    defer tracker.deinit();
+    const component = handles.ComponentId.init(7, 1);
+    const window = handles.WindowId.init(8, 1);
+    try tracker.register(component, window);
+    _ = tracker.consumeComponent(component);
+    _ = tracker.consumeWindow(window);
+
+    const paint: ui.layout.Dirty = .{
+        .compose = false,
+        .layout = false,
+        .paint = true,
+        .hit_test = false,
+        .semantics = false,
+        .resources = false,
+    };
+    _ = tracker.markComponent(component, paint);
+    try testing.expect(tracker.windowDirty(window).?.compose);
+    try testing.expect(tracker.consumeComponent(component).?.compose);
+    _ = tracker.consumeWindow(window);
+
+    _ = tracker.markComponentDuringFrame(component, paint);
+    try testing.expectEqual(paint, tracker.windowDirty(window).?);
+    const in_flight = tracker.beginComponent(component).?;
+    try testing.expect(in_flight.paint);
+    try testing.expect(!in_flight.compose);
+    tracker.finishWindowComposition(window, false);
+    try testing.expectEqual(paint, tracker.beginComponent(component).?);
+    tracker.finishWindowComposition(window, true);
+    try testing.expect(!tracker.windowDirty(window).?.compose);
 }
 
 test "bounded queues preserve order, capacity, and shutdown" {
@@ -305,6 +1612,31 @@ test "font and image readers reject truncated and hostile offsets" {
     }
 }
 
+test "GIF decoder accepts every frame of a valid disposal animation" {
+    const bytes = @embedFile("fixtures/ajax-loader.gif");
+    var decoder = try ui.animation.Decoder.init(testing.allocator, bytes, .{});
+    defer decoder.deinit();
+    var frames: usize = 0;
+    while (try decoder.next()) |_| {
+        frames += 1;
+        if (frames > 256) return error.TestUnexpectedResult;
+    }
+    try testing.expect(frames > 1);
+
+    var malformed = try testing.allocator.dupe(u8, bytes);
+    defer testing.allocator.free(malformed);
+    malformed[malformed.len - 1] = 1;
+    var strict = try ui.animation.Decoder.init(testing.allocator, malformed, .{});
+    defer strict.deinit();
+    while (strict.next()) |_| {} else |err| try testing.expectEqual(error.InvalidImage, err);
+
+    var player = try ui.animation.Player.init(testing.allocator, malformed, .{}, 0);
+    defer player.deinit();
+    _ = try player.advance(10 * std.time.ns_per_s);
+    try testing.expectEqual(ui.animation.State.failed, player.state);
+    try testing.expectEqual(error.InvalidImage, player.failure.?);
+}
+
 test "scene validation preserves operation ordering and bounds nesting depth" {
     var scene = ui.scene.Scene.init(testing.allocator);
     defer scene.deinit();
@@ -341,6 +1673,111 @@ test "scene validation preserves operation ordering and bounds nesting depth" {
     try too_deep.finish();
 }
 
+test "backdrop effects encode as a validated retained scene primitive" {
+    try testing.expectEqual(@as(u32, 11), @backingInt(ui.scene_abi.OperationKind.custom_passes));
+    try testing.expectEqual(@as(u32, 12), @backingInt(ui.scene_abi.OperationKind.backdrop_effect));
+
+    var scene = ui.scene.Scene.init(testing.allocator);
+    defer scene.deinit();
+    var builder = ui.scene.Builder.init(&scene, .{});
+    defer builder.deinit();
+    const effect: ui.scene_abi.BackdropEffect = .{
+        .bounds = ui.Rect.fromXYWH(2, 3, 20, 12),
+        .radii = ui.CornerRadii.all(4),
+        .blur_radius = 6,
+        .saturation = 0.75,
+        .opacity = 0.5,
+    };
+    try builder.backdropEffect(effect);
+    try builder.finish();
+
+    try testing.expect(scene.view().requiresBackdropEffects());
+    try testing.expectEqual(@as(usize, 1), scene.backdrop_effects.items.len);
+    try testing.expectEqual(effect, scene.backdrop_effects.items[0]);
+    try testing.expectEqual(@as(usize, 1), scene.operations.items.len);
+    const operation = scene.operations.items[0];
+    try testing.expectEqual(@backingInt(ui.scene_abi.OperationKind.backdrop_effect), operation.kind);
+    try testing.expectEqual(@as(u32, 0), operation.start);
+    try testing.expectEqual(@as(u32, 1), operation.count);
+    try testing.expectEqual(ui.scene.none_index, operation.clip);
+    try testing.expectEqual(ui.scene.none_index, operation.layer);
+    try testing.expectEqual(ui.scene.none_index, operation.material);
+    try testing.expectEqual(ui.scene.none_index, operation.reserved);
+
+    var invalid_scene = ui.scene.Scene.init(testing.allocator);
+    defer invalid_scene.deinit();
+    var invalid_builder = ui.scene.Builder.init(&invalid_scene, .{});
+    defer invalid_builder.deinit();
+    try invalid_builder.backdropEffect(.{
+        .bounds = ui.Rect.fromXYWH(0, 0, 4, 4),
+        .radii = .{},
+        .blur_radius = 129,
+        .saturation = 1,
+    });
+    try testing.expectError(error.InvalidScene, invalid_builder.finish());
+}
+
+test "retained paint changes include backdrop effect fields" {
+    var store = ui.NodeStore.init(testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+
+    const initial_style: ui.style.Style = .{ .paint = .{
+        .backdrop_effect = .{ .blur_radius = 4, .saturation = 0.8 },
+    } };
+    const root = try store.reconcile(null, .invalid, .invalid, .{ .style = initial_style }, 1, scratch.allocator());
+    const initial_generation = store.getConst(root).?.paint_generation;
+
+    var updated_style = initial_style;
+    updated_style.paint.backdrop_effect = .{ .blur_radius = 8, .saturation = 1.2 };
+    _ = try store.reconcile(root, .invalid, .invalid, .{ .style = updated_style }, 1, scratch.allocator());
+    try testing.expectEqual(updated_style.paint.backdrop_effect, store.getConst(root).?.borrowedStyle().paint.backdrop_effect);
+    try testing.expectEqual(initial_generation + 1, store.getConst(root).?.paint_generation);
+
+    var invalid_style = updated_style;
+    invalid_style.paint.backdrop_effect = .{ .blur_radius = 129 };
+    try testing.expectError(error.InvalidConfiguration, store.reconcile(root, .invalid, .invalid, .{ .style = invalid_style }, 1, scratch.allocator()));
+    try testing.expectEqual(updated_style.paint.backdrop_effect, store.getConst(root).?.borrowedStyle().paint.backdrop_effect);
+}
+
+test "scene painter emits styled backdrop before opacity-isolated node paint" {
+    var store = ui.NodeStore.init(testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const root = try store.reconcile(null, .invalid, .invalid, .{
+        .kind = .spacer,
+        .style = .{
+            .paint = .{
+                .background = .{ .solid = ui.Color.rgba(0.1, 0.2, 0.3, 0.75) },
+                .backdrop_effect = .{ .blur_radius = 2, .saturation = 0.9 },
+                .opacity = 0.5,
+            },
+        },
+    }, 1, scratch.allocator());
+    store.get(root).?.layout.bounds = ui.Rect.fromXYWH(2, 2, 20, 12);
+
+    var scene = ui.scene.Scene.init(testing.allocator);
+    defer scene.deinit();
+    var builder = ui.scene.Builder.init(&scene, .{});
+    defer builder.deinit();
+    var painter: ui.ScenePainter = .{
+        .builder = &builder,
+        .scratch = scratch.allocator(),
+        .scale_factor = try ui.ScaleFactor.init(1),
+    };
+    try painter.paint(&store, root);
+    try builder.finish();
+
+    try testing.expectEqual(@as(usize, 4), scene.operations.items.len);
+    try testing.expectEqual(@backingInt(ui.scene_abi.OperationKind.backdrop_effect), scene.operations.items[0].kind);
+    try testing.expectEqual(@as(f32, 0.5), scene.backdrop_effects.items[0].opacity);
+    try testing.expectEqual(@backingInt(ui.scene_abi.OperationKind.push_layer), scene.operations.items[1].kind);
+    try testing.expectEqual(@backingInt(ui.scene_abi.OperationKind.quads), scene.operations.items[2].kind);
+    try testing.expectEqual(@backingInt(ui.scene_abi.OperationKind.pop_layer), scene.operations.items[3].kind);
+}
+
 test "scene builder leaves no partial primitive when allocation fails" {
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
     var scene = ui.scene.Scene.init(failing.allocator());
@@ -365,9 +1802,10 @@ test "native media placements are bounded unique layout declarations" {
     defer builder.deinit();
     const id = handles.NativeMediaId.init(2, 1);
     const bounds = ui.Rect.fromXYWH(10, 20, 320, 180);
-    try builder.nativeMedia(id, bounds);
+    try builder.nativeMediaWithVisibility(id, bounds, false);
     try testing.expectEqual(@as(usize, 1), scene.native_media_placements.items.len);
     try testing.expectEqual(bounds, scene.native_media_placements.items[0].bounds);
+    try testing.expect(!scene.native_media_placements.items[0].visible);
     try testing.expectError(error.InvalidScene, builder.nativeMedia(id, bounds));
     try testing.expectError(error.InvalidHandle, builder.nativeMedia(.invalid, bounds));
 }
@@ -405,6 +1843,198 @@ test "null renderer respects affine rounded clips and produces readback" {
     try testing.expect(pixel(readback, 6, 6)[0] > 240);
     try testing.expectEqual(@as(u8, 0), pixel(readback, 0, 0)[3]);
     try testing.expect(pixel(readback, 2, 2)[3] < 128);
+}
+
+test "null renderer paints content translated into a parent scroll clip" {
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    defer renderer.deinit();
+
+    var scene = ui.scene.Scene.init(testing.allocator);
+    defer scene.deinit();
+    var builder = ui.scene.Builder.init(&scene, .{});
+    defer builder.deinit();
+
+    _ = try builder.pushClip(ui.Rect.fromXYWH(0, 0, 10, 10), .{});
+    _ = try builder.pushLayer(1, .normal, ui.Affine2D.translation(.{ .x = 0, .y = -100 }));
+    try builder.quad(.{
+        .bounds = ui.Rect.fromXYWH(0, 100, 10, 10),
+        .background = ui.Color.rgba(1, 0, 0, 1),
+        .border_color = .transparent,
+        .border_widths = .{},
+        .radii = .{},
+    }, null);
+    try builder.popLayer();
+    try builder.popClip();
+    try builder.finish();
+
+    var readback = (try renderer.renderOffscreen(.{
+        .width = 10,
+        .height = 10,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8,
+    }, scene.view(), testing.allocator)).?;
+    defer readback.deinit(testing.allocator);
+    try testing.expect(pixel(readback, 5, 5)[0] > 240);
+    try testing.expect(pixel(readback, 5, 5)[3] > 240);
+}
+
+test "retained scroll composition paints an absolute virtualized child after offset" {
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    defer renderer.deinit();
+    var store = ui.NodeStore.init(testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+
+    const item = ui.NodeSpec{
+        .kind = .spacer,
+        .style = .{
+            .layout = .{
+                .position = .absolute,
+                .width = .{ .points = 10 },
+                .height = .{ .points = 10 },
+                .inset = .{ .top = .{ .points = 100 }, .left = .{ .points = 0 } },
+            },
+            .paint = .{ .background = .{ .solid = ui.Color.rgba(1, 0, 0, 1) } },
+        },
+    };
+    const content = ui.NodeSpec{
+        .kind = .container,
+        .style = .{ .layout = .{ .width = .{ .points = 10 }, .height = .{ .points = 110 }, .flex_shrink = 0 } },
+        .children = &.{item},
+    };
+    const root = try store.reconcile(null, .invalid, .invalid, .{
+        .kind = .{ .scroll = .{ .vertical = true, .offset_y = 100 } },
+        .style = .{ .layout = .{
+            .width = .{ .points = 10 },
+            .height = .{ .points = 10 },
+            .overflow_y = .scroll,
+            .overflow_x = .hidden,
+        } },
+        .children = &.{content},
+    }, 1, scratch.allocator());
+    var measure_context: u8 = 0;
+    var engine: ui.LayoutEngine = .{
+        .scratch = scratch.allocator(),
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .measures = .{
+            .context = &measure_context,
+            .text_fn = emptyTextMeasure,
+            .custom_measure_fn = emptyCustomMeasure,
+        },
+    };
+    try engine.layout(&store, root, .{ .width = 10, .height = 10 });
+    const root_record = store.getConst(root).?;
+    const content_record = store.getConst(root_record.children.items[0]).?;
+    const item_record = store.getConst(content_record.children.items[0]).?;
+    try testing.expectApproxEqAbs(@as(f32, 110), content_record.layout.bounds.size.height, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 100), item_record.layout.bounds.origin.y, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 10), item_record.layout.bounds.size.height, 0.001);
+
+    var scene = ui.scene.Scene.init(testing.allocator);
+    defer scene.deinit();
+    var builder = ui.scene.Builder.init(&scene, .{});
+    defer builder.deinit();
+    var painter: ui.ScenePainter = .{
+        .builder = &builder,
+        .scratch = scratch.allocator(),
+        .scale_factor = try ui.ScaleFactor.init(1),
+    };
+    try painter.paint(&store, root);
+    try builder.finish();
+
+    var readback = (try renderer.renderOffscreen(.{
+        .width = 10,
+        .height = 10,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8,
+    }, scene.view(), testing.allocator)).?;
+    defer readback.deinit(testing.allocator);
+    try testing.expect(pixel(readback, 5, 5)[0] > 240);
+    try testing.expect(pixel(readback, 5, 5)[3] > 240);
+}
+
+test "null renderer advertises and applies retained backdrop effects" {
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    defer renderer.deinit();
+    try testing.expect(renderer.capabilities().backdrop_effects);
+
+    var scene = ui.scene.Scene.init(testing.allocator);
+    defer scene.deinit();
+    var builder = ui.scene.Builder.init(&scene, .{});
+    defer builder.deinit();
+    try builder.quad(.{
+        .bounds = ui.Rect.fromXYWH(0, 0, 4, 8),
+        .background = ui.Color.rgba(1, 0, 0, 1),
+        .border_color = .transparent,
+        .border_widths = .{},
+        .radii = .{},
+    }, null);
+    try builder.quad(.{
+        .bounds = ui.Rect.fromXYWH(4, 0, 4, 8),
+        .background = ui.Color.rgba(0, 0, 1, 1),
+        .border_color = .transparent,
+        .border_widths = .{},
+        .radii = .{},
+    }, null);
+    try builder.backdropEffect(.{
+        .bounds = ui.Rect.fromXYWH(0, 0, 8, 8),
+        .radii = .{},
+        .blur_radius = 2,
+        .saturation = 1,
+    });
+    try builder.finish();
+
+    var readback = (try renderer.renderOffscreen(.{
+        .width = 8,
+        .height = 8,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8,
+    }, scene.view(), testing.allocator)).?;
+    defer readback.deinit(testing.allocator);
+    const boundary = pixel(readback, 3, 4);
+    try testing.expect(boundary[0] > 0);
+    try testing.expect(boundary[2] > 0);
+}
+
+test "null backdrop blur preserves uniform pixels and saturation can desaturate them" {
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    defer renderer.deinit();
+
+    var scene = ui.scene.Scene.init(testing.allocator);
+    defer scene.deinit();
+    var builder = ui.scene.Builder.init(&scene, .{});
+    defer builder.deinit();
+    const source = ui.Color.rgba(0.8, 0.2, 0.1, 1);
+    try builder.quad(.{
+        .bounds = ui.Rect.fromXYWH(0, 0, 8, 8),
+        .background = source,
+        .border_color = .transparent,
+        .border_widths = .{},
+        .radii = .{},
+    }, null);
+    try builder.backdropEffect(.{
+        .bounds = ui.Rect.fromXYWH(2, 2, 4, 4),
+        .radii = .{},
+        .blur_radius = 4,
+        .saturation = 0,
+    });
+    try builder.finish();
+
+    var readback = (try renderer.renderOffscreen(.{
+        .width = 8,
+        .height = 8,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8,
+    }, scene.view(), testing.allocator)).?;
+    defer readback.deinit(testing.allocator);
+    const outside = pixel(readback, 0, 0);
+    try testing.expectEqual(@as(u8, 204), outside[0]);
+    try testing.expectEqual(@as(u8, 51), outside[1]);
+    try testing.expectEqual(@as(u8, 26), outside[2]);
+    const desaturated = pixel(readback, 4, 4);
+    try testing.expectEqual(desaturated[0], desaturated[1]);
+    try testing.expectEqual(desaturated[1], desaturated[2]);
 }
 
 test "null renderer samples scaled textures bilinearly" {
@@ -635,6 +2265,14 @@ test "application configuration validates every path work boundary" {
     try testing.expectError(error.InvalidConfiguration, ui.config.validate(missing_work));
 }
 
+test "pointer event coalescing policy is an explicit application contract" {
+    var value: ui.config.AppConfig = .{};
+    try ui.config.validate(value);
+    try testing.expectEqual(ui.config.PointerEventCoalescing.platform_default, value.pointer_event_coalescing);
+    value.pointer_event_coalescing = .disabled;
+    try ui.config.validate(value);
+}
+
 test "layout, hit testing, focus, and accessibility share retained identities" {
     var store = ui.NodeStore.init(testing.allocator);
     defer store.deinit();
@@ -811,6 +2449,44 @@ test "scrolling flex containers preserve overflowing main-axis content" {
     try testing.expectApproxEqAbs(@as(f32, 80), store.getConst(retained[1]).?.layout.bounds.size.height, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 80), store.getConst(retained[1]).?.layout.bounds.origin.y, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 160), store.getConst(root).?.layout.scroll_extent.height, 0.001);
+}
+
+test "dialog keeps overflowing modal content in a live scroll viewport" {
+    var open = true;
+    var content_children: [8]ui.NodeSpec = undefined;
+    for (&content_children) |*child| child.* = .{ .kind = .spacer, .style = .{ .layout = .{ .height = .{ .points = 80 }, .flex_shrink = 0 } } };
+    const dialog_content = ui.NodeSpec{ .kind = .container, .style = .{ .layout = .{ .direction = .column } }, .children = &content_children };
+    const footer = ui.NodeSpec{ .kind = .spacer, .style = .{ .layout = .{ .height = .{ .points = 40 }, .flex_shrink = 0 } } };
+    var dialog = ui.widgets.Dialog{ .open = &open, .title = "Scrollable dialog", .content = dialog_content, .footer = footer, .width = 420 };
+
+    var build_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer build_arena.deinit();
+    var build_context: ui.Component.BuildContext = undefined;
+    build_context.allocator = build_arena.allocator();
+    const spec = try dialog.build(&build_context);
+    const panel = spec.children[1];
+    try testing.expectEqual(@as(usize, 1), panel.children.len);
+    const scroll = panel.children[0];
+    try testing.expect(std.meta.activeTag(scroll.kind) == .scroll);
+    try testing.expectEqual(ui.layout.Overflow.scroll, scroll.style.layout.overflow_y);
+
+    var store = ui.NodeStore.init(testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const root = try store.reconcile(null, handles.NodeId.invalid, handles.NodeId.invalid, spec, 1, scratch.allocator());
+    var measure_context: u8 = 0;
+    var engine: ui.LayoutEngine = .{
+        .scratch = scratch.allocator(),
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .measures = .{ .context = &measure_context, .text_fn = emptyTextMeasure, .custom_measure_fn = emptyCustomMeasure },
+    };
+    try engine.layout(&store, root, .{ .width = 480, .height = 300 });
+    const panel_id = store.getConst(root).?.children.items[1];
+    const scroll_id = store.getConst(panel_id).?.children.items[0];
+    const scroll_record = store.getConst(scroll_id).?;
+    try testing.expect(scroll_record.layout.scroll_extent.height > scroll_record.layout.content_bounds.size.height);
+    try testing.expect(scroll_record.layout.bounds.size.height <= 246);
 }
 
 test "flex remeasures wrapped content at its allocated main size" {
@@ -1015,6 +2691,51 @@ test "absolute layout applies margins and derives an auto aspect axis" {
     try testing.expectApproxEqAbs(@as(f32, 35), child.size.height, 0.001);
 }
 
+test "absolute point-width menus honor right and bottom insets" {
+    var store = ui.NodeStore.init(testing.allocator);
+    defer store.deinit();
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+
+    const menu_items = [_]ui.NodeSpec{
+        .{ .kind = .{ .text = "New Note" } },
+        .{ .kind = .{ .text = "New Sticky" } },
+        .{ .kind = .{ .text = "New Folder" } },
+        .{ .kind = .{ .text = "New Palette" } },
+        .{ .kind = .{ .text = "Palette from Image" } },
+    };
+    const children = [_]ui.NodeSpec{.{
+        .kind = .container,
+        .style = .{ .layout = .{
+            .position = .absolute,
+            .width = .{ .points = 220 },
+            .inset = .{ .top = .auto, .right = .{ .points = 14 }, .bottom = .{ .points = 78 }, .left = .auto },
+            .direction = .column,
+            .gap = .{ .height = 3 },
+            .padding = .{ .top = .{ .points = 10 }, .right = .{ .points = 10 }, .bottom = .{ .points = 10 }, .left = .{ .points = 10 } },
+        } },
+        .children = &menu_items,
+    }};
+    const root = try store.reconcile(null, .invalid, .invalid, .{ .children = &children }, 1, scratch.allocator());
+    var measure_context: u8 = 0;
+    var engine: ui.LayoutEngine = .{
+        .scratch = scratch.allocator(),
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .measures = .{
+            .context = &measure_context,
+            .text_fn = menuTextMeasure,
+            .custom_measure_fn = emptyCustomMeasure,
+        },
+    };
+    try engine.layout(&store, root, .{ .width = 800, .height = 600 });
+
+    const menu = store.getConst(store.getConst(root).?.children.items[0]).?.layout.bounds;
+    try testing.expectApproxEqAbs(@as(f32, 566), menu.origin.x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 310), menu.origin.y, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 220), menu.size.width, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 212), menu.size.height, 0.001);
+}
+
 test "custom measurement cannot publish non-finite layout geometry" {
     var store = ui.NodeStore.init(testing.allocator);
     defer store.deinit();
@@ -1049,6 +2770,11 @@ test "headless platform deterministically exposes windows displays clipboard and
     });
     try testing.expectEqual(ui.platform.NativeHandle.Kind.headless, native.kind);
     try testing.expect(harness.bundle.windows.nativeHandle(window) != null);
+    try testing.expectError(error.MissingCapability, harness.bundle.windows.captureWindow(
+        window,
+        .{ .width = 640, .height = 480 },
+        testing.allocator,
+    ));
 
     var displays = try harness.bundle.displays.list(testing.allocator);
     defer displays.deinit();
@@ -1082,6 +2808,159 @@ test "headless platform deterministically exposes windows displays clipboard and
     harness.bundle.windows.destroy(window);
     while (try harness.bundle.event_loop.step(sink, false)) {}
     try testing.expectEqual(@as(EventCollector.Tag, .closed), events.tags[events.len - 1]);
+}
+
+test "headless promised-file service preserves mixed outcomes and cancellation" {
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, null);
+    defer harness.bundle.deinit();
+    defer harness.bundle.renderer.deinit();
+    const service = harness.bundle.promised_files orelse return error.MissingCapability;
+    const descriptors = [_]ui.platform.PromisedFileDescriptor{
+        .{ .suggested_name = "one.txt", .content_type = "public.plain-text" },
+        .{ .suggested_name = "two.pdf", .content_type = "com.adobe.pdf" },
+    };
+    const outcomes = [_]ui.HeadlessPlatform.FakePromisedOutcome{
+        .{ .path = "/tmp/promised/one.txt" },
+        .{ .error_description = "provider refused the second file" },
+    };
+    const batch = try harness.addPromisedBatch(&descriptors, &outcomes);
+    var description = try service.describe(batch, testing.allocator);
+    defer description.deinit();
+    try testing.expectEqualStrings("one.txt", description.values[0].suggested_name);
+    const operation = try service.begin(batch, "/tmp/promised-destination");
+    try service.releaseBatch(batch);
+    try testing.expectEqual(ui.platform.PromisedFilePoll.pending, try service.poll(operation, testing.allocator));
+    var terminal = try service.poll(operation, testing.allocator);
+    switch (terminal) {
+        .pending => {
+            return error.TestUnexpectedResult;
+        },
+        .terminal => |*completion| {
+            defer completion.deinit();
+            try testing.expectEqual(ui.platform.PromisedFileTerminalStatus.partial, completion.status);
+            try testing.expectEqualStrings("/tmp/promised/one.txt", completion.outputs[0].path.?);
+            try testing.expectEqualStrings("provider refused the second file", completion.outputs[1].error_description.?);
+        },
+    }
+    try service.releaseOperation(operation);
+    try testing.expectError(error.InvalidHandle, service.releaseBatch(batch));
+
+    const canceled_batch = try harness.addPromisedBatch(&descriptors, &.{ .{}, .{} });
+    const canceled_operation = try service.begin(canceled_batch, "/tmp/promised-canceled");
+    try service.cancel(canceled_operation);
+    var canceled = try service.poll(canceled_operation, testing.allocator);
+    switch (canceled) {
+        .pending => {
+            return error.TestUnexpectedResult;
+        },
+        .terminal => |*completion| {
+            defer completion.deinit();
+            try testing.expectEqual(ui.platform.PromisedFileTerminalStatus.canceled, completion.status);
+            try testing.expect(completion.outputs[0].path == null);
+        },
+    }
+    try service.releaseOperation(canceled_operation);
+    try service.releaseBatch(canceled_batch);
+}
+
+test "headless page capture is bounded, generational, and one-shot" {
+    var memory: ui.config.MemoryBudgets = .{};
+    memory.offscreen_request_count = 2;
+    var harness = try ui.HeadlessPlatform.createWithMemory(testing.allocator, null, memory);
+    defer harness.bundle.deinit();
+    defer harness.bundle.renderer.deinit();
+
+    const service = harness.bundle.page_capture orelse return error.MissingCapability;
+    harness.setPageCaptureOutcome(.{ .status = .completed, .width = 640, .height = 360 });
+    const options: ui.platform.PageCaptureOptions = .{
+        .url = "https://example.com/article",
+        .size = .{ .width = 320, .height = 180 },
+        .timeout_ns = 2 * std.time.ns_per_s,
+    };
+    const request = try service.begin(options);
+    try testing.expect(request.isValid());
+    try testing.expectError(error.ResourceBusy, service.release(request));
+    try testing.expectEqual(ui.platform.PageCapturePoll.pending, try service.poll(request, testing.allocator));
+
+    var terminal = try service.poll(request, testing.allocator);
+    switch (terminal) {
+        .pending => return error.TestUnexpectedResult,
+        .terminal => |*completion| {
+            defer completion.deinit();
+            try testing.expectEqual(ui.platform.PageCaptureTerminalStatus.completed, completion.status);
+            const result = completion.result orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(@as(u32, 640), result.width);
+            try testing.expectEqual(@as(u32, 360), result.height);
+            try testing.expectEqualStrings("\x89PNG\r\n\x1a\n", result.bytes);
+        },
+    }
+    try testing.expectError(error.InvalidHandle, service.poll(request, testing.allocator));
+    try service.release(request);
+    try testing.expectError(error.InvalidHandle, service.release(request));
+
+    const replacement = try service.begin(options);
+    try testing.expectEqual(request.index, replacement.index);
+    try testing.expect(request.generation != replacement.generation);
+    try service.cancel(replacement);
+    var canceled = try service.poll(replacement, testing.allocator);
+    switch (canceled) {
+        .pending => return error.TestUnexpectedResult,
+        .terminal => |*completion| {
+            defer completion.deinit();
+            try testing.expectEqual(ui.platform.PageCaptureTerminalStatus.canceled, completion.status);
+            try testing.expect(completion.result == null);
+        },
+    }
+    try service.release(replacement);
+}
+
+test "headless page capture preserves failure details and validates URLs" {
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, null);
+    defer harness.bundle.deinit();
+    defer harness.bundle.renderer.deinit();
+    const service = harness.bundle.page_capture orelse return error.MissingCapability;
+
+    try testing.expectError(error.InvalidConfiguration, service.begin(.{ .url = "file:///tmp/private" }));
+    try testing.expectError(error.InvalidConfiguration, service.begin(.{ .url = "https://" }));
+    try testing.expectError(error.InvalidConfiguration, service.begin(.{ .url = "https://example.com", .size = .{ .width = 0, .height = 180 } }));
+
+    harness.setPageCaptureOutcome(.{
+        .status = .failed,
+        .error_description = "LinkPresentation refused the page",
+    });
+    const request = try service.begin(.{ .url = "https://example.com" });
+    _ = try service.poll(request, testing.allocator);
+    var terminal = try service.poll(request, testing.allocator);
+    switch (terminal) {
+        .pending => return error.TestUnexpectedResult,
+        .terminal => |*completion| {
+            defer completion.deinit();
+            try testing.expectEqual(ui.platform.PageCaptureTerminalStatus.failed, completion.status);
+            try testing.expectEqualStrings("LinkPresentation refused the page", completion.error_description.?);
+            try testing.expect(completion.result == null);
+        },
+    }
+    try service.release(request);
+}
+
+test "headless purging a queued promised drop releases its batch" {
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, null);
+    defer harness.bundle.deinit();
+    defer harness.bundle.renderer.deinit();
+    const service = harness.bundle.promised_files orelse return error.MissingCapability;
+    const descriptors = [_]ui.platform.PromisedFileDescriptor{.{ .suggested_name = "queued.txt" }};
+    const outcomes = [_]ui.HeadlessPlatform.FakePromisedOutcome{.{ .path = "/tmp/queued.txt" }};
+    const batch = try harness.addPromisedBatch(&descriptors, &outcomes);
+    const window = handles.WindowId.init(51, 1);
+    _ = try harness.bundle.windows.create(window, .{ .title = "queued promise", .visible = false });
+    try harness.post(window, .{ .input = .{ .file_drop_performed = .{
+        .paths = &.{},
+        .position = .{},
+        .promised_batch = batch,
+    } } });
+
+    harness.bundle.windows.destroy(window);
+    try testing.expectError(error.InvalidHandle, service.describe(batch, testing.allocator));
 }
 
 test "coordinator binding is single owner and returns a typed error" {
@@ -1293,6 +3172,29 @@ test "retained updates reject invalid payloads without changing committed record
     try testing.expectEqual(initial_generation, store.getConst(root).?.paint_generation);
 }
 
+test "file drops preserve mixed paths and text within the aggregate payload bound" {
+    const path = "/tmp/from-native-file-url";
+    const uri_list = "https://example.com/item\r\nfile:///tmp/from-uri-list\r\n";
+    var event: ui.input.Event = .{ .file_drop_performed = .{
+        .paths = &.{path},
+        .position = .{ .x = 4, .y = 8 },
+        .text = uri_list,
+    } };
+    try ui.input.validate(&event, .{ .maximum_payload_bytes = path.len + uri_list.len });
+
+    try testing.expectError(error.BudgetExceeded, ui.input.validate(&event, .{
+        .maximum_payload_bytes = path.len + uri_list.len - 1,
+    }));
+
+    const invalid_text = [_]u8{0xff};
+    event = .{ .file_drop_performed = .{
+        .paths = &.{path},
+        .position = .{ .x = 4, .y = 8 },
+        .text = &invalid_text,
+    } };
+    try testing.expectError(error.InvalidUtf8, ui.input.validate(&event, .{}));
+}
+
 test "retained byte budget rejects replacement and preserves old ownership" {
     var store = ui.NodeStore.initWithLimits(testing.allocator, .{
         .maximum_nodes = 16,
@@ -1423,23 +3325,126 @@ test "menu validation rejects invalid trees before invoking native code" {
         .limits = .{ .maximum_items = 2, .maximum_depth = 2, .maximum_text_bytes = 8 },
     };
     const action_id = handles.ActionId.init(1, 1);
-    const valid = [_]ui.platform.MenuItem{.{ .action = .{ .label = "Open", .action = action_id, .payload = 0xfeed_beef } }};
+    const valid = [_]ui.platform.MenuItem{.{ .action = .{
+        .label = "Open",
+        .action = action_id,
+        .payload = 0xfeed_beef,
+        .shortcut = .{ .key = .{ .character = 'o' }, .modifiers = .{ .command = true } },
+    } }};
     try menus.setApplicationMenu(&valid);
     try testing.expectEqual(@as(usize, 1), probe.set_calls);
     try testing.expectEqual(@as(u64, 0xfeed_beef), probe.payload);
     var invocation_event: ui.platform.WindowEvent = .{ .menu_action = .{ .action = action_id, .payload = 0xfeed_beef } };
     try ui.platform.validateWindowEvent(&invocation_event);
 
+    const standard = [_]ui.platform.MenuItem{.{ .application = .{ .items = &.{.{ .system_action = .{ .label = "About", .action = .about_application } }} } }};
+    try menus.setApplicationMenu(&standard);
+    try testing.expectEqual(@as(usize, 2), probe.set_calls);
+
     const too_many = [_]ui.platform.MenuItem{ .separator, .separator, .separator };
     try testing.expectError(error.BudgetExceeded, menus.setApplicationMenu(&too_many));
     const invalid_text = [_]u8{0xff};
     const invalid = [_]ui.platform.MenuItem{.{ .action = .{ .label = &invalid_text, .action = action_id } }};
     try testing.expectError(error.InvalidUtf8, menus.setApplicationMenu(&invalid));
+    const invalid_function = [_]ui.platform.MenuItem{.{ .action = .{ .label = "Open", .action = action_id, .shortcut = .{ .key = .{ .function = 0 } } } }};
+    try testing.expectError(error.InvalidConfiguration, menus.setApplicationMenu(&invalid_function));
+    const native_shortcut = [_]ui.platform.MenuItem{.{ .action = .{ .label = "Open", .action = action_id, .shortcut = .{ .key = .{ .native = 1 } } } }};
+    try testing.expectError(error.Unsupported, menus.setApplicationMenu(&native_shortcut));
     const leaf = [_]ui.platform.MenuItem{.separator};
     const middle = [_]ui.platform.MenuItem{.{ .submenu = .{ .label = "M", .items = &leaf } }};
     const deep = [_]ui.platform.MenuItem{.{ .submenu = .{ .label = "D", .items = &middle } }};
     try testing.expectError(error.BudgetExceeded, menus.setApplicationMenu(&deep));
-    try testing.expectEqual(@as(usize, 1), probe.set_calls);
+    try testing.expectEqual(@as(usize, 2), probe.set_calls);
+}
+
+const MenuDispatchProbe = struct {
+    action: handles.ActionId,
+    invocations: usize = 0,
+    child_invocations: usize = 0,
+    payload: u64 = 0,
+    focus_target: bool = false,
+
+    pub fn build(self: *MenuDispatchProbe, ctx: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
+        const handlers = try ctx.allocator.dupe(ui.actions.Handler, &.{.{
+            .action = self.action,
+            .callback_context = self,
+            .callback = receive,
+        }});
+        const child_handlers = try ctx.allocator.dupe(ui.actions.Handler, &.{.{
+            .action = self.action,
+            .callback_context = self,
+            .callback = receiveChild,
+        }});
+        const children = try ctx.allocator.alloc(ui.NodeSpec, 1);
+        children[0] = .{
+            .kind = .spacer,
+            .style = .{ .layout = .{ .width = .{ .points = 10 }, .height = .{ .points = 10 } }, .interaction = .{ .focusable = true, .tab_index = -1, .autofocus = self.focus_target } },
+            .action_handlers = child_handlers,
+        };
+        return .{
+            .kind = .container,
+            .action_handlers = handlers,
+            .children = children,
+        };
+    }
+
+    fn receive(
+        context: *anyopaque,
+        dispatch: *ui.actions.Dispatch,
+        invocation: ui.actions.ActionEvent,
+        ctx: *ui.input.Context,
+    ) ui.Error!void {
+        const self: *MenuDispatchProbe = @ptrCast(@alignCast(context));
+        self.invocations += 1;
+        self.payload = invocation.menu_payload;
+        self.focus_target = true;
+        ctx.requestAutofocusAfterReconcile();
+        try ctx.invalidate(.{});
+        dispatch.handled = true;
+    }
+
+    fn receiveChild(context: *anyopaque, dispatch: *ui.actions.Dispatch, _: ui.actions.ActionEvent, _: *ui.input.Context) ui.Error!void {
+        const self: *MenuDispatchProbe = @ptrCast(@alignCast(context));
+        self.child_invocations += 1;
+        dispatch.handled = true;
+    }
+};
+
+test "application menu actions dispatch to the retained component root" {
+    var text_backend_instance = try ui.InTreeTextBackend.createInstance(
+        testing.allocator,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64,
+        64,
+        64 * 1024,
+    );
+    const text_backend = text_backend_instance.interface();
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, text_backend);
+    const bundle = harness.bundle;
+    harness.bundle = undefined;
+    const app = try ui.App.createWithBundle(testing.allocator, .{
+        .application_name = "menu dispatch conformance",
+        .allow_multiple_apps_for_testing = true,
+    }, bundle);
+    defer app.destroy() catch unreachable;
+
+    const action = try app.registerAction("conformance.root-menu-action");
+    var model: MenuDispatchProbe = .{ .action = action };
+    const window = try app.openWindow(.{
+        .platform = .{ .title = "menu dispatch", .size = .{ .width = 320, .height = 240 } },
+    }, ui.Component.Descriptor.from(MenuDispatchProbe, &model));
+    while (try app.step(false)) {}
+
+    try harness.post(window, .{ .menu_action = .{ .action = action, .payload = 0x5eed } });
+    while (try app.step(false)) {}
+
+    try testing.expectEqual(@as(usize, 1), model.invocations);
+    try testing.expectEqual(@as(u64, 0x5eed), model.payload);
+
+    try harness.post(window, .{ .menu_action = .{ .action = action, .payload = 0xbeef } });
+    while (try app.step(false)) {}
+    try testing.expectEqual(@as(usize, 1), model.child_invocations);
 }
 
 test "application and native media services validate inputs before platform calls" {
@@ -1449,6 +3454,10 @@ test "application and native media services validate inputs before platform call
     try clipboard.writePaths(&clipboard_paths);
     try testing.expectEqual(@as(usize, 1), clipboard_probe.calls);
     try testing.expectEqual(@as(usize, 2), clipboard_probe.path_count);
+    try clipboard.writeImage(.{ .format = .png, .bytes = "png" });
+    try testing.expectEqual(@as(usize, 1), clipboard_probe.image_calls);
+    try testing.expectEqualStrings("png", clipboard_probe.image_bytes);
+    try testing.expectError(error.InvalidConfiguration, clipboard.writeImage(.{ .format = .png, .bytes = &.{} }));
     try testing.expectError(error.InvalidConfiguration, clipboard.writePaths(&.{}));
     try testing.expectError(error.InvalidUtf8, clipboard.writePaths(&.{"bad\x00path"}));
 
@@ -1479,12 +3488,54 @@ test "application and native media services validate inputs before platform call
     try native_media.setVolume(id, 0.25);
     try native_media.setMuted(id, true);
     const state = try native_media.state(id);
+    try testing.expectEqual(ui.platform.NativeMediaStatus.ready, state.status);
     try testing.expect(state.playing);
     try testing.expectEqual(@as(f32, 0.25), state.volume);
     try testing.expect(state.muted);
     try native_media.destroy(id);
     try testing.expectEqual(@as(usize, 10), media_probe.calls);
     try testing.expectError(error.InvalidConfiguration, native_media.setVolume(id, 2));
+}
+
+test "native media failure detail is copied and malformed provider state is rejected" {
+    var media_probe: NativeMediaProbe = .{};
+    const native_media = media_probe.service();
+    const id = try native_media.create(handles.WindowId.init(4, 1), .{
+        .source = .{ .file = "/tmp/malformed.mov" },
+        .frame = ui.Rect.fromXYWH(0, 0, 320, 180),
+    });
+
+    media_probe.status = .failed;
+    media_probe.error_description = try ui.platform.NativeMediaErrorDescription.init(
+        "The media could not be opened: unsupported codec",
+    );
+    const state = try native_media.state(id);
+    try testing.expectEqual(ui.platform.NativeMediaStatus.failed, state.status);
+    try testing.expect(state.error_description != null);
+    try testing.expectEqualStrings(
+        "The media could not be opened: unsupported codec",
+        state.error_description.?.slice(),
+    );
+
+    var malformed: ui.platform.NativeMediaErrorDescription = .{ .length = 1 };
+    malformed.bytes[0] = 0xff;
+    media_probe.error_description = malformed;
+    try testing.expectError(error.PlatformFailure, native_media.state(id));
+
+    try native_media.destroy(id);
+}
+
+test "native media keeps a presented frame independent of playback rate" {
+    var media_probe: NativeMediaProbe = .{ .playing = false, .has_presented_frame = true };
+    const native_media = media_probe.service();
+    const id = try native_media.create(handles.WindowId.init(5, 1), .{
+        .source = .{ .file = "/tmp/paused.mov" },
+        .frame = ui.Rect.fromXYWH(0, 0, 320, 180),
+    });
+    const state = try native_media.state(id);
+    try testing.expect(!state.playing);
+    try testing.expect(state.has_presented_frame);
+    try native_media.destroy(id);
 }
 
 test "headless queued payloads are deep copied and aggregate bounded" {
@@ -1501,10 +3552,12 @@ test "headless queued payloads are deep copied and aggregate bounded" {
         .replacement_utf8 = null,
     } } } });
     var path_bytes = [_]u8{ '/', 't', 'm', 'p', '/', 'a' };
+    var drop_text_bytes = [_]u8{ 'h', 't', 't', 'p', 's', ':', '/', '/', 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm' };
     var paths = [_][]const u8{&path_bytes};
     try harness.post(window, .{ .input = .{ .file_drop_performed = .{
         .paths = &paths,
         .position = .{ .x = 3, .y = 4 },
+        .text = &drop_text_bytes,
     } } });
     var accessibility_bytes = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
     try harness.post(window, .{ .accessibility_action = .{
@@ -1515,10 +3568,12 @@ test "headless queued payloads are deep copied and aggregate bounded" {
     } });
     ime_bytes[0] = 'x';
     path_bytes[5] = 'z';
+    drop_text_bytes[0] = 'x';
     accessibility_bytes[0] = 'x';
     while (try harness.bundle.event_loop.step(sink, false)) {}
     try testing.expect(collector.ime_owned);
     try testing.expect(collector.path_owned);
+    try testing.expect(collector.drop_text_owned);
     try testing.expect(collector.accessibility_owned);
 
     var constrained_memory: ui.config.MemoryBudgets = .{};
@@ -1562,6 +3617,12 @@ test "scene primitive budget spans every typed primitive stream" {
         .border_widths = .{},
         .radii = .{},
     }, null);
+    try testing.expectError(error.BudgetExceeded, builder.backdropEffect(.{
+        .bounds = ui.Rect.fromXYWH(0, 0, 1, 1),
+        .radii = .{},
+        .blur_radius = 1,
+        .saturation = 1,
+    }));
     try testing.expectError(error.BudgetExceeded, builder.underline(.{
         .bounds = ui.Rect.fromXYWH(0, 0, 1, 1),
         .color = ui.Color.white,
@@ -1731,6 +3792,19 @@ test "text field clipboard editing history and IME are bounded and reversible" {
     defer field.deinit();
     field.selection = .{ .start = 1, .end = 4 };
 
+    try field.replaceSelection("**ell**", .{ .start = 2, .end = 5 }, &context);
+    try testing.expectEqualStrings("h**ell**o", field.value());
+    try testing.expectEqual(ui.input.TextRange{ .start = 3, .end = 6 }, field.selection);
+    try testing.expectEqual(ui.input.TextRange{ .start = 3, .end = 6 }, text_input.selection);
+    try sendShortcut(&field, &dispatch, &context, 'z', false);
+    try testing.expectEqualStrings("hello", field.value());
+    try testing.expectEqual(ui.input.TextRange{ .start = 1, .end = 4 }, field.selection);
+    try sendShortcut(&field, &dispatch, &context, 'z', true);
+    try testing.expectEqualStrings("h**ell**o", field.value());
+    try testing.expectEqual(ui.input.TextRange{ .start = 3, .end = 6 }, field.selection);
+    try field.setValue("hello");
+    field.selection = .{ .start = 1, .end = 4 };
+
     try sendShortcut(&field, &dispatch, &context, 'x', false);
     try testing.expectEqualStrings("ho", field.value());
     try testing.expectEqualStrings("ell", clipboard.value());
@@ -1772,6 +3846,174 @@ test "text field clipboard editing history and IME are bounded and reversible" {
     try testing.expectEqualStrings("hello世!", field.value());
 }
 
+test "text field publishes selection before native input activation" {
+    var coordinator = ui.runtime.Coordinator.init(testing.allocator);
+    try coordinator.bind();
+    defer coordinator.deinit() catch unreachable;
+    const component_id = handles.ComponentId.init(1, 1);
+    const window_id = handles.WindowId.init(1, 1);
+    const node_id = handles.NodeId.init(1, 1);
+    try coordinator.invalidations.register(component_id, window_id);
+    var text_input: TextInputProbe = .{};
+    var context: ui.input.Context = .{
+        .coordinator = &coordinator,
+        .component = component_id,
+        .window = window_id,
+        .current_layout_bounds = ui.Rect.fromXYWH(0, 0, 200, 30),
+        .native_text_input = text_input.bridge(),
+    };
+    var dispatch: ui.input.Dispatch = .{
+        .window = window_id,
+        .target = node_id,
+        .current = node_id,
+        .phase = .target,
+    };
+    var field = try ui.widgets.TextField.init(testing.allocator, "## Heading");
+    defer field.deinit();
+    field.selection = .{ .start = 3, .end = 10 };
+
+    const focus: ui.input.Event = .focus_in;
+    try field.event(&dispatch, &focus, &context);
+
+    try testing.expect(text_input.active);
+    try testing.expect(text_input.activation_observed_surrounding_text);
+    try testing.expectEqual(ui.input.TextRange{ .start = 3, .end = 10 }, text_input.activation_selection);
+}
+
+test "text field visual configuration drives layout paint hit testing and IME geometry" {
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    var build_context: ui.Component.BuildContext = undefined;
+    build_context.allocator = scratch.allocator();
+
+    var field = try ui.widgets.TextField.init(testing.allocator, "abcd");
+    defer field.deinit();
+
+    const default_spec = try field.build(&build_context);
+    try testing.expect(std.meta.eql(default_spec.style.layout.padding, ui.layout.LengthEdges{
+        .top = .{ .points = 6 },
+        .right = .{ .points = 9 },
+        .bottom = .{ .points = 6 },
+        .left = .{ .points = 9 },
+    }));
+    try testing.expectEqual(ui.widgets.Theme.dark.surface, switch (default_spec.style.paint.background) {
+        .solid => |color| color,
+        else => unreachable,
+    });
+    try testing.expectEqual(ui.widgets.Theme.dark.border, default_spec.style.paint.border.color);
+    try testing.expectEqual(ui.widgets.Theme.dark.radius, default_spec.style.paint.radii.top_left);
+    try testing.expectEqual(ui.widgets.Theme.dark.text, default_spec.style.text.color);
+    try testing.expect(default_spec.style.text.line_height == null);
+
+    const surface = ui.Color.rgba(0.12, 0.18, 0.24, 0.92);
+    const border = ui.Color.rgba(0.35, 0.48, 0.61, 1);
+    const text = ui.Color.rgba(0.91, 0.86, 0.72, 1);
+    const placeholder = ui.Color.rgba(0.42, 0.49, 0.57, 1);
+    field.visual = .{
+        .content_insets = .{ .top = 7, .right = 11, .bottom = 5, .left = 13 },
+        .surface_color = surface,
+        .border_color = border,
+        .radius = 17,
+        .text_color = text,
+        .placeholder_color = placeholder,
+        .line_height = 42,
+    };
+    const configured_spec = try field.build(&build_context);
+    try testing.expect(std.meta.eql(configured_spec.style.layout.padding, ui.layout.LengthEdges{
+        .top = .{ .points = 7 },
+        .right = .{ .points = 11 },
+        .bottom = .{ .points = 5 },
+        .left = .{ .points = 13 },
+    }));
+    try testing.expectEqual(surface, switch (configured_spec.style.paint.background) {
+        .solid => |color| color,
+        else => unreachable,
+    });
+    try testing.expectEqual(border, configured_spec.style.paint.border.color);
+    try testing.expectEqual(@as(f32, 17), configured_spec.style.paint.radii.top_left);
+    try testing.expectEqual(text, configured_spec.style.text.color);
+    try testing.expectEqual(@as(f32, 42), configured_spec.style.text.line_height.?);
+
+    var probe: TextGeometryProbe = .{};
+    var measure_context: ui.custom.MeasureContext = .{
+        .allocator = scratch.allocator(),
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .text = probe.services(),
+    };
+    const measured = try field.measure(&measure_context, .{ .maximum = .{ .width = 100, .height = 100 } });
+    try testing.expectEqual(@as(f32, 42), measured.height);
+    try testing.expectEqual(@as(f32, 42), probe.last_measure_style.line_height.?);
+    try testing.expectEqual(text, probe.last_measure_style.color);
+
+    var paint_context: ui.custom.PaintContext = .{
+        .scene_context = &probe,
+        .emit_fn = TextGeometryProbe.emit,
+        .scratch = scratch.allocator(),
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .text = probe.services(),
+    };
+    try field.paint(&paint_context, ui.Rect.fromXYWH(0, 0, 120, 80));
+    try testing.expectEqual(ui.Rect.fromXYWH(13, 7, 96, 68), field.last_content_bounds);
+    try testing.expectEqual(ui.Rect.fromXYWH(13, 7, 96, 68), probe.last_paint_bounds);
+    try testing.expectEqual(text, probe.last_paint_style.color);
+    try testing.expectEqual(@as(f32, 42), probe.last_paint_style.line_height.?);
+    try testing.expectEqual(@as(f32, 96), probe.last_caret_max_width);
+    try testing.expectEqual(@as(f32, 42), probe.last_caret_style.line_height.?);
+
+    var coordinator = ui.runtime.Coordinator.init(testing.allocator);
+    try coordinator.bind();
+    defer coordinator.deinit() catch unreachable;
+    const component_id = handles.ComponentId.init(1, 1);
+    const window_id = handles.WindowId.init(1, 1);
+    const node_id = handles.NodeId.init(1, 1);
+    try coordinator.invalidations.register(component_id, window_id);
+    var text_input: TextInputProbe = .{};
+    var input_context: ui.input.Context = .{
+        .coordinator = &coordinator,
+        .component = component_id,
+        .window = window_id,
+        .current_layout_bounds = ui.Rect.fromXYWH(0, 0, 120, 80),
+        .native_text_input = text_input.bridge(),
+    };
+    var dispatch: ui.input.Dispatch = .{
+        .window = window_id,
+        .target = node_id,
+        .current = node_id,
+        .phase = .target,
+    };
+    const pointer_down: ui.input.Event = .{ .pointer_down = .{
+        .pointer_id = 17,
+        .position = .{ .x = 29, .y = 12 },
+        .button = .primary,
+        .click_count = 1,
+    } };
+    try field.event(&dispatch, &pointer_down, &input_context);
+    try testing.expectEqual(@as(usize, 2), field.selection.start);
+    try testing.expectEqual(@as(usize, 2), field.selection.end);
+    try testing.expectEqual(@as(f32, 16), probe.last_hit_point.x);
+    try testing.expectEqual(@as(f32, 96), probe.last_hit_max_width);
+    try testing.expectEqual(text, probe.last_hit_style.color);
+    try testing.expectEqual(@as(f32, 42), probe.last_hit_style.line_height.?);
+    try testing.expect(text_input.candidate_rect_calls != 0);
+    try testing.expectEqual(@as(f32, 29), text_input.candidate_rect.origin.x);
+    try testing.expectEqual(@as(f32, 7), text_input.candidate_rect.origin.y);
+
+    field.placeholder = "placeholder";
+    try field.setValue("");
+    try field.paint(&paint_context, ui.Rect.fromXYWH(0, 0, 120, 80));
+    try testing.expectEqual(placeholder, probe.last_paint_style.color);
+
+    field.disabled = true;
+    const disabled_spec = try field.build(&build_context);
+    try testing.expect(disabled_spec.semantics.disabled);
+    try testing.expectEqual(@as(usize, 0), disabled_spec.semantics.actions.len);
+    field.disabled = false;
+    field.focused = true;
+    const focused_spec = try field.build(&build_context);
+    try testing.expectEqual(ui.widgets.Theme.dark.focus_ring, focused_spec.style.paint.border.color);
+    try testing.expectEqual(configured_spec.semantics.actions.len, focused_spec.semantics.actions.len);
+}
+
 test "text field setValue preserves committed text across allocation failures" {
     try testing.checkAllAllocationFailures(testing.allocator, textFieldSetValueAllocationProbe, .{});
 }
@@ -1784,8 +4026,26 @@ test "disabled standard controls expose no invokable accessibility actions" {
     var callback_probe: usize = 0;
     const callback: ui.widgets.Callback = .{ .context = &callback_probe, .callback = noopWidgetCallback };
 
-    var button: ui.widgets.Button = .{ .label = "button", .on_activate = callback, .disabled = true };
+    const product_fonts: []const []const u8 = &.{ "Inter", "Avenir", "system-ui" };
+    const product_theme: ui.widgets.Theme = .{ .font_families = product_fonts };
+    var button: ui.widgets.Button = .{ .label = "button", .on_activate = callback, .theme = &product_theme };
+    const enabled_button_spec = try button.build(&context);
+    try testing.expect(enabled_button_spec.style.interaction.focusable);
+    try testing.expect(!enabled_button_spec.style.interaction.disabled);
+    try testing.expectEqual(@as(usize, 1), enabled_button_spec.semantics.actions.len);
+    try testing.expectEqual(ui.accessibility.Action.activate, enabled_button_spec.semantics.actions[0]);
+    try testing.expectEqualSlices([]const u8, product_fonts, enabled_button_spec.children[0].style.text.font_families);
+
+    button.focused = true;
+    const focused_button_spec = try button.build(&context);
+    try testing.expectEqual(button.theme.focus_ring, focused_button_spec.style.paint.border.color);
+    try testing.expectEqual(button.theme.focus_ring_width, focused_button_spec.style.paint.border.widths.top);
+
+    button.disabled = true;
     const button_spec = try button.build(&context);
+    try testing.expect(!button_spec.style.interaction.focusable);
+    try testing.expect(button_spec.style.interaction.disabled);
+    try testing.expect(button_spec.semantics.disabled);
     try testing.expectEqual(@as(usize, 0), button_spec.semantics.actions.len);
     try testing.expectEqual(ui.text.WrapMode.none, button_spec.children[0].style.text.wrap);
     try testing.expectEqual(@as(?u32, 1), button_spec.children[0].style.text.maximum_lines);
@@ -1825,6 +4085,30 @@ test "disabled standard controls expose no invokable accessibility actions" {
     const password_spec = try field.build(&context);
     try testing.expect(password_spec.semantics.selection == null);
     try testing.expectEqualStrings("", password_spec.semantics.value);
+}
+
+test "editable text fields advertise activation for native accessibility press" {
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    var context: ui.Component.BuildContext = undefined;
+    context.allocator = scratch.allocator();
+
+    var field = try ui.widgets.TextField.init(testing.allocator, "text");
+    defer field.deinit();
+
+    const editable = try field.build(&context);
+    try testing.expectEqual(@as(usize, 4), editable.semantics.actions.len);
+    try testing.expectEqual(ui.accessibility.Action.focus, editable.semantics.actions[0]);
+    try testing.expectEqual(ui.accessibility.Action.activate, editable.semantics.actions[1]);
+    try testing.expectEqual(ui.accessibility.Action.set_selection, editable.semantics.actions[2]);
+    try testing.expectEqual(ui.accessibility.Action.set_value, editable.semantics.actions[3]);
+
+    field.read_only = true;
+    const read_only = try field.build(&context);
+    try testing.expectEqual(@as(usize, 3), read_only.semantics.actions.len);
+    try testing.expectEqual(ui.accessibility.Action.focus, read_only.semantics.actions[0]);
+    try testing.expectEqual(ui.accessibility.Action.activate, read_only.semantics.actions[1]);
+    try testing.expectEqual(ui.accessibility.Action.set_selection, read_only.semantics.actions[2]);
 }
 
 test "text field keeps the caret visible and marks active IME text" {
@@ -2159,6 +4443,64 @@ test "render extension registry owns labels and bounds retired entries" {
     registry.collect(10);
     try testing.expectEqual(@as(usize, 1), probe.deinits);
     _ = try registry.register(probe.descriptor("second"));
+}
+
+test "renderer rejects backdrop scenes when the backend does not advertise support" {
+    var context: u8 = 0;
+    const renderer = UnsupportedBackdropRenderer.renderer(&context);
+
+    var scene = ui.scene.Scene.init(testing.allocator);
+    defer scene.deinit();
+    var builder = ui.scene.Builder.init(&scene, .{});
+    defer builder.deinit();
+    try builder.backdropEffect(.{
+        .bounds = ui.Rect.fromXYWH(0, 0, 4, 4),
+        .radii = .{},
+        .blur_radius = 0,
+        .saturation = 1,
+    });
+    try builder.finish();
+    try testing.expect(scene.view().requiresBackdropEffects());
+
+    try testing.expectError(error.Unsupported, renderer.renderOffscreen(.{
+        .width = 4,
+        .height = 4,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8,
+    }, scene.view(), testing.allocator));
+    try testing.expectError(error.Unsupported, renderer.submit(.{ .value = 1, .device_generation = 1 }, scene.view()));
+    renderer.deinit();
+}
+
+test "render extension depth requirements are validated and retained" {
+    var probe: RenderExtensionProbe = .{};
+    var registry = ui.render_extension.Registry.initWithLimit(testing.allocator, 2);
+    defer registry.deinit();
+
+    var descriptor = probe.descriptor("depth-aware extension");
+    descriptor.requirements.depth = .{ .clear_depth = 0.75 };
+    const id = try registry.register(descriptor);
+    const requirements = try registry.requirements(id);
+    try testing.expect(requirements.depth != null);
+    try testing.expectEqual(ui.render_extension.DepthFormat.depth32_float, requirements.depth.?.format);
+    try testing.expectEqual(@as(f32, 0.75), requirements.depth.?.clear_depth);
+
+    var invalid = probe.descriptor("invalid depth clear");
+    invalid.requirements.depth = .{ .clear_depth = std.math.nan(f32) };
+    try testing.expectError(error.InvalidConfiguration, registry.register(invalid));
+    invalid.requirements.depth = .{ .clear_depth = -0.01 };
+    try testing.expectError(error.InvalidConfiguration, registry.register(invalid));
+    invalid.requirements.depth = .{ .clear_depth = 1.01 };
+    try testing.expectError(error.InvalidConfiguration, registry.register(invalid));
+}
+
+test "null renderer rejects native depth extension requirements" {
+    var probe: RenderExtensionProbe = .{};
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    defer renderer.deinit();
+    var descriptor = probe.descriptor("depth requires a native backend");
+    descriptor.requirements.depth = .{};
+    try testing.expectError(error.Unsupported, renderer.registerExtension(descriptor));
 }
 
 test "null renderer executes custom passes with payload flags and device recovery" {
@@ -2523,6 +4865,102 @@ const RenderExtensionProbe = struct {
     }
 };
 
+const UnsupportedBackdropRenderer = struct {
+    fn renderer(context: *anyopaque) ui.render.Renderer {
+        return .{ .context = context, .vtable = &vtable };
+    }
+
+    const vtable: ui.render.Renderer.VTable = .{
+        .capabilities = capabilities,
+        .device_generation = deviceGeneration,
+        .begin_frame = beginFrame,
+        .submit = submit,
+        .render_offscreen = renderOffscreen,
+        .completed_epoch = completedEpoch,
+        .invalidate_surface = invalidateSurface,
+        .recover = recover,
+        .create_texture = createTexture,
+        .write_texture = writeTexture,
+        .destroy_texture = destroyTexture,
+        .import_external_surface = importExternalSurface,
+        .replace_external_surface = replaceExternalSurface,
+        .destroy_external_surface = destroyExternalSurface,
+        .register_extension = registerExtension,
+        .destroy_extension = destroyExtension,
+        .deinit = deinit,
+    };
+
+    fn capabilities(_: *anyopaque) ui.render.Capabilities {
+        return .{};
+    }
+    fn deviceGeneration(_: *anyopaque) ui.render.DeviceGeneration {
+        return 1;
+    }
+    fn beginFrame(_: *anyopaque, _: ui.render.FrameDescriptor) ui.Error!ui.render.FrameToken {
+        return error.Unsupported;
+    }
+    fn submit(_: *anyopaque, _: ui.render.FrameToken, _: ui.render.SceneView) ui.Error!ui.render.Submission {
+        return error.Unsupported;
+    }
+    fn renderOffscreen(
+        _: *anyopaque,
+        _: ui.render.OffscreenTarget,
+        _: ui.render.SceneView,
+        _: std.mem.Allocator,
+    ) ui.Error!?ui.render.Readback {
+        return error.Unsupported;
+    }
+    fn completedEpoch(_: *anyopaque) ui.render.SubmissionEpoch {
+        return 0;
+    }
+    fn invalidateSurface(_: *anyopaque, _: handles.WindowId) ui.Error!void {
+        return error.Unsupported;
+    }
+    fn recover(_: *anyopaque, _: ui.config.GpuPolicy) ui.Error!void {
+        return error.Unsupported;
+    }
+    fn createTexture(_: *anyopaque, _: handles.TextureId, _: ui.render.TextureDescriptor) ui.Error!void {
+        return error.Unsupported;
+    }
+    fn writeTexture(
+        _: *anyopaque,
+        _: handles.TextureId,
+        _: ui.render.TextureRegion,
+        _: []const u8,
+        _: usize,
+    ) ui.Error!void {
+        return error.Unsupported;
+    }
+    fn destroyTexture(_: *anyopaque, _: handles.TextureId, _: ui.render.SubmissionEpoch) ui.Error!void {
+        return error.Unsupported;
+    }
+    fn importExternalSurface(
+        _: *anyopaque,
+        _: handles.SurfaceId,
+        _: ui.render.ExternalSurfaceDescriptor,
+    ) ui.Error!void {
+        return error.Unsupported;
+    }
+    fn replaceExternalSurface(
+        _: *anyopaque,
+        _: handles.SurfaceId,
+        _: ui.render.ExternalSurfaceDescriptor,
+        _: ui.render.SubmissionEpoch,
+    ) ui.Error!void {
+        return error.Unsupported;
+    }
+    fn destroyExternalSurface(_: *anyopaque, _: handles.SurfaceId, _: ui.render.SubmissionEpoch) ui.Error!void {
+        return error.Unsupported;
+    }
+    fn registerExtension(_: *anyopaque, _: ui.render_extension.Descriptor) ui.Error!handles.RenderExtensionId {
+        return error.Unsupported;
+    }
+    fn destroyExtension(_: *anyopaque, _: handles.RenderExtensionId, _: ui.render.SubmissionEpoch) ui.Error!void {
+        return error.Unsupported;
+    }
+    fn deinit(_: *anyopaque) void {}
+};
+
 fn noopWidgetCallback(context: *anyopaque, _: *ui.input.Context) ui.Error!void {
     const count: *usize = @ptrCast(@alignCast(context));
     count.* += 1;
@@ -2544,6 +4982,15 @@ fn mutatingSelectionRects(
 
 const TextGeometryProbe = struct {
     underlines: usize = 0,
+    last_measure_style: ui.style.TextStyle = .{},
+    last_paint_style: ui.style.TextStyle = .{},
+    last_hit_style: ui.style.TextStyle = .{},
+    last_caret_style: ui.style.TextStyle = .{},
+    last_measure_max_width: f32 = 0,
+    last_paint_bounds: ui.Rect = .{},
+    last_hit_max_width: f32 = 0,
+    last_hit_point: ui.Point = .{},
+    last_caret_max_width: f32 = 0,
 
     fn services(self: *TextGeometryProbe) ui.custom.TextServices {
         return .{
@@ -2557,11 +5004,14 @@ const TextGeometryProbe = struct {
     }
 
     fn measure(
-        _: *anyopaque,
+        context: *anyopaque,
         value: []const u8,
         style: ui.style.TextStyle,
         constraints: ui.layout.Constraints,
     ) ui.Error!ui.Size {
+        const self: *TextGeometryProbe = @ptrCast(@alignCast(context));
+        self.last_measure_style = style;
+        self.last_measure_max_width = constraints.maximum.width;
         const natural_width = @as(f32, @floatFromInt(value.len)) * 8;
         const width = if (style.wrap == .none or !std.math.isFinite(constraints.maximum.width))
             natural_width
@@ -2574,27 +5024,44 @@ const TextGeometryProbe = struct {
         return constraints.constrain(.{ .width = width, .height = @as(f32, @floatFromInt(lines)) * 18 });
     }
 
-    fn paint(_: *anyopaque, _: *anyopaque, _: []const u8, _: ui.style.TextStyle, _: ui.Rect) ui.Error!void {}
+    fn paint(
+        context: *anyopaque,
+        _: *anyopaque,
+        _: []const u8,
+        style: ui.style.TextStyle,
+        bounds: ui.Rect,
+    ) ui.Error!void {
+        const self: *TextGeometryProbe = @ptrCast(@alignCast(context));
+        self.last_paint_style = style;
+        self.last_paint_bounds = bounds;
+    }
 
     fn hitTest(
-        _: *anyopaque,
+        context: *anyopaque,
         value: []const u8,
-        _: ui.style.TextStyle,
-        _: f32,
+        style: ui.style.TextStyle,
+        maximum_width: f32,
         point: ui.Point,
     ) ui.Error!ui.text.Hit {
+        const self: *TextGeometryProbe = @ptrCast(@alignCast(context));
+        self.last_hit_style = style;
+        self.last_hit_max_width = maximum_width;
+        self.last_hit_point = point;
         const offset: usize = @intFromFloat(@max(0, @round(point.x / 8)));
         return .{ .utf8_offset = @min(offset, value.len) };
     }
 
     fn caretRect(
-        _: *anyopaque,
+        context: *anyopaque,
         value: []const u8,
-        _: ui.style.TextStyle,
-        _: f32,
+        style: ui.style.TextStyle,
+        maximum_width: f32,
         utf8_offset: usize,
         _: ui.text.CaretAffinity,
     ) ui.Error!ui.Rect {
+        const self: *TextGeometryProbe = @ptrCast(@alignCast(context));
+        self.last_caret_style = style;
+        self.last_caret_max_width = maximum_width;
         return ui.Rect.fromXYWH(@as(f32, @floatFromInt(@min(utf8_offset, value.len))) * 8, 0, 1, 18);
     }
 
@@ -2674,6 +5141,12 @@ const ClipboardProbe = struct {
 const TextInputProbe = struct {
     active: bool = false,
     selection: ui.input.TextRange = .{ .start = 0, .end = 0 },
+    candidate_rect: ui.Rect = .{},
+    candidate_rect_calls: usize = 0,
+    surrounding_text: [64]u8 = undefined,
+    surrounding_text_length: usize = 0,
+    activation_observed_surrounding_text: bool = false,
+    activation_selection: ui.input.TextRange = .{},
 
     fn bridge(self: *TextInputProbe) ui.input.NativeTextInput {
         return .{
@@ -2688,17 +5161,32 @@ const TextInputProbe = struct {
     fn setActive(context: *anyopaque, _: handles.WindowId, active: bool) ui.Error!void {
         const self: *TextInputProbe = @ptrCast(@alignCast(context));
         self.active = active;
+        if (active) {
+            self.activation_observed_surrounding_text = std.mem.eql(
+                u8,
+                self.surrounding_text[0..self.surrounding_text_length],
+                "## Heading",
+            );
+            self.activation_selection = self.selection;
+        }
     }
 
-    fn setCandidateRect(_: *anyopaque, _: handles.WindowId, _: ui.Rect) ui.Error!void {}
+    fn setCandidateRect(context: *anyopaque, _: handles.WindowId, rect: ui.Rect) ui.Error!void {
+        const self: *TextInputProbe = @ptrCast(@alignCast(context));
+        self.candidate_rect = rect;
+        self.candidate_rect_calls += 1;
+    }
 
     fn setSurroundingText(
         context: *anyopaque,
         _: handles.WindowId,
-        _: []const u8,
+        text: []const u8,
         selection: ui.input.TextRange,
     ) ui.Error!void {
         const self: *TextInputProbe = @ptrCast(@alignCast(context));
+        if (text.len > self.surrounding_text.len) return error.BudgetExceeded;
+        @memcpy(self.surrounding_text[0..text.len], text);
+        self.surrounding_text_length = text.len;
         self.selection = selection;
     }
 };
@@ -2735,6 +5223,15 @@ fn emptyTextMeasure(
     _: ui.layout.Constraints,
 ) ui.Error!ui.layout_engine.TextMeasure {
     return .{ .size = .zero };
+}
+
+fn menuTextMeasure(
+    _: *anyopaque,
+    _: []const u8,
+    _: ui.style.TextStyle,
+    constraints: ui.layout.Constraints,
+) ui.Error!ui.layout_engine.TextMeasure {
+    return .{ .size = constraints.constrain(.{ .width = 160, .height = 36 }) };
 }
 
 fn wrappingTextMeasure(
@@ -2865,6 +5362,8 @@ const ApplicationServiceProbe = struct {
 const ClipboardPathProbe = struct {
     calls: usize = 0,
     path_count: usize = 0,
+    image_calls: usize = 0,
+    image_bytes: []const u8 = "",
 
     fn service(self: *ClipboardPathProbe) ui.platform.Clipboard {
         return .{
@@ -2872,6 +5371,7 @@ const ClipboardPathProbe = struct {
             .read_text_fn = readText,
             .write_text_fn = writeText,
             .write_paths_fn = writePaths,
+            .write_image_fn = writeImage,
             .maximum_bytes = 128,
             .maximum_paths = 4,
         };
@@ -2888,12 +5388,22 @@ const ClipboardPathProbe = struct {
         self.calls += 1;
         self.path_count = paths.len;
     }
+
+    fn writeImage(context: *anyopaque, image: ui.platform.ClipboardImage) ui.Error!void {
+        const self: *ClipboardPathProbe = @ptrCast(@alignCast(context));
+        self.image_calls += 1;
+        self.image_bytes = image.bytes;
+    }
 };
 
 const NativeMediaProbe = struct {
     calls: usize = 0,
     volume: f32 = 0.75,
     muted: bool = false,
+    status: ui.platform.NativeMediaStatus = .ready,
+    playing: bool = true,
+    has_presented_frame: bool = false,
+    error_description: ?ui.platform.NativeMediaErrorDescription = null,
 
     fn service(self: *NativeMediaProbe) ui.platform.NativeMedia {
         return .{
@@ -2943,7 +5453,16 @@ const NativeMediaProbe = struct {
     }
     fn state(context: *anyopaque, _: handles.NativeMediaId) ui.Error!ui.platform.NativeMediaState {
         const self = count(context);
-        return .{ .playing = true, .position_ns = 42, .duration_ns = 84, .volume = self.volume, .muted = self.muted };
+        return .{
+            .status = self.status,
+            .error_description = self.error_description,
+            .has_presented_frame = self.has_presented_frame,
+            .playing = self.playing,
+            .position_ns = 42,
+            .duration_ns = 84,
+            .volume = self.volume,
+            .muted = self.muted,
+        };
     }
     fn destroy(context: *anyopaque, _: handles.NativeMediaId) ui.Error!void {
         _ = count(context);
@@ -2953,6 +5472,7 @@ const NativeMediaProbe = struct {
 const PayloadCollector = struct {
     ime_owned: bool = false,
     path_owned: bool = false,
+    drop_text_owned: bool = false,
     accessibility_owned: bool = false,
 
     fn receive(context: *anyopaque, _: handles.WindowId, event: *const ui.platform.WindowEvent) void {
@@ -2965,6 +5485,7 @@ const PayloadCollector = struct {
                 },
                 .file_drop_performed => |drop| {
                     self.path_owned = drop.paths.len == 1 and std.mem.eql(u8, drop.paths[0], "/tmp/a");
+                    self.drop_text_owned = drop.text != null and std.mem.eql(u8, drop.text.?, "https://example.com");
                 },
                 else => {},
             },
@@ -3127,4 +5648,45 @@ fn svgManagerAllocationProbe(allocator: std.mem.Allocator) !void {
     ;
     const id = try manager.load(source);
     try manager.release(id);
+}
+
+fn sceneSnapshotAllocationProbe(allocator: std.mem.Allocator) !void {
+    const operation = ui.scene_abi.Operation{
+        .kind = @backingInt(ui.scene_abi.OperationKind.quads),
+        .start = 0,
+        .count = 1,
+        .clip = ui.scene.none_index,
+        .layer = ui.scene.none_index,
+        .material = ui.scene.none_index,
+        .target = 0,
+        .reserved = ui.scene.none_index,
+    };
+    const quad = ui.scene_abi.Quad{
+        .bounds = ui.Rect.fromXYWH(0, 0, 4, 4),
+        .background = ui.Color.rgba(1, 0, 0, 1),
+        .border_color = .transparent,
+        .border_widths = .{},
+        .radii = .{},
+    };
+    const source: ui.render.SceneView = .{
+        .operations = @as([]const ui.scene_abi.Operation, &.{operation}),
+        .materials = &.{},
+        .gradient_stops = &.{},
+        .clips = &.{},
+        .layers = &.{},
+        .shadows = &.{},
+        .quads = @as([]const ui.scene_abi.Quad, &.{quad}),
+        .paths = &.{},
+        .path_vertices = &.{},
+        .underlines = &.{},
+        .monochrome_sprites = &.{},
+        .color_sprites = &.{},
+        .external_surfaces = &.{},
+        .custom_passes = &.{},
+        .custom_payload = &.{},
+    };
+    var snapshot = try ui.render.SceneSnapshot.init(allocator, source);
+    defer snapshot.deinit();
+    try testing.expectEqual(source.operations.len, snapshot.view().operations.len);
+    try testing.expectEqual(source.quads.len, snapshot.view().quads.len);
 }

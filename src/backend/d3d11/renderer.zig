@@ -698,6 +698,7 @@ pub const Renderer = struct {
             const kind = std.enums.fromInt(scene_abi.OperationKind, operation.kind) orelse return error.InvalidScene;
             switch (kind) {
                 .push_clip, .pop_clip => continue,
+                .backdrop_effect => return error.Unsupported,
                 .push_layer => {
                     if (depth + 1 >= targets.len or operation.start >= view.layers.len) return error.InvalidScene;
                     depth += 1;
@@ -1225,6 +1226,7 @@ pub const Renderer = struct {
     }
 
     fn registerExtension(raw: *anyopaque, descriptor: extension.Descriptor) Error!handles.RenderExtensionId {
+        if (descriptor.requirements.depth != null) return error.Unsupported;
         const self = cast(raw);
         try self.collect(false);
         return self.extensions.register(descriptor);

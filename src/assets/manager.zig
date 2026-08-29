@@ -20,6 +20,11 @@ const AnimatedEntry = struct {
     references: usize = 1,
 };
 
+pub const AnimationStatus = struct {
+    state: animation.State,
+    failure: ?Error = null,
+};
+
 const ImageKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
 pub const Manager = struct {
@@ -119,6 +124,11 @@ pub const Manager = struct {
     pub fn animationFrame(self: *const Manager, id: handles.AnimationId) ?animation.Frame {
         const entry = self.animations.getConst(id) orelse return null;
         return entry.player.frame();
+    }
+
+    pub fn animationStatus(self: *const Manager, id: handles.AnimationId) ?AnimationStatus {
+        const entry = self.animations.getConst(id) orelse return null;
+        return .{ .state = entry.player.state, .failure = entry.player.failure };
     }
 
     pub fn playAnimation(self: *Manager, id: handles.AnimationId, now_ns: u64) Error!void {

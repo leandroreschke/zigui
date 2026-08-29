@@ -48,6 +48,10 @@ rotating horizontal output.
   lossless JPEG processes are rejected.
 - GIF87a/GIF89a: palettes, transparency, interlacing, LZW, frame delays,
   disposal methods, loop metadata, and incremental animation composition.
+- WebP: on macOS builds, bounded ImageIO-backed VP8/VP8L/VP8X still images and
+  ANIM/ANMF animations are exposed as owned RGBA8 frames with validated canvas
+  dimensions, frame delays, and loop counts. Other targets return
+  `error.Unsupported` until a native or in-tree WebP provider is selected.
 - BMP: uncompressed 24-bit and uncompressed/bitfield 32-bit DIB images,
   top-down rows, alpha masks, and supported embedded matrix/TRC color profiles.
 - QOI: RGB and RGBA streams in sRGB or linear color space.

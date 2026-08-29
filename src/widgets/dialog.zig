@@ -7,6 +7,7 @@ const input = @import("../input/event.zig");
 const a11y = @import("../a11y/api.zig");
 const Callback = @import("callback.zig").Callback;
 const Theme = @import("theme.zig").Theme;
+const ScrollView = @import("scroll_view.zig").ScrollView;
 
 pub const Dialog = struct {
     open: *bool,
@@ -20,6 +21,7 @@ pub const Dialog = struct {
     dismiss_on_backdrop: bool = true,
     backdrop: HandlerTarget = .{ .kind = .backdrop },
     panel: HandlerTarget = .{ .kind = .panel },
+    scroll_view: ScrollView = .{ .content = .{} },
 
     const HandlerTarget = struct {
         owner: *Dialog = undefined,
@@ -38,17 +40,35 @@ pub const Dialog = struct {
         }
         self.backdrop.owner = self;
         self.panel.owner = self;
-        const backdrop_handlers = try ctx.allocator.dupe(input.Handler, &.{.{ .context = &self.backdrop, .callback = handle }});
-        const panel_handlers = try ctx.allocator.dupe(input.Handler, &.{.{ .context = &self.panel, .callback = handle }});
-        const panel_actions = try ctx.allocator.dupe(a11y.Action, &.{.focus});
         const panel_children = try ctx.allocator.alloc(node.Spec, 2 + @as(usize, @intFromBool(self.footer != null)));
         panel_children[0] = .{
             .kind = .{ .text = self.title },
-            .style = .{ .text = .{ .font_size = self.theme.font_size + 4, .font_weight = .semibold, .color = self.theme.text } },
+            .style = .{ .text = .{ .font_families = self.theme.font_families, .font_size = self.theme.font_size + 4, .font_weight = .semibold, .color = self.theme.text } },
             .semantics = .{ .role = .heading, .label = self.title },
         };
         panel_children[1] = self.content;
         if (self.footer) |footer| panel_children[2] = footer;
+        self.scroll_view.content = .{
+            .kind = .container,
+            .style = .{ .layout = .{
+                .width = .{ .percent = 1 },
+                .direction = .column,
+                .gap = .{ .height = self.theme.spacing * 2 },
+            } },
+            .children = panel_children,
+        };
+        self.scroll_view.style = .{ .layout = .{
+            .width = .{ .percent = 1 },
+            .height = .{ .percent = 1 },
+            .min_height = .{ .points = 0 },
+            .flex_grow = 1,
+            .flex_shrink = 1,
+        } };
+        const backdrop_handlers = try ctx.allocator.dupe(input.Handler, &.{.{ .context = &self.backdrop, .callback = handle }});
+        const panel_handlers = try ctx.allocator.dupe(input.Handler, &.{.{ .context = &self.panel, .callback = handle }});
+        const panel_actions = try ctx.allocator.dupe(a11y.Action, &.{.focus});
+        const scroll_spec = try self.scroll_view.build(ctx);
+        const panel_scroll_children = try ctx.allocator.dupe(node.Spec, &.{scroll_spec});
         const overlay_children = try ctx.allocator.alloc(node.Spec, 2);
         overlay_children[0] = .{
             .kind = .container,
@@ -67,9 +87,8 @@ pub const Dialog = struct {
                     .max_width = .{ .percent = 0.92 },
                     .max_height = .{ .percent = 0.9 },
                     .direction = .column,
-                    .gap = .{ .height = self.theme.spacing * 2 },
                     .padding = .{ .left = .{ .points = 20 }, .right = .{ .points = 20 }, .top = .{ .points = 18 }, .bottom = .{ .points = 18 } },
-                    .overflow_y = .scroll,
+                    .overflow_y = .hidden,
                 },
                 .paint = .{
                     .background = .{ .solid = self.theme.surface },
@@ -81,7 +100,7 @@ pub const Dialog = struct {
             },
             .handlers = panel_handlers,
             .semantics = .{ .role = .dialog, .label = self.title, .actions = panel_actions },
-            .children = panel_children,
+            .children = panel_scroll_children,
         };
         return .{
             .kind = .container,

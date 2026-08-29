@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Error = @import("../core/error.zig").Error;
 const handles = @import("../core/handle.zig");
 const api = @import("api.zig");
@@ -576,14 +577,62 @@ pub const Backend = struct {
             const catalog = &self.catalog.items[catalog_index];
             if (isLastResortFamily(catalog.family)) continue;
             if (!coverageMayContainAll(&catalog.coverage, scalars)) continue;
-            const id = self.loadCatalog(catalog_index, descriptor) catch |err| switch (err) {
+            const id = self.loadCatalogForFallback(catalog_index, descriptor, scalars) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => continue,
-            };
-            if (id.eql(primary)) continue;
-            if (try self.fontCovers(id, scalars)) return id;
+            } orelse continue;
+            if (!id.eql(primary)) return id;
         }
         return primary;
+    }
+
+    /// Probe a catalog face against the exact scalar cluster before retaining
+    /// its mapped source. The coarse catalog coverage bitmap is intentionally
+    /// conservative and can produce many false positives for symbol blocks;
+    /// retaining every rejected probe would exhaust the mapped-font budget
+    /// while resolving one missing glyph.
+    fn loadCatalogForFallback(
+        self: *Backend,
+        index: usize,
+        descriptor: api.FontDescriptor,
+        scalars: []const ScalarRecord,
+    ) Error!?handles.FontId {
+        if (index >= self.catalog.items.len) return error.InvalidHandle;
+        const catalog = &self.catalog.items[index];
+        if (catalog.face) |face| {
+            if (!try covers(face.font, scalars)) return null;
+            const id = try self.instanceForFace(face, descriptor);
+            if (!catalog.loaded.isValid()) catalog.loaded = id;
+            return id;
+        }
+
+        const maximum_bytes = switch (catalog.loader.storage) {
+            .resident => self.maximum_font_bytes -| self.loaded_font_bytes,
+            .mapped => self.maximum_mapped_font_bytes -| self.mapped_font_bytes,
+        };
+        var source = catalog.loader.load(self.allocator, catalog.path, maximum_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        var source_transferred = false;
+        defer if (!source_transferred) source.deinit(self.allocator);
+
+        const candidate = opentype.Font.init(source.bytes, catalog.face_index) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        if (!try covers(candidate, scalars)) return null;
+
+        // addSource owns and cleans up the source on its own error path. Mark
+        // the value transferred before the call so our defer cannot double
+        // release a loader-owned mapping if allocation fails there.
+        source_transferred = true;
+        const face = try self.addSource(source, catalog.face_index);
+        errdefer self.rollbackLastFace(face);
+        const id = try self.instanceForFace(face, descriptor);
+        catalog.face = face;
+        if (!catalog.loaded.isValid()) catalog.loaded = id;
+        return id;
     }
 
     fn fontCovers(self: *Backend, id: handles.FontId, scalars: []const ScalarRecord) Error!bool {
@@ -848,4 +897,53 @@ fn resolveDirection(bytes: []const u8, requested: api.TextDirection) Error!api.T
         else => {},
     };
     return .left_to_right;
+}
+
+fn loadTestResidentFont(_: ?*anyopaque, allocator: std.mem.Allocator, path: []const u8, maximum_bytes: usize) Error!FontSource {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.TextUnavailable;
+    defer file.close(io);
+    const metadata = file.stat(io) catch return error.TextUnavailable;
+    const size = std.math.cast(usize, metadata.size) orelse return error.BudgetExceeded;
+    if (size == 0 or size > maximum_bytes) return error.BudgetExceeded;
+    const bytes = allocator.alloc(u8, size) catch return error.OutOfMemory;
+    errdefer allocator.free(bytes);
+    const read = file.readPositionalAll(io, bytes, 0) catch return error.TextUnavailable;
+    if (read != bytes.len) return error.TextUnavailable;
+    return FontSource.resident(bytes);
+}
+
+test "fallback probes release nonmatching catalog faces before retaining them" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var backend = try Backend.createInstance(testing.allocator, 16 * 1024 * 1024, 16 * 1024 * 1024, 64, 8, 4096);
+    defer {
+        backend.destroy();
+        testing.allocator.destroy(backend);
+    }
+
+    const path = "/System/Library/Fonts/Avenir.ttc";
+    const catalog_index = try backend.addCatalogFile(
+        path,
+        0,
+        "Test Font",
+        .regular,
+        .normal,
+        100,
+        .{},
+        .{},
+        .{ .storage = .resident, .load_fn = loadTestResidentFont },
+    );
+    var scalars = [_]ScalarRecord{.{
+        .scalar = 0x10ffff,
+        .cluster_utf8 = 0,
+        .font = .invalid,
+        .script = .common,
+    }};
+    const descriptor: api.FontDescriptor = .{ .families = &.{}, .weight = .regular, .style = .normal, .stretch = 100 };
+    try testing.expect((try backend.loadCatalogForFallback(catalog_index, descriptor, &scalars)) == null);
+    try testing.expectEqual(@as(usize, 0), backend.loaded_font_bytes);
+    try testing.expectEqual(@as(usize, 0), backend.faces.items.len);
+    try testing.expect(backend.catalog.items[catalog_index].face == null);
 }

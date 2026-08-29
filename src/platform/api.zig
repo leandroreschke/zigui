@@ -3,6 +3,7 @@ const a11y = @import("../a11y/api.zig");
 const clock = @import("../core/clock.zig");
 const Error = @import("../core/error.zig").Error;
 const geometry = @import("../core/geometry.zig");
+const appearance = @import("../core/appearance.zig");
 const handles = @import("../core/handle.zig");
 const native_media_placement = @import("../core/native_media.zig");
 const input = @import("../input/event.zig");
@@ -14,6 +15,145 @@ pub const NativeHandle = struct {
     value: usize,
 
     pub const Kind = enum { none, appkit, win32, wayland, x11, headless };
+};
+
+pub const WindowSnapshotFormat = enum { png_srgb8 };
+
+/// An owned snapshot of a native window. The bytes are a PNG whose pixels
+/// have been converted to 8-bit sRGB by the platform provider. The provider
+/// owns the bytes through `allocator`; callers must release them with
+/// `deinit` after loading or retaining the snapshot.
+pub const OwnedWindowSnapshot = struct {
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    format: WindowSnapshotFormat,
+    width: u32,
+    height: u32,
+    scale_factor: geometry.ScaleFactor,
+
+    pub fn deinit(self: *OwnedWindowSnapshot) void {
+        self.allocator.free(@constCast(self.bytes));
+        self.* = undefined;
+    }
+};
+
+/// Opaque identity for one asynchronous LinkPresentation page-capture
+/// request.  The native provider and any App registry retain their own
+/// operation state; consumers never receive Foundation or AppKit objects.
+pub const PageCaptureRequestId = handles.PageCaptureRequestId;
+
+pub const PageCaptureOptions = struct {
+    /// Only HTTP and HTTPS URLs are accepted.  The provider owns all URL
+    /// parsing and networking after this bounded UTF-8 value is copied.
+    url: []const u8,
+    /// Logical points requested from the native LinkPresentation renderer.
+    /// The returned PNG dimensions are provider-reported pixel dimensions.
+    size: geometry.Size = .{ .width = 1280, .height = 800 },
+    /// Monotonic timeout requested from the provider, in nanoseconds.
+    timeout_ns: u64 = 12 * std.time.ns_per_s,
+};
+
+pub const PageCaptureTerminalStatus = enum {
+    completed,
+    failed,
+    canceled,
+};
+
+/// Allocator-owned PNG produced by a page-capture provider.  `bytes` remains
+/// valid until `deinit`; it is never backed by an Objective-C object.
+pub const OwnedPageCapture = struct {
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    width: u32,
+    height: u32,
+
+    pub fn deinit(self: *OwnedPageCapture) void {
+        self.allocator.free(@constCast(self.bytes));
+        self.* = undefined;
+    }
+};
+
+pub const PageCaptureCompletion = struct {
+    allocator: std.mem.Allocator,
+    request: PageCaptureRequestId,
+    status: PageCaptureTerminalStatus,
+    result: ?OwnedPageCapture = null,
+    error_description: ?[]const u8 = null,
+
+    pub fn deinit(self: *PageCaptureCompletion) void {
+        if (self.result) |*result| result.deinit();
+        if (self.error_description) |description| self.allocator.free(@constCast(description));
+        self.* = undefined;
+    }
+};
+
+pub const PageCapturePoll = union(enum) {
+    pending,
+    terminal: PageCaptureCompletion,
+};
+
+pub const PageCaptureLimits = struct {
+    maximum_requests: usize = 32,
+    maximum_url_bytes: usize = 16 * 1024 * 1024,
+    maximum_result_bytes: usize = 64 * 1024 * 1024,
+    maximum_pixels: usize = 16 * 1024 * 1024,
+    maximum_dimension: f64 = 16_384,
+    maximum_timeout_ns: u64 = 60 * std.time.ns_per_s,
+};
+
+/// Native LinkPresentation-backed page capture.  This is intentionally a
+/// small opaque async service rather than a UI element or a filesystem API:
+/// applications receive an owned PNG and decide how/where to persist it.
+pub const PageCapture = struct {
+    context: *anyopaque,
+    begin_fn: *const fn (*anyopaque, PageCaptureOptions) Error!PageCaptureRequestId,
+    poll_fn: *const fn (*anyopaque, PageCaptureRequestId, std.mem.Allocator) Error!PageCapturePoll,
+    cancel_fn: *const fn (*anyopaque, PageCaptureRequestId) Error!void,
+    release_fn: *const fn (*anyopaque, PageCaptureRequestId) Error!void,
+    limits: PageCaptureLimits = .{},
+
+    pub fn begin(self: PageCapture, options: PageCaptureOptions) Error!PageCaptureRequestId {
+        try validatePageCaptureOptions(options, self.limits);
+        const request = try self.begin_fn(self.context, options);
+        if (!request.isValid()) return error.PlatformFailure;
+        return request;
+    }
+
+    pub fn poll(
+        self: PageCapture,
+        request: PageCaptureRequestId,
+        allocator: std.mem.Allocator,
+    ) Error!PageCapturePoll {
+        if (!request.isValid()) return error.InvalidHandle;
+        var result = try self.poll_fn(self.context, request, allocator);
+        switch (result) {
+            .pending => {},
+            .terminal => |*completion| {
+                if (!completion.request.eql(request)) {
+                    completion.deinit();
+                    return error.PlatformFailure;
+                }
+                validatePageCaptureCompletion(completion.*, self.limits) catch |err| {
+                    completion.deinit();
+                    return err;
+                };
+            },
+        }
+        return result;
+    }
+
+    pub fn cancel(self: PageCapture, request: PageCaptureRequestId) Error!void {
+        if (!request.isValid()) return error.InvalidHandle;
+        try self.cancel_fn(self.context, request);
+    }
+
+    /// Releases a terminal request after its one-shot terminal poll has been
+    /// consumed.  Providers may keep callback/native barriers until this
+    /// point, but no native object is exposed to the caller.
+    pub fn release(self: PageCapture, request: PageCaptureRequestId) Error!void {
+        if (!request.isValid()) return error.InvalidHandle;
+        try self.release_fn(self.context, request);
+    }
 };
 
 pub const WindowState = render.SurfaceState;
@@ -51,6 +191,10 @@ pub const WindowEvent = union(enum) {
     moved: geometry.Point,
     resized: geometry.Size,
     scale_changed: geometry.ScaleFactor,
+    /// The platform's resolved window mode after a native transition. Native
+    /// menu commands and system shortcuts publish this just like
+    /// programmatic mode commands.
+    mode_changed: WindowMode,
     focused: bool,
     occluded: bool,
     appearance_changed: Appearance,
@@ -64,7 +208,9 @@ pub const WindowEvent = union(enum) {
     device_lost,
 };
 
-pub const Appearance = enum { system, light, dark, high_contrast_light, high_contrast_dark };
+/// Compatibility export. The contract is owned by the platform-neutral core
+/// module so consumers do not need to depend on platform APIs for appearance.
+pub const Appearance = appearance.Appearance;
 
 pub const Cursor = enum {
     default,
@@ -103,6 +249,7 @@ pub const EventLoop = struct {
     run_fn: *const fn (*anyopaque, EventSink) Error!void,
     step_fn: *const fn (*anyopaque, EventSink, bool) Error!bool,
     wake_fn: *const fn (*anyopaque) void,
+    schedule_wake_fn: *const fn (*anyopaque, clock.Timestamp) Error!void = unsupportedScheduledWake,
     request_quit_fn: *const fn (*anyopaque) void,
     clock: clock.Clock,
 
@@ -118,10 +265,18 @@ pub const EventLoop = struct {
         self.wake_fn(self.context);
     }
 
+    pub fn scheduleWake(self: EventLoop, deadline_ns: clock.Timestamp) Error!void {
+        try self.schedule_wake_fn(self.context, deadline_ns);
+    }
+
     pub fn requestQuit(self: EventLoop) void {
         self.request_quit_fn(self.context);
     }
 };
+
+fn unsupportedScheduledWake(_: *anyopaque, _: clock.Timestamp) Error!void {
+    return error.MissingCapability;
+}
 
 pub const WindowSystem = struct {
     context: *anyopaque,
@@ -133,7 +288,12 @@ pub const WindowSystem = struct {
     set_cursor_fn: *const fn (*anyopaque, handles.WindowId, Cursor) Error!void,
     command_fn: *const fn (*anyopaque, handles.WindowId, WindowCommand) Error!void,
     native_handle_fn: *const fn (*anyopaque, handles.WindowId) ?NativeHandle,
+    /// Optional native whole-window capture. Providers must return an owned
+    /// 8-bit sRGB PNG snapshot, or `MissingCapability` when unavailable.
+    capture_window_fn: ?*const fn (*anyopaque, handles.WindowId, geometry.Size, std.mem.Allocator) Error!OwnedWindowSnapshot = null,
     maximum_text_bytes: usize = 16 * 1024 * 1024,
+    maximum_snapshot_pixels: usize = 64 * 1024 * 1024,
+    maximum_snapshot_bytes: usize = 256 * 1024 * 1024,
 
     pub fn create(self: WindowSystem, id: handles.WindowId, options: WindowOptions) Error!NativeHandle {
         if (!id.isValid()) return error.InvalidHandle;
@@ -188,6 +348,37 @@ pub const WindowSystem = struct {
         if (native.kind == .none or native.value == 0) return null;
         return native;
     }
+
+    /// Captures the native window at the requested logical aspect ratio. This
+    /// is a synchronous, UI-thread operation; App exposes the mutation-phase
+    /// guarded entry point for application code.
+    pub fn captureWindow(
+        self: WindowSystem,
+        id: handles.WindowId,
+        target: geometry.Size,
+        allocator: std.mem.Allocator,
+    ) Error!OwnedWindowSnapshot {
+        if (!id.isValid()) return error.InvalidHandle;
+        if (!finitePositiveSize(target)) return error.InvalidConfiguration;
+        if (self.maximum_snapshot_pixels == 0 or self.maximum_snapshot_bytes == 0)
+            return error.InvalidConfiguration;
+        const target_pixels = target.width * target.height;
+        if (!std.math.isFinite(target_pixels) or target_pixels > @as(f64, @floatFromInt(self.maximum_snapshot_pixels)))
+            return error.BudgetExceeded;
+        const callback = self.capture_window_fn orelse return error.MissingCapability;
+        var result = try callback(self.context, id, target, allocator);
+        errdefer result.deinit();
+        if (result.format != .png_srgb8 or result.bytes.len == 0 or result.width == 0 or result.height == 0)
+            return error.InvalidImage;
+        const pixels = std.math.mul(usize, result.width, result.height) catch return error.BudgetExceeded;
+        if (pixels > self.maximum_snapshot_pixels or result.bytes.len > self.maximum_snapshot_bytes)
+            return error.BudgetExceeded;
+        if (!std.math.isFinite(result.scale_factor.value) or result.scale_factor.value <= 0)
+            return error.InvalidScaleFactor;
+        if (result.bytes.len < 8 or !std.mem.eql(u8, result.bytes[0..8], "\x89PNG\r\n\x1a\n"))
+            return error.InvalidImage;
+        return result;
+    }
 };
 
 pub const Display = struct {
@@ -237,6 +428,7 @@ pub const Clipboard = struct {
     write_text_fn: *const fn (*anyopaque, []const u8) Error!void,
     read_contents_fn: ?*const fn (*anyopaque, std.mem.Allocator) Error!ClipboardContents = null,
     write_paths_fn: ?*const fn (*anyopaque, []const []const u8) Error!void = null,
+    write_image_fn: ?*const fn (*anyopaque, ClipboardImage) Error!void = null,
     maximum_bytes: usize = 64 * 1024 * 1024,
     maximum_paths: usize = 4_096,
 
@@ -284,6 +476,13 @@ pub const Clipboard = struct {
         try callback(self.context, paths);
     }
 
+    pub fn writeImage(self: Clipboard, image: ClipboardImage) Error!void {
+        if (image.format != .png or image.bytes.len == 0) return error.InvalidConfiguration;
+        if (image.bytes.len > self.maximum_bytes) return error.BudgetExceeded;
+        const callback = self.write_image_fn orelse return error.MissingCapability;
+        try callback(self.context, image);
+    }
+
     pub fn bridge(self: Clipboard) input.NativeClipboard {
         return .{
             .context = self.context,
@@ -301,6 +500,156 @@ pub const ClipboardImage = struct {
     bytes: []const u8,
 };
 
+/// Opaque identity for a native file-promise receive snapshot. The provider
+/// retains the native receivers behind this handle; applications only see
+/// bounded, owned descriptors and paths.
+pub const PromisedFileBatchId = handles.PromisedFileBatchId;
+pub const PromisedFileOperationId = handles.PromisedFileOperationId;
+
+pub const PromisedFileDescriptor = struct {
+    /// Provider-supplied display name. This is metadata, not a filesystem
+    /// path, and is always UTF-8 owned by `OwnedPromisedFileDescriptors`.
+    suggested_name: []const u8,
+    /// Provider-supplied UTI/MIME-like type identifier. Empty means unknown.
+    content_type: []const u8 = "",
+};
+
+pub const OwnedPromisedFileDescriptors = struct {
+    allocator: std.mem.Allocator,
+    batch: PromisedFileBatchId,
+    values: []PromisedFileDescriptor,
+
+    pub fn deinit(self: *OwnedPromisedFileDescriptors) void {
+        for (self.values) |descriptor| {
+            self.allocator.free(@constCast(descriptor.suggested_name));
+            if (descriptor.content_type.len != 0) self.allocator.free(@constCast(descriptor.content_type));
+        }
+        self.allocator.free(self.values);
+        self.* = undefined;
+    }
+};
+
+pub const PromisedFileTerminalStatus = enum {
+    completed,
+    partial,
+    failed,
+    canceled,
+};
+
+pub const PromisedFileOutput = struct {
+    descriptor_index: usize,
+    /// A materialized local path, owned by the completion value, or null when
+    /// the provider reported an error for this descriptor.
+    path: ?[]const u8 = null,
+    /// A bounded provider error for this descriptor. It is optional even for
+    /// failed output because some native providers expose no localized detail.
+    error_description: ?[]const u8 = null,
+};
+
+pub const PromisedFileCompletion = struct {
+    allocator: std.mem.Allocator,
+    operation: PromisedFileOperationId,
+    status: PromisedFileTerminalStatus,
+    outputs: []PromisedFileOutput,
+    error_description: ?[]const u8 = null,
+
+    pub fn deinit(self: *PromisedFileCompletion) void {
+        for (self.outputs) |output| {
+            if (output.path) |path| self.allocator.free(@constCast(path));
+            if (output.error_description) |description| self.allocator.free(@constCast(description));
+        }
+        self.allocator.free(self.outputs);
+        if (self.error_description) |description| self.allocator.free(@constCast(description));
+        self.* = undefined;
+    }
+};
+
+pub const PromisedFilePoll = union(enum) {
+    pending,
+    terminal: PromisedFileCompletion,
+};
+
+pub const PromisedFileLimits = struct {
+    maximum_batches: usize = 1_024,
+    maximum_operations: usize = 1_024,
+    maximum_files: usize = 4_096,
+    /// Aggregate bytes for descriptor metadata, destination paths, and
+    /// provider callback results retained by one service.
+    maximum_bytes: usize = 16 * 1024 * 1024,
+};
+
+/// Native file-promise materialization. The public contract intentionally
+/// contains no AppKit, Foundation, or platform receiver types. A batch is
+/// produced by a native clipboard/drag provider, described here, and can be
+/// received exactly once into one shared destination directory.
+pub const PromisedFiles = struct {
+    context: *anyopaque,
+    describe_batch_fn: *const fn (*anyopaque, PromisedFileBatchId, std.mem.Allocator) Error!OwnedPromisedFileDescriptors,
+    begin_fn: *const fn (*anyopaque, PromisedFileBatchId, []const u8) Error!PromisedFileOperationId,
+    poll_fn: *const fn (*anyopaque, PromisedFileOperationId, std.mem.Allocator) Error!PromisedFilePoll,
+    cancel_fn: *const fn (*anyopaque, PromisedFileOperationId) Error!void,
+    release_batch_fn: *const fn (*anyopaque, PromisedFileBatchId) Error!void,
+    release_operation_fn: *const fn (*anyopaque, PromisedFileOperationId) Error!void,
+    limits: PromisedFileLimits = .{},
+
+    pub fn describe(self: PromisedFiles, batch: PromisedFileBatchId, allocator: std.mem.Allocator) Error!OwnedPromisedFileDescriptors {
+        if (!batch.isValid()) return error.InvalidHandle;
+        var result = try self.describe_batch_fn(self.context, batch, allocator);
+        validatePromisedDescriptors(result, self.limits) catch |err| {
+            result.deinit();
+            return err;
+        };
+        return result;
+    }
+
+    pub fn begin(self: PromisedFiles, batch: PromisedFileBatchId, destination: []const u8) Error!PromisedFileOperationId {
+        if (!batch.isValid()) return error.InvalidHandle;
+        try validateServiceText(destination, self.limits.maximum_bytes);
+        const operation = try self.begin_fn(self.context, batch, destination);
+        if (!operation.isValid()) return error.PlatformFailure;
+        return operation;
+    }
+
+    pub fn poll(self: PromisedFiles, operation: PromisedFileOperationId, allocator: std.mem.Allocator) Error!PromisedFilePoll {
+        if (!operation.isValid()) return error.InvalidHandle;
+        var result = try self.poll_fn(self.context, operation, allocator);
+        switch (result) {
+            .pending => {},
+            .terminal => |*completion| {
+                if (!completion.operation.eql(operation)) {
+                    completion.deinit();
+                    return error.PlatformFailure;
+                }
+                validatePromisedCompletion(completion.*, self.limits) catch |err| {
+                    completion.deinit();
+                    return err;
+                };
+            },
+        }
+        return result;
+    }
+
+    pub fn cancel(self: PromisedFiles, operation: PromisedFileOperationId) Error!void {
+        if (!operation.isValid()) return error.InvalidHandle;
+        try self.cancel_fn(self.context, operation);
+    }
+
+    /// Releases the caller's reference to a batch. A batch may be released
+    /// immediately after `begin`; the provider keeps an internal operation
+    /// reference until all callbacks and shared-destination cleanup finish.
+    pub fn releaseBatch(self: PromisedFiles, batch: PromisedFileBatchId) Error!void {
+        if (!batch.isValid()) return error.InvalidHandle;
+        try self.release_batch_fn(self.context, batch);
+    }
+
+    /// Releases a terminal operation after its completion value has been
+    /// consumed. Providers may retain callback barriers until this call.
+    pub fn releaseOperation(self: PromisedFiles, operation: PromisedFileOperationId) Error!void {
+        if (!operation.isValid()) return error.InvalidHandle;
+        try self.release_operation_fn(self.context, operation);
+    }
+};
+
 /// One allocator-owned native clipboard snapshot. File URLs are exposed as
 /// filesystem paths rather than URL strings. Image bytes are encoded PNG so
 /// consumers can pass them directly to ZigUI's image capability.
@@ -310,6 +659,16 @@ pub const ClipboardContents = struct {
     paths: []const []const u8 = &.{},
     image: ?ClipboardImage = null,
     contains_promised_files: bool = false,
+    /// Number of native promised-file entries in this snapshot. When a
+    /// provider can retain them, `promised_batch` is non-null and owns the
+    /// corresponding receive snapshot; otherwise this remains detection-only.
+    promised_file_count: usize = 0,
+    /// When non-null, the provider retained the native receivers and exposes
+    /// them through `Bundle.promised_files`. Call `releaseBatch` when the
+    /// application no longer needs the batch, even if it is not received.
+    /// Mixed clipboard representations have stable consumer ordering:
+    /// `paths`, `promised_batch`, `image`, then `text`.
+    promised_batch: ?PromisedFileBatchId = null,
 
     pub fn deinit(self: *ClipboardContents) void {
         if (self.text) |value| self.allocator.free(@constCast(value));
@@ -328,9 +687,53 @@ pub const MenuInvocation = struct {
     payload: u64 = 0,
 };
 
+/// Platform-neutral keyboard equivalent displayed by native application
+/// menus. Dispatch still follows the registered action; this only describes
+/// the native menu accelerator and must match the binding installed by the
+/// application.
+pub const MenuShortcut = struct {
+    key: input.Key,
+    modifiers: input.Modifiers = .{},
+};
+
+/// Native responder/application actions that do not belong to an
+/// application-owned action registry. These preserve platform menu behavior
+/// such as Services, the standard Edit responder chain, and window commands.
+pub const SystemMenuAction = enum {
+    about_application,
+    services,
+    hide_application,
+    hide_other_applications,
+    show_all_applications,
+    quit_application,
+    close_window,
+    minimize_window,
+    zoom_window,
+    enter_fullscreen,
+    bring_all_to_front,
+    undo,
+    redo,
+    cut,
+    copy,
+    paste,
+    select_all,
+};
+
 pub const MenuItem = union(enum) {
-    action: struct { label: []const u8, action: handles.ActionId, payload: u64 = 0, enabled: bool = true, checked: bool = false },
+    action: struct {
+        label: []const u8,
+        action: handles.ActionId,
+        payload: u64 = 0,
+        enabled: bool = true,
+        checked: bool = false,
+        shortcut: ?MenuShortcut = null,
+    },
     submenu: struct { label: []const u8, items: []const MenuItem },
+    /// Items in this group are installed in the platform application menu.
+    /// Platforms without a distinct application menu may render them as an
+    /// ordinary top-level submenu.
+    application: struct { items: []const MenuItem },
+    system_action: struct { label: []const u8, action: SystemMenuAction },
     separator,
 };
 
@@ -436,7 +839,28 @@ pub const NativeMediaOptions = struct {
     muted: bool = false,
 };
 
+pub const NativeMediaStatus = enum {
+    loading,
+    ready,
+    failed,
+};
+
+/// Bounded inline-owned text associated with a failed native media state.
+/// The alias keeps the platform-facing API discoverable while the storage and
+/// validation contract remains platform-neutral in core/native_media.zig.
+pub const NativeMediaErrorDescription = native_media_placement.ErrorDescription;
+
 pub const NativeMediaState = struct {
+    status: NativeMediaStatus = .loading,
+    /// True after the native player has presented at least one decoded video
+    /// frame. This is independent of `playing`: a paused or seeking player
+    /// may still own the current frame and should not fall back to an import
+    /// thumbnail merely because its rate is zero.
+    has_presented_frame: bool = false,
+    /// Present when a provider can expose a safe localized failure detail.
+    /// This is a value copy; callers do not retain platform objects or an
+    /// allocator and may read it until this state snapshot is discarded.
+    error_description: ?NativeMediaErrorDescription = null,
     playing: bool,
     position_ns: u64,
     duration_ns: ?u64,
@@ -517,6 +941,7 @@ pub const NativeMedia = struct {
         if (!id.isValid()) return error.InvalidHandle;
         const value = try self.state_fn(self.context, id);
         if (!std.math.isFinite(value.volume) or value.volume < 0 or value.volume > 1) return error.PlatformFailure;
+        if (value.error_description) |description| description.validate() catch return error.PlatformFailure;
         return value;
     }
     pub fn destroy(self: NativeMedia, id: handles.NativeMediaId) Error!void {
@@ -579,6 +1004,8 @@ pub const Bundle = struct {
     text_input: ?TextInput = null,
     accessibility: ?a11y.Adapter = null,
     clipboard: ?Clipboard = null,
+    promised_files: ?PromisedFiles = null,
+    page_capture: ?PageCapture = null,
     menus: ?Menus = null,
     dialogs: ?Dialogs = null,
     application_services: ?ApplicationServices = null,
@@ -604,6 +1031,7 @@ pub fn validateWindowEvent(value: *const WindowEvent) Error!void {
         .resized => |size| if (!finiteNonNegativeSize(size)) return error.InvalidConfiguration,
         .scale_changed => |scale_factor| if (!std.math.isFinite(scale_factor.value) or scale_factor.value <= 0)
             return error.InvalidScaleFactor,
+        .mode_changed => {},
         .menu_action => |invocation| if (!invocation.action.isValid()) return error.InvalidHandle,
         .accessibility_action => |request| {
             if (!request.window.isValid() or !request.target.isValid()) return error.InvalidHandle;
@@ -706,9 +1134,69 @@ fn validateServiceText(value: []const u8, maximum_bytes: usize) Error!void {
     if (!validUtf8Text(value)) return error.InvalidUtf8;
 }
 
+fn validatePageCaptureOptions(value: PageCaptureOptions, limits: PageCaptureLimits) Error!void {
+    if (limits.maximum_requests == 0 or limits.maximum_url_bytes == 0 or
+        limits.maximum_result_bytes == 0 or limits.maximum_pixels == 0 or
+        limits.maximum_dimension <= 0 or !std.math.isFinite(limits.maximum_dimension) or
+        limits.maximum_timeout_ns == 0)
+        return error.InvalidConfiguration;
+    try validateServiceText(value.url, limits.maximum_url_bytes);
+    if (!isHttpUrl(value.url)) return error.InvalidConfiguration;
+    if (!finitePositiveSize(value.size) or value.size.width > limits.maximum_dimension or
+        value.size.height > limits.maximum_dimension)
+        return error.InvalidConfiguration;
+    const pixels = value.size.width * value.size.height;
+    if (!std.math.isFinite(pixels) or pixels > @as(f64, @floatFromInt(limits.maximum_pixels)))
+        return error.BudgetExceeded;
+    if (value.timeout_ns == 0 or value.timeout_ns > limits.maximum_timeout_ns)
+        return error.InvalidConfiguration;
+}
+
+fn validatePageCaptureCompletion(value: PageCaptureCompletion, limits: PageCaptureLimits) Error!void {
+    if (!value.request.isValid()) return error.InvalidHandle;
+    if (value.error_description) |description| {
+        if (!validUtf8Text(description) or description.len > limits.maximum_url_bytes)
+            return error.InvalidUtf8;
+    }
+    switch (value.status) {
+        .completed => {
+            const result = value.result orelse return error.PlatformFailure;
+            if (result.width == 0 or result.height == 0 or
+                @as(f64, @floatFromInt(result.width)) > limits.maximum_dimension or
+                @as(f64, @floatFromInt(result.height)) > limits.maximum_dimension or
+                result.bytes.len < 8 or
+                !std.mem.eql(u8, result.bytes[0..8], "\x89PNG\r\n\x1a\n"))
+                return error.InvalidImage;
+            const pixels = std.math.mul(usize, result.width, result.height) catch return error.BudgetExceeded;
+            if (pixels > limits.maximum_pixels or result.bytes.len > limits.maximum_result_bytes)
+                return error.BudgetExceeded;
+        },
+        .failed, .canceled => if (value.result != null) return error.InvalidConfiguration,
+    }
+}
+
+fn isHttpUrl(value: []const u8) bool {
+    const separator = std.mem.indexOf(u8, value, "://") orelse return false;
+    if (separator == 0) return false;
+    const scheme = value[0..separator];
+    if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https")) return false;
+    const authority_start = separator + 3;
+    if (authority_start >= value.len) return false;
+    const authority_end = std.mem.indexOfAnyPos(u8, value, authority_start, "/?#") orelse value.len;
+    if (authority_end == authority_start) return false;
+    for (value) |byte| {
+        if (byte <= 0x20 or byte == 0x7f) return false;
+    }
+    return true;
+}
+
 fn validateClipboardContents(value: ClipboardContents, maximum_bytes: usize, maximum_paths: usize) Error!void {
     if (maximum_bytes == 0 or maximum_paths == 0) return error.InvalidConfiguration;
     if (value.paths.len > maximum_paths) return error.BudgetExceeded;
+    if (value.promised_file_count > maximum_paths) return error.BudgetExceeded;
+    if (value.contains_promised_files != (value.promised_file_count != 0)) return error.InvalidConfiguration;
+    if (value.promised_batch) |batch| if (!batch.isValid()) return error.InvalidHandle;
+    if (value.promised_batch != null and value.promised_file_count == 0) return error.InvalidConfiguration;
     var used: usize = 0;
     if (value.text) |text_value| {
         if (!validUtf8Text(text_value)) return error.InvalidUtf8;
@@ -723,6 +1211,42 @@ fn validateClipboardContents(value: ClipboardContents, maximum_bytes: usize, max
         used = std.math.add(usize, used, image.bytes.len) catch return error.BudgetExceeded;
     }
     if (used > maximum_bytes) return error.BudgetExceeded;
+}
+
+fn validatePromisedDescriptors(value: OwnedPromisedFileDescriptors, limits: PromisedFileLimits) Error!void {
+    if (!value.batch.isValid()) return error.InvalidHandle;
+    if (value.values.len == 0 or value.values.len > limits.maximum_files) return error.BudgetExceeded;
+    var used: usize = 0;
+    for (value.values) |descriptor| {
+        if (!validUtf8Text(descriptor.suggested_name) or descriptor.suggested_name.len == 0)
+            return error.InvalidUtf8;
+        if (!validUtf8Text(descriptor.content_type)) return error.InvalidUtf8;
+        used = std.math.add(usize, used, descriptor.suggested_name.len) catch return error.BudgetExceeded;
+        used = std.math.add(usize, used, descriptor.content_type.len) catch return error.BudgetExceeded;
+        if (used > limits.maximum_bytes) return error.BudgetExceeded;
+    }
+}
+
+fn validatePromisedCompletion(value: PromisedFileCompletion, limits: PromisedFileLimits) Error!void {
+    if (!value.operation.isValid()) return error.InvalidHandle;
+    if (value.outputs.len > limits.maximum_files) return error.BudgetExceeded;
+    var used: usize = 0;
+    if (value.error_description) |description| {
+        if (!validUtf8Text(description)) return error.InvalidUtf8;
+        used = std.math.add(usize, used, description.len) catch return error.BudgetExceeded;
+    }
+    for (value.outputs) |output| {
+        if (output.descriptor_index >= limits.maximum_files) return error.InvalidConfiguration;
+        if (output.path) |path| {
+            try validatePath(path, limits.maximum_bytes);
+            used = std.math.add(usize, used, path.len) catch return error.BudgetExceeded;
+        }
+        if (output.error_description) |description| {
+            if (!validUtf8Text(description)) return error.InvalidUtf8;
+            used = std.math.add(usize, used, description.len) catch return error.BudgetExceeded;
+        }
+        if (used > limits.maximum_bytes) return error.BudgetExceeded;
+    }
 }
 
 fn validateMenu(items: []const MenuItem, limits: MenuLimits) Error!void {
@@ -749,12 +1273,24 @@ fn validateMenuLevel(
             .action => |definition| {
                 if (!definition.action.isValid()) return error.InvalidHandle;
                 try chargeMenuText(definition.label, limits.maximum_text_bytes, text_bytes);
+                if (definition.shortcut) |shortcut| try validateMenuShortcut(shortcut);
             },
             .submenu => |submenu| {
                 try chargeMenuText(submenu.label, limits.maximum_text_bytes, text_bytes);
                 try validateMenuLevel(submenu.items, limits, depth + 1, count, text_bytes);
             },
+            .application => |application| try validateMenuLevel(application.items, limits, depth + 1, count, text_bytes),
+            .system_action => |definition| try chargeMenuText(definition.label, limits.maximum_text_bytes, text_bytes),
         }
+    }
+}
+
+fn validateMenuShortcut(shortcut: MenuShortcut) Error!void {
+    switch (shortcut.key) {
+        .character => |value| if (value == 0 or !std.unicode.utf8ValidCodepoint(value)) return error.InvalidConfiguration,
+        .function => |number| if (number == 0 or number > 35) return error.InvalidConfiguration,
+        .native => return error.Unsupported,
+        else => {},
     }
 }
 
@@ -763,4 +1299,91 @@ fn chargeMenuText(value: []const u8, maximum: usize, used: *usize) Error!void {
     const next = std.math.add(usize, used.*, value.len) catch return error.BudgetExceeded;
     if (next > maximum) return error.BudgetExceeded;
     used.* = next;
+}
+
+const SnapshotProbe = struct {
+    calls: usize = 0,
+    format: WindowSnapshotFormat = .png_srgb8,
+    width: u32 = 8,
+    height: u32 = 4,
+    byte_count: usize = 8,
+
+    fn capture(raw: *anyopaque, _: handles.WindowId, _: geometry.Size, allocator: std.mem.Allocator) Error!OwnedWindowSnapshot {
+        const self: *SnapshotProbe = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        const bytes = try allocator.alloc(u8, self.byte_count);
+        @memset(bytes, 0);
+        if (bytes.len >= 8) @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+        return .{
+            .allocator = allocator,
+            .bytes = bytes,
+            .format = self.format,
+            .width = self.width,
+            .height = self.height,
+            .scale_factor = .{ .value = 2 },
+        };
+    }
+};
+
+fn snapshotStubCreate(_: *anyopaque, _: handles.WindowId, _: WindowOptions) Error!NativeHandle {
+    return .{ .kind = .headless, .value = 1 };
+}
+fn snapshotStubDestroy(_: *anyopaque, _: handles.WindowId) void {}
+fn snapshotStubShow(_: *anyopaque, _: handles.WindowId, _: bool) Error!void {}
+fn snapshotStubTitle(_: *anyopaque, _: handles.WindowId, _: []const u8) Error!void {}
+fn snapshotStubFrame(_: *anyopaque, _: handles.WindowId) Error!void {}
+fn snapshotStubCursor(_: *anyopaque, _: handles.WindowId, _: Cursor) Error!void {}
+fn snapshotStubCommand(_: *anyopaque, _: handles.WindowId, _: WindowCommand) Error!void {}
+fn snapshotStubNative(_: *anyopaque, _: handles.WindowId) ?NativeHandle {
+    return .{ .kind = .headless, .value = 1 };
+}
+
+fn snapshotWindowSystem(probe: *SnapshotProbe) WindowSystem {
+    return .{
+        .context = probe,
+        .create_fn = snapshotStubCreate,
+        .destroy_fn = snapshotStubDestroy,
+        .show_fn = snapshotStubShow,
+        .title_fn = snapshotStubTitle,
+        .request_frame_fn = snapshotStubFrame,
+        .set_cursor_fn = snapshotStubCursor,
+        .command_fn = snapshotStubCommand,
+        .native_handle_fn = snapshotStubNative,
+        .capture_window_fn = SnapshotProbe.capture,
+    };
+}
+
+test "window snapshot contract validates ownership and budgets" {
+    const testing = std.testing;
+    const id = handles.WindowId.init(1, 1);
+    var probe: SnapshotProbe = .{};
+    var windows = snapshotWindowSystem(&probe);
+    var snapshot = try windows.captureWindow(id, .{ .width = 320, .height = 180 }, testing.allocator);
+    defer snapshot.deinit();
+    try testing.expectEqual(@as(usize, 1), probe.calls);
+    try testing.expectEqual(WindowSnapshotFormat.png_srgb8, snapshot.format);
+    try testing.expectEqual(@as(u32, 8), snapshot.width);
+    try testing.expectEqual(@as(f32, 2), snapshot.scale_factor.value);
+
+    windows.maximum_snapshot_bytes = 7;
+    try testing.expectError(error.BudgetExceeded, windows.captureWindow(id, .{ .width = 320, .height = 180 }, testing.allocator));
+    try testing.expectEqual(@as(usize, 2), probe.calls);
+
+    windows.maximum_snapshot_bytes = 256;
+    probe.byte_count = 7;
+    try testing.expectError(error.InvalidImage, windows.captureWindow(id, .{ .width = 320, .height = 180 }, testing.allocator));
+    probe.byte_count = 8;
+    probe.format = .png_srgb8;
+}
+
+test "window snapshot contract rejects missing capability and invalid targets" {
+    const testing = std.testing;
+    const id = handles.WindowId.init(1, 1);
+    var probe: SnapshotProbe = .{};
+    var windows = snapshotWindowSystem(&probe);
+    windows.capture_window_fn = null;
+    try testing.expectError(error.MissingCapability, windows.captureWindow(id, .{ .width = 320, .height = 180 }, testing.allocator));
+    windows.capture_window_fn = SnapshotProbe.capture;
+    try testing.expectError(error.InvalidConfiguration, windows.captureWindow(id, .{ .width = 0, .height = 180 }, testing.allocator));
+    try testing.expectEqual(@as(usize, 0), probe.calls);
 }

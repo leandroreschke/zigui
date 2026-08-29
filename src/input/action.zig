@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing = std.testing;
 const Error = @import("../core/error.zig").Error;
 const handles = @import("../core/handle.zig");
 const event = @import("event.zig");
@@ -37,9 +38,16 @@ pub const Dispatch = struct {
     current: handles.NodeId,
     handled: bool = false,
     propagation_stopped: bool = false,
+    requested_autofocus_after_reconcile: bool = false,
 
     pub fn stopPropagation(self: *Dispatch) void {
         self.propagation_stopped = true;
+    }
+
+    /// Transfers focus to the next declarative autofocus node after an action
+    /// callback changes the retained tree.
+    pub fn requestAutofocusAfterReconcile(self: *Dispatch) void {
+        self.requested_autofocus_after_reconcile = true;
     }
 };
 
@@ -60,6 +68,7 @@ const Binding = struct {
     context: Context,
     priority: i16,
     insertion: u64,
+    exclude_text_input: bool = false,
 };
 
 pub const Registry = struct {
@@ -142,6 +151,31 @@ pub const Registry = struct {
     }
 
     pub fn bind(self: *Registry, chord: Chord, action_id: handles.ActionId, binding_context: Context, priority: i16) Error!void {
+        return self.bindWithOptions(chord, action_id, binding_context, priority, false);
+    }
+
+    /// Binds an action for the active context unless the focused retained node
+    /// is an editable text field. This is the direct equivalent of a desktop
+    /// key context such as `Workspace && !Input`; it does not alter menu or
+    /// programmatic dispatch, only keyboard resolution.
+    pub fn bindExcludingTextInput(
+        self: *Registry,
+        chord: Chord,
+        action_id: handles.ActionId,
+        binding_context: Context,
+        priority: i16,
+    ) Error!void {
+        return self.bindWithOptions(chord, action_id, binding_context, priority, true);
+    }
+
+    fn bindWithOptions(
+        self: *Registry,
+        chord: Chord,
+        action_id: handles.ActionId,
+        binding_context: Context,
+        priority: i16,
+        exclude_text_input: bool,
+    ) Error!void {
         if (!self.definitions.contains(action_id)) return error.InvalidHandle;
         if (self.bindings.items.len >= self.maximum_bindings) return error.BudgetExceeded;
         const next_insertion = std.math.add(u64, self.insertion, 1) catch return error.BudgetExceeded;
@@ -151,15 +185,26 @@ pub const Registry = struct {
             .context = binding_context,
             .priority = priority,
             .insertion = next_insertion,
+            .exclude_text_input = exclude_text_input,
         });
         self.insertion = next_insertion;
     }
 
     pub fn resolve(self: *const Registry, key_event: event.KeyEvent, active_contexts: []const Context) ?handles.ActionId {
+        return self.resolveWithTextInput(key_event, active_contexts, false);
+    }
+
+    pub fn resolveWithTextInput(
+        self: *const Registry,
+        key_event: event.KeyEvent,
+        active_contexts: []const Context,
+        text_input_focused: bool,
+    ) ?handles.ActionId {
         var best: ?Binding = null;
         var best_specificity: usize = 0;
         for (self.bindings.items) |binding| {
             if (!binding.chord.matches(key_event)) continue;
+            if (text_input_focused and binding.exclude_text_input) continue;
             const specificity = contextSpecificity(binding.context, active_contexts) orelse continue;
             if (best == null or specificity > best_specificity or
                 (specificity == best_specificity and binding.priority > best.?.priority) or
@@ -181,6 +226,20 @@ fn normalizedModifiers(value: event.Modifiers) u8 {
     if (value.command) result |= 1 << 3;
     if (value.function) result |= 1 << 4;
     return result;
+}
+
+test "text-input-excluding action bindings preserve ordinary context resolution" {
+    var registry = Registry.init(testing.allocator);
+    defer registry.deinit();
+
+    const action_id = try registry.register("test.text-input-exclusion");
+    const chord: Chord = .{ .key = .{ .character = 'n' }, .modifiers = .{ .command = true } };
+    const active = [_]Context{context("Test.Workspace")};
+    try registry.bindExcludingTextInput(chord, action_id, active[0], 10);
+
+    const key: event.KeyEvent = .{ .key = .{ .character = 'n' }, .physical_code = 0, .modifiers = .{ .command = true } };
+    try testing.expectEqual(action_id, registry.resolveWithTextInput(key, &active, false).?);
+    try testing.expect(registry.resolveWithTextInput(key, &active, true) == null);
 }
 
 pub fn contextSpecificity(binding_context: Context, active: []const Context) ?usize {

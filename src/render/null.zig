@@ -13,6 +13,17 @@ const maximum_layer_depth = 32;
 const maximum_clip_depth = 64;
 const maximum_layer_bytes = 512 * 1024 * 1024;
 
+const AsyncOffscreenRequest = struct {
+    id: api.OffscreenRequestId,
+    target: api.OffscreenTarget,
+    snapshot: api.SceneSnapshot,
+    /// Each retained ID holds its texture in the renderer map until the
+    /// asynchronous request reaches a terminal poll or teardown drain.
+    retained_texture_ids: std.ArrayList(u64) = .empty,
+    polled: bool = false,
+    cancelled: bool = false,
+};
+
 pub const NullRenderer = struct {
     allocator: std.mem.Allocator,
     generation: api.DeviceGeneration = 1,
@@ -24,11 +35,15 @@ pub const NullRenderer = struct {
     extensions: extension.Registry,
     path_limits: path_tessellator.Limits,
     maximum_textures: usize,
+    maximum_offscreen_requests: usize,
+    next_offscreen_id: api.OffscreenRequestId = 1,
+    offscreen_requests: std.AutoHashMap(api.OffscreenRequestId, *AsyncOffscreenRequest),
 
     const Texture = struct {
         descriptor: api.TextureDescriptor,
         pixels: []u8,
         release_after: api.SubmissionEpoch = std.math.maxInt(api.SubmissionEpoch),
+        async_holds: usize = 0,
     };
 
     pub fn create(allocator: std.mem.Allocator) Error!api.Renderer {
@@ -48,6 +63,8 @@ pub const NullRenderer = struct {
                 .maximum_cache_bytes = 0,
             },
             .maximum_textures = memory.texture_count,
+            .maximum_offscreen_requests = memory.offscreen_request_count,
+            .offscreen_requests = std.AutoHashMap(api.OffscreenRequestId, *AsyncOffscreenRequest).init(allocator),
         };
         return .{ .context = instance, .vtable = &vtable };
     }
@@ -58,6 +75,10 @@ pub const NullRenderer = struct {
         .begin_frame = beginFrame,
         .submit = submit,
         .render_offscreen = renderOffscreen,
+        .begin_offscreen = beginOffscreen,
+        .poll_offscreen = pollOffscreen,
+        .cancel_offscreen = cancelOffscreen,
+        .drain_offscreen = drainOffscreen,
         .completed_epoch = completedEpoch,
         .invalidate_surface = invalidateSurface,
         .recover = recover,
@@ -77,7 +98,7 @@ pub const NullRenderer = struct {
     }
 
     fn capabilities(_: *anyopaque) api.Capabilities {
-        return .{ .offscreen_readback = true, .custom_materials = true };
+        return .{ .offscreen_readback = true, .offscreen_async_readback = true, .custom_materials = true, .backdrop_effects = true };
     }
 
     fn deviceGeneration(context: *anyopaque) api.DeviceGeneration {
@@ -155,6 +176,125 @@ pub const NullRenderer = struct {
         };
     }
 
+    fn beginOffscreen(
+        context: *anyopaque,
+        target: api.OffscreenTarget,
+        view: api.SceneView,
+    ) Error!api.OffscreenRequestId {
+        const renderer = self(context);
+        if (!target.readback) return error.InvalidConfiguration;
+        if (renderer.offscreen_requests.count() >= renderer.maximum_offscreen_requests)
+            return error.BudgetExceeded;
+        try scene.validate(view);
+        try renderer.offscreen_requests.ensureUnusedCapacity(1);
+        const snapshot = try api.SceneSnapshot.init(renderer.allocator, view);
+        errdefer {
+            var owned = snapshot;
+            owned.deinit();
+        }
+        const id = renderer.nextOffscreenIdValue();
+        const request = try renderer.allocator.create(AsyncOffscreenRequest);
+        errdefer {
+            renderer.releaseSceneTextures(request);
+            request.retained_texture_ids.deinit(renderer.allocator);
+            renderer.allocator.destroy(request);
+        }
+        request.* = .{ .id = id, .target = target, .snapshot = snapshot };
+        try renderer.retainSceneTextures(request, snapshot.view());
+        renderer.offscreen_requests.putAssumeCapacity(id, request);
+        return id;
+    }
+
+    fn retainSceneTextures(renderer: *NullRenderer, request: *AsyncOffscreenRequest, view: api.SceneView) Error!void {
+        for (view.operations) |operation| {
+            const kind = std.enums.fromInt(scene_abi.OperationKind, operation.kind) orelse return error.InvalidScene;
+            const sprites = switch (kind) {
+                .monochrome_sprites => view.monochrome_sprites[operation.start..][0..operation.count],
+                .color_sprites => view.color_sprites[operation.start..][0..operation.count],
+                else => continue,
+            };
+            for (sprites) |sprite| {
+                const texture = renderer.textures.getPtr(sprite.texture) orelse return error.InvalidHandle;
+                texture.async_holds += 1;
+                request.retained_texture_ids.append(renderer.allocator, sprite.texture) catch |err| {
+                    texture.async_holds -= 1;
+                    return err;
+                };
+            }
+        }
+    }
+
+    fn pollOffscreen(
+        context: *anyopaque,
+        id: api.OffscreenRequestId,
+        allocator: std.mem.Allocator,
+    ) Error!api.OffscreenPoll {
+        const renderer = self(context);
+        const request = renderer.offscreen_requests.get(id) orelse return error.InvalidHandle;
+        if (!request.polled) {
+            request.polled = true;
+            return .pending;
+        }
+        if (request.cancelled) {
+            renderer.finishOffscreenRequest(id, request);
+            return .cancelled;
+        }
+        const result = renderOffscreen(renderer, request.target, request.snapshot.view(), allocator) catch |err| {
+            renderer.finishOffscreenRequest(id, request);
+            return .{ .failed = err };
+        };
+        const readback = result orelse {
+            renderer.finishOffscreenRequest(id, request);
+            return .{ .failed = error.PlatformFailure };
+        };
+        renderer.finishOffscreenRequest(id, request);
+        return .{ .ready = readback };
+    }
+
+    fn cancelOffscreen(context: *anyopaque, id: api.OffscreenRequestId) Error!void {
+        const request = self(context).offscreen_requests.get(id) orelse return error.InvalidHandle;
+        request.cancelled = true;
+    }
+
+    fn drainOffscreen(context: *anyopaque) void {
+        const renderer = self(context);
+        var iterator = renderer.offscreen_requests.iterator();
+        while (iterator.next()) |entry| {
+            const request = entry.value_ptr.*;
+            renderer.releaseSceneTextures(request);
+            request.snapshot.deinit();
+            request.retained_texture_ids.deinit(renderer.allocator);
+            renderer.allocator.destroy(request);
+        }
+        renderer.offscreen_requests.clearRetainingCapacity();
+    }
+
+    fn nextOffscreenIdValue(renderer: *NullRenderer) api.OffscreenRequestId {
+        var id = renderer.next_offscreen_id;
+        while (id == 0 or renderer.offscreen_requests.contains(id)) {
+            id +%= 1;
+            if (id == 0) id = 1;
+        }
+        renderer.next_offscreen_id = id +% 1;
+        if (renderer.next_offscreen_id == 0) renderer.next_offscreen_id = 1;
+        return id;
+    }
+
+    fn finishOffscreenRequest(renderer: *NullRenderer, id: api.OffscreenRequestId, request: *AsyncOffscreenRequest) void {
+        _ = renderer.offscreen_requests.remove(id);
+        renderer.releaseSceneTextures(request);
+        request.snapshot.deinit();
+        request.retained_texture_ids.deinit(renderer.allocator);
+        renderer.allocator.destroy(request);
+    }
+
+    fn releaseSceneTextures(renderer: *NullRenderer, request: *AsyncOffscreenRequest) void {
+        for (request.retained_texture_ids.items) |id| {
+            if (renderer.textures.getPtr(id)) |texture| texture.async_holds -|= 1;
+        }
+        renderer.collectTextures();
+    }
+
     fn completedEpoch(context: *anyopaque) api.SubmissionEpoch {
         return self(context).completed_submission;
     }
@@ -164,6 +304,7 @@ pub const NullRenderer = struct {
     fn recover(context: *anyopaque, policy: config.GpuPolicy) Error!void {
         _ = policy;
         const renderer = self(context);
+        drainOffscreen(renderer);
         renderer.generation +%= 1;
         if (renderer.generation == 0) renderer.generation = 1;
         renderer.active_token = null;
@@ -244,6 +385,7 @@ pub const NullRenderer = struct {
     }
 
     fn registerExtension(context: *anyopaque, descriptor: extension.Descriptor) Error!@import("../core/handle.zig").RenderExtensionId {
+        if (descriptor.requirements.depth != null) return error.Unsupported;
         const renderer = self(context);
         renderer.extensions.collect(renderer.completed_submission);
         return renderer.extensions.register(descriptor);
@@ -256,6 +398,8 @@ pub const NullRenderer = struct {
     fn deinit(context: *anyopaque) void {
         const renderer = self(context);
         const allocator = renderer.allocator;
+        drainOffscreen(renderer);
+        renderer.offscreen_requests.deinit();
         var iterator = renderer.textures.iterator();
         while (iterator.next()) |entry| allocator.free(entry.value_ptr.pixels);
         renderer.textures.deinit();
@@ -268,7 +412,8 @@ pub const NullRenderer = struct {
         defer remove.deinit(renderer.allocator);
         var iterator = renderer.textures.iterator();
         while (iterator.next()) |entry| {
-            if (entry.value_ptr.release_after <= renderer.completed_submission) remove.append(renderer.allocator, entry.key_ptr.*) catch return;
+            if (entry.value_ptr.async_holds == 0 and entry.value_ptr.release_after <= renderer.completed_submission)
+                remove.append(renderer.allocator, entry.key_ptr.*) catch return;
         }
         for (remove.items) |key| {
             const texture = renderer.textures.fetchRemove(key) orelse continue;
@@ -466,6 +611,8 @@ fn rasterize(
                     renderer.submitted_epoch +| 1,
                 );
             },
+            .backdrop_effect => for (view.backdrop_effects[operation.start..][0..operation.count]) |effect|
+                try paintBackdropEffect(target, destination, stride, effect, transform, &clip, allocator),
             else => {},
         }
     }
@@ -634,6 +781,127 @@ fn paintQuad(
             }
         }
     }
+}
+
+fn paintBackdropEffect(
+    target: api.OffscreenTarget,
+    pixels: []u8,
+    stride: usize,
+    effect: scene_abi.BackdropEffect,
+    transform: geometry.Affine2D,
+    clip: *const ClipChain,
+    allocator: std.mem.Allocator,
+) Error!void {
+    if (effect.bounds.isEmpty()) return;
+    const inverse = transform.inverse() orelse return;
+    const world_bounds = transform.transformRectBounds(effect.bounds);
+    const output_bounds = geometry.Rect.intersection(world_bounds, clip.bounds) orelse return;
+    const output = pixelBounds(target, output_bounds) orelse return;
+    const capture_bounds = pixelBounds(target, expandRect(world_bounds, effect.blur_radius * 2)) orelse return;
+    const capture_width = capture_bounds.right - capture_bounds.left;
+    const capture_height = capture_bounds.bottom - capture_bounds.top;
+    const capture_stride = std.math.mul(usize, capture_width, 4) catch return error.BudgetExceeded;
+    const capture_length = std.math.mul(usize, capture_stride, capture_height) catch return error.BudgetExceeded;
+    const snapshot = try allocator.alloc(u8, capture_length);
+    defer allocator.free(snapshot);
+
+    for (0..capture_height) |row| {
+        const source_start = (@as(usize, capture_bounds.top) + row) * stride + @as(usize, capture_bounds.left) * 4;
+        @memcpy(snapshot[row * capture_stride ..][0..capture_stride], pixels[source_start..][0..capture_stride]);
+    }
+
+    const scale = target.scale_factor.value;
+    const blur_radius: u32 = @intFromFloat(@ceil(effect.blur_radius * scale));
+    var y = output.top;
+    while (y < output.bottom) : (y += 1) {
+        var x = output.left;
+        while (x < output.right) : (x += 1) {
+            const world_point: geometry.Point = .{
+                .x = (@as(f32, @floatFromInt(x)) + 0.5) / scale,
+                .y = (@as(f32, @floatFromInt(y)) + 0.5) / scale,
+            };
+            const local_point = inverse.transformPoint(world_point);
+            const shape_coverage = roundedCoverage(effect.bounds, effect.radii, local_point);
+            if (shape_coverage <= 0) continue;
+            const coverage = shape_coverage * clip.coverage(world_point) * effect.opacity;
+            if (coverage <= 0) continue;
+            const filtered = saturateBackdrop(
+                blurBackdrop(snapshot, capture_stride, capture_bounds, x, y, blur_radius),
+                effect.saturation,
+            );
+            const offset = @as(usize, y) * stride + @as(usize, x) * 4;
+            const original = byteColor(pixels, offset);
+            writeByteColor(pixels, offset, mixBackdrop(original, filtered, coverage));
+        }
+    }
+}
+
+fn blurBackdrop(
+    snapshot: []const u8,
+    stride: usize,
+    bounds: PixelBounds,
+    x: u32,
+    y: u32,
+    radius: u32,
+) geometry.Color {
+    if (radius == 0) return snapshotColor(snapshot, stride, bounds, @intCast(x), @intCast(y));
+    const near: i64 = @max(@as(i64, 1), @as(i64, @intFromFloat(@round(@as(f32, @floatFromInt(radius)) * 0.5))));
+    const far: i64 = @max(near, @as(i64, radius));
+    const diagonal: i64 = @max(@as(i64, 1), @as(i64, @intFromFloat(@round(@as(f32, @floatFromInt(radius)) * 0.7071))));
+    var result: geometry.Color = .{ .a = 0 };
+    addPremultiplied(&result, snapshotColor(snapshot, stride, bounds, @intCast(x), @intCast(y)), 0.3125);
+    for ([_][2]i64{ .{ -near, 0 }, .{ near, 0 }, .{ 0, -near }, .{ 0, near } }) |offset|
+        addPremultiplied(&result, snapshotColor(snapshot, stride, bounds, @as(i64, x) + offset[0], @as(i64, y) + offset[1]), 0.125);
+    for ([_][2]i64{ .{ -far, 0 }, .{ far, 0 }, .{ 0, -far }, .{ 0, far } }) |offset|
+        addPremultiplied(&result, snapshotColor(snapshot, stride, bounds, @as(i64, x) + offset[0], @as(i64, y) + offset[1]), 0.03125);
+    for ([_][2]i64{ .{ -diagonal, -diagonal }, .{ diagonal, -diagonal }, .{ -diagonal, diagonal }, .{ diagonal, diagonal } }) |offset|
+        addPremultiplied(&result, snapshotColor(snapshot, stride, bounds, @as(i64, x) + offset[0], @as(i64, y) + offset[1]), 0.015625);
+    if (result.a <= 0) return .transparent;
+    return .{
+        .r = result.r / result.a,
+        .g = result.g / result.a,
+        .b = result.b / result.a,
+        .a = result.a,
+    };
+}
+
+fn addPremultiplied(result: *geometry.Color, sample: geometry.Color, weight: f32) void {
+    const weighted_alpha = sample.a * weight;
+    result.r += sample.r * weighted_alpha;
+    result.g += sample.g * weighted_alpha;
+    result.b += sample.b * weighted_alpha;
+    result.a += weighted_alpha;
+}
+
+fn snapshotColor(snapshot: []const u8, stride: usize, bounds: PixelBounds, x: i64, y: i64) geometry.Color {
+    const clamped_x = std.math.clamp(x, @as(i64, bounds.left), @as(i64, bounds.right) - 1);
+    const clamped_y = std.math.clamp(y, @as(i64, bounds.top), @as(i64, bounds.bottom) - 1);
+    const offset = @as(usize, @intCast(clamped_y - bounds.top)) * stride + @as(usize, @intCast(clamped_x - bounds.left)) * 4;
+    return byteColor(snapshot, offset);
+}
+
+fn saturateBackdrop(color: geometry.Color, saturation: f32) geometry.Color {
+    const luminance = color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722;
+    return .{
+        .r = luminance + (color.r - luminance) * saturation,
+        .g = luminance + (color.g - luminance) * saturation,
+        .b = luminance + (color.b - luminance) * saturation,
+        .a = color.a,
+    };
+}
+
+fn mixBackdrop(original: geometry.Color, filtered: geometry.Color, amount: f32) geometry.Color {
+    const t = std.math.clamp(amount, 0, 1);
+    const original_alpha = original.a;
+    const filtered_alpha = filtered.a;
+    const alpha = original_alpha + (filtered_alpha - original_alpha) * t;
+    if (alpha <= 0) return .transparent;
+    return .{
+        .r = (original.r * original_alpha + (filtered.r * filtered_alpha - original.r * original_alpha) * t) / alpha,
+        .g = (original.g * original_alpha + (filtered.g * filtered_alpha - original.g * original_alpha) * t) / alpha,
+        .b = (original.b * original_alpha + (filtered.b * filtered_alpha - original.b * original_alpha) * t) / alpha,
+        .a = alpha,
+    };
 }
 
 fn paintUnderline(

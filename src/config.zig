@@ -2,6 +2,7 @@ const std = @import("std");
 const options = @import("zigui_options");
 const core_config = @import("core/config.zig");
 const Error = @import("core/error.zig").Error;
+const handles = @import("core/handle.zig");
 
 pub const Platform = enum {
     auto,
@@ -33,6 +34,14 @@ pub const tracing_enabled = options.enable_tracing;
 pub const GpuPolicy = core_config.GpuPolicy;
 pub const MemoryBudgets = core_config.MemoryBudgets;
 
+/// Native pointer-event delivery policy. The platform default preserves the
+/// host application's existing behavior; direct-manipulation applications may
+/// request uncoalesced pointer samples when every intermediate position matters.
+pub const PointerEventCoalescing = enum {
+    platform_default,
+    disabled,
+};
+
 pub const LinuxConfig = struct {
     /// Full Wayland socket path. When null, ZigUI resolves XDG_RUNTIME_DIR and
     /// WAYLAND_DISPLAY from the initial process environment.
@@ -42,13 +51,29 @@ pub const LinuxConfig = struct {
     x11_display: ?[]const u8 = null,
 };
 
+/// Application-owned work that must complete before ZigUI begins destroying
+/// a window in response to a close request. The callback runs synchronously
+/// on the App event-loop thread and receives the still-valid window identity.
+/// Returning an error leaves the window open and causes the App run loop to
+/// report the error after it stops.
+pub const WindowCloseCallback = struct {
+    context: *anyopaque,
+    callback: *const fn (*anyopaque, handles.WindowId) Error!void,
+
+    pub fn call(self: WindowCloseCallback, window: handles.WindowId) Error!void {
+        try self.callback(self.context, window);
+    }
+};
+
 pub const AppConfig = struct {
     application_name: []const u8 = "ZigUI application",
     application_version: []const u8 = "",
     gpu: GpuPolicy = .{},
     memory: MemoryBudgets = .{},
     linux: LinuxConfig = .{},
+    pointer_event_coalescing: PointerEventCoalescing = .platform_default,
     quit_when_last_window_closes: bool = true,
+    window_close_callback: ?WindowCloseCallback = null,
     allow_multiple_apps_for_testing: bool = false,
 };
 
@@ -88,6 +113,7 @@ pub fn validate(value: AppConfig) Error!void {
         value.memory.scene_custom_pass_count,
         value.memory.scene_custom_payload_bytes,
         value.memory.worker_queue_capacity,
+        value.memory.offscreen_request_count,
     }) |count| if (count == 0 or count > std.math.maxInt(u32)) return error.InvalidConfiguration;
     if (value.memory.retained_tree_depth > core_config.maximum_retained_tree_depth)
         return error.InvalidConfiguration;

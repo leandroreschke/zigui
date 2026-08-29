@@ -18,7 +18,12 @@ pub const Window = struct {
     logical_size: geometry.Size,
     position: ?geometry.Point,
     scale_factor: geometry.ScaleFactor,
-    appearance: platform.Appearance = .system,
+    /// Platform-reported refresh rate for presentation deadline evidence.
+    /// Zero means the display provider did not expose a rate.
+    reported_refresh_millihertz: u32 = 0,
+    // Non-native/headless platforms use a deterministic resolved baseline.
+    // Native adapters publish their actual value before the first frame.
+    appearance: platform.Appearance = .light,
     mode: platform.WindowMode = .normal,
     clear_color: geometry.Color,
     anchor: handles.NodeId,
@@ -36,6 +41,7 @@ pub const Window = struct {
     pending_frame: bool = false,
     visible: bool = false,
     close_scheduled: bool = false,
+    close_callback_invoked: bool = false,
     occluded: bool = false,
     platform_focused: bool = false,
     last_input_ns: ?u64 = null,

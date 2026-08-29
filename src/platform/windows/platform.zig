@@ -45,6 +45,8 @@ const OwnedMenuItem = union(enum) {
         checked: bool,
     },
     submenu: struct { label: []u8, items: []OwnedMenuItem },
+    application: struct { items: []OwnedMenuItem },
+    system_action: struct { label: []u8, action: api.SystemMenuAction },
     separator,
 
     fn deinit(self: *OwnedMenuItem, allocator: std.mem.Allocator) void {
@@ -54,6 +56,8 @@ const OwnedMenuItem = union(enum) {
                 allocator.free(submenu.label);
                 deinitOwnedMenuItems(allocator, submenu.items);
             },
+            .application => |application| deinitOwnedMenuItems(allocator, application.items),
+            .system_action => |definition| allocator.free(definition.label),
             .separator => {},
         }
         self.* = undefined;
@@ -1023,6 +1027,11 @@ fn cloneMenuItems(
                 const children = try cloneMenuItems(allocator, submenu.items, actions, next);
                 break :submenu_result .{ .submenu = .{ .label = label, .items = children } };
             },
+            .application => |application| application_result: {
+                const children = try cloneMenuItems(allocator, application.items, actions, next);
+                break :application_result .{ .application = .{ .items = children } };
+            },
+            .system_action => |definition| .{ .system_action = .{ .label = try allocator.dupe(u8, definition.label), .action = definition.action } },
         };
         initialized += 1;
     }
@@ -1057,6 +1066,16 @@ fn buildOwnedMenu(allocator: std.mem.Allocator, items: []const OwnedMenuItem, po
                 return error.PlatformFailure;
             }
         },
+        .application => |application| {
+            const child = try buildOwnedMenu(allocator, application.items, true);
+            const label = try std.unicode.utf8ToUtf16LeAllocZ(allocator, "Application");
+            defer allocator.free(label);
+            if (win.AppendMenuW(menu, win.MF_POPUP, @intFromPtr(child.?), label) == 0) {
+                _ = win.DestroyMenu(child);
+                return error.PlatformFailure;
+            }
+        },
+        .system_action => return error.Unsupported,
     };
     return menu;
 }
@@ -1121,6 +1140,16 @@ fn buildMenu(
                 return error.PlatformFailure;
             }
         },
+        .application => |application| {
+            const child = try buildMenu(allocator, application.items, actions, next, true);
+            const label = try std.unicode.utf8ToUtf16LeAllocZ(allocator, "Application");
+            defer allocator.free(label);
+            if (win.AppendMenuW(menu, win.MF_POPUP, @intFromPtr(child.?), label) == 0) {
+                _ = win.DestroyMenu(child);
+                return error.PlatformFailure;
+            }
+        },
+        .system_action => return error.Unsupported,
     };
     return menu;
 }

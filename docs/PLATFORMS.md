@@ -10,6 +10,7 @@ absent instead of installing a hidden fallback.
 | Always-on-top windows | NSWindow level | Win32 topmost | unsupported | `_NET_WM_STATE_ABOVE` | deterministic state |
 | Renderer | Metal | D3D11 | Vulkan | Vulkan | CPU reference |
 | Text engine | in-tree | in-tree | in-tree | in-tree | in-tree when enabled |
+| WebP image/animation | bounded ImageIO provider | unsupported | unsupported | unsupported | unsupported |
 | Native IME | `NSTextInputClient` | IMM32 | text-input-v3 when advertised | XIM wire protocol | absent |
 | Accessibility | NSAccessibility | UI Automation | AT-SPI over in-tree D-Bus | AT-SPI over in-tree D-Bus | semantic tree only |
 | Clipboard text | NSPasteboard | Win32 clipboard | data-device when advertised | X selections | deterministic memory clipboard |
@@ -56,7 +57,15 @@ file-path budgets.
 
 With `-Dmedia=true`, macOS also exposes a bounded `NativeMedia` service backed
 by AVPlayer and AVPlayerLayer. Its handles are tied to a ZigUI window and offer
-frame updates, play/pause/seek, volume, mute, state, and deterministic teardown.
+frame updates, play/pause/seek, volume, mute, loading/ready/failed state, and a
+`has_presented_frame` signal independent of playback rate. The signal lets a
+consumer keep the latest native frame visible while paused or seeking instead
+of reverting to a stale persisted thumbnail. They also offer deterministic
+teardown. AVPlayerItem readiness is exposed as a platform-neutral
+enum and failed states may carry a bounded inline-owned `error_description`
+copied from the provider; consumers render their own loading and error
+treatment. The description owns no AVFoundation object or allocator and may be
+absent when the platform has no safe localized detail.
 `widgets.NativeMediaView` synchronizes final committed layout bounds without
 mutating platform state during component composition. The layer is a native
 overlay above the Metal scene and does not inherit ZigUI clips or transforms;

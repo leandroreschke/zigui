@@ -44,6 +44,14 @@ from implementation style alone.
 Low-cost counters cover frame phases, invalidations, allocations, live bytes,
 scene primitives, uploads, atlas use, cache hits and misses, GPU submissions,
 resource creation, dropped/coalesced events, and input-to-present latency.
+`core.metrics.PresentationStats` additionally retains a fixed 256-sample ring
+of successful presentation timestamps and optional input latencies, exposing
+nearest-rank p50/p95/p99 values, dropped submissions, the latest
+platform-reported refresh rate, and current/maximum missed-deadline streaks.
+Recording happens after a successful renderer submit/present result and does
+not schedule frames or impose a refresh-rate policy. A zero reported refresh
+rate disables only deadline accounting; timestamp and percentile evidence
+remain available.
 Detailed journaling is compile-time optional.
 
 Allocator byte counters require the caller to wrap its allocator with
@@ -70,5 +78,9 @@ The 2026-08-24 consolidated campaign used an Apple M3 Pro MacBook Pro with
   macOS. This is below the 5 MiB budget.
 
 These figures are a reproducible baseline, not a universal latency claim.
-Frame-time and input-to-present percentiles still require workload-specific
-profiling on each deployment machine.
+The fixed presentation ring makes frame-interval and input-to-present
+percentiles available to workload traces without allocations, but the values
+still require workload-specific profiling on each deployment machine. A
+display-link callback count is not presentation evidence; use
+`frames_presented`, `presentation.presented_count`, the retained timestamps,
+and the platform-reported refresh rate from the same run.

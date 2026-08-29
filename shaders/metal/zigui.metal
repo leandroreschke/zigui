@@ -29,6 +29,7 @@ struct Globals {
 };
 struct PathVertex { Point position; Color color; };
 struct Composite { Rect bounds; float opacity; float reserved0; float reserved1; float reserved2; };
+struct BackdropComposite { Rect bounds; Radii radii; Point capture_origin; Size capture_size; float blur_radius; float saturation; float opacity; };
 
 struct VertexOut {
     float4 position [[position]];
@@ -341,6 +342,58 @@ fragment float4 path_fragment(PathOut in [[stage_in]], const device Material *ma
     result.a *= clip_mask(in.transformed, globals.clip_index, clips) * globals.opacity;
     result.rgb *= result.a;
     return result;
+}
+
+vertex VertexOut backdrop_vertex(uint vertex_id [[vertex_id]], constant BackdropComposite &item [[buffer(0)]],
+    constant Globals &globals [[buffer(10)]]) {
+    float2 local = corner(vertex_id);
+    float2 world = float2(item.bounds.origin.x, item.bounds.origin.y) + local * float2(item.bounds.size.width, item.bounds.size.height);
+    VertexOut out;
+    out.world = world;
+    out.local = local;
+    out.transformed = transform_point(globals.transform, world);
+    out.position = clip_position(out.transformed, globals.viewport, globals.viewport_origin);
+    out.instance = 0;
+    return out;
+}
+
+float4 backdrop_blur(texture2d<float> texture, sampler sample_filter, float2 uv, float blur_radius) {
+    if (blur_radius <= 0.001) return texture.sample(sample_filter, uv);
+    float2 texel = 1.0 / float2(texture.get_width(), texture.get_height());
+    float2 near_offset = texel * max(blur_radius * 0.5, 1.0);
+    float2 far_offset = texel * max(blur_radius, 1.0);
+    float2 diagonal_offset = texel * max(blur_radius * 0.7071, 1.0);
+    float4 result = texture.sample(sample_filter, uv) * 0.3125;
+    result += texture.sample(sample_filter, uv + float2(-near_offset.x, 0.0)) * 0.125;
+    result += texture.sample(sample_filter, uv + float2(near_offset.x, 0.0)) * 0.125;
+    result += texture.sample(sample_filter, uv + float2(0.0, -near_offset.y)) * 0.125;
+    result += texture.sample(sample_filter, uv + float2(0.0, near_offset.y)) * 0.125;
+    result += texture.sample(sample_filter, uv + float2(-far_offset.x, 0.0)) * 0.03125;
+    result += texture.sample(sample_filter, uv + float2(far_offset.x, 0.0)) * 0.03125;
+    result += texture.sample(sample_filter, uv + float2(0.0, -far_offset.y)) * 0.03125;
+    result += texture.sample(sample_filter, uv + float2(0.0, far_offset.y)) * 0.03125;
+    result += texture.sample(sample_filter, uv + float2(-diagonal_offset.x, -diagonal_offset.y)) * 0.015625;
+    result += texture.sample(sample_filter, uv + float2(diagonal_offset.x, -diagonal_offset.y)) * 0.015625;
+    result += texture.sample(sample_filter, uv + float2(-diagonal_offset.x, diagonal_offset.y)) * 0.015625;
+    result += texture.sample(sample_filter, uv + float2(diagonal_offset.x, diagonal_offset.y)) * 0.015625;
+    return result;
+}
+
+fragment float4 backdrop_fragment(VertexOut in [[stage_in]], constant BackdropComposite &item [[buffer(0)]],
+    const device ResolvedClip *clips [[buffer(3)]], constant Globals &globals [[buffer(10)]],
+    texture2d<float> backdrop_texture [[texture(0)]]) {
+    constexpr sampler sample_filter(coord::normalized, address::clamp_to_edge, filter::linear);
+    float2 capture_origin = float2(item.capture_origin.x, item.capture_origin.y);
+    float2 capture_size = float2(item.capture_size.width, item.capture_size.height);
+    float2 uv = (in.transformed - capture_origin) / capture_size;
+    float4 original = backdrop_texture.sample(sample_filter, uv);
+    float4 blurred = backdrop_blur(backdrop_texture, sample_filter, uv, item.blur_radius);
+    float3 color = blurred.a > 0.000001 ? blurred.rgb / blurred.a : 0.0;
+    float luminance = dot(color, float3(0.2126, 0.7152, 0.0722));
+    color = luminance + (color - luminance) * item.saturation;
+    float4 filtered = float4(color * blurred.a, blurred.a);
+    float coverage = rounded_mask(in.world, item.bounds, item.radii) * clip_mask(in.transformed, globals.clip_index, clips) * item.opacity;
+    return mix(original, filtered, clamp(coverage, 0.0, 1.0));
 }
 
 vertex VertexOut composite_vertex(uint vertex_id [[vertex_id]], constant Composite &item [[buffer(0)]],

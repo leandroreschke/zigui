@@ -76,7 +76,7 @@ pub fn build(b: *std.Build) void {
             .module = options.createModule(),
         }},
     });
-    linkPlatform(zigui, platform, enable_media);
+    linkPlatform(b, zigui, platform, enable_media, enable_images);
     if (platform == .macos and renderer == .metal) addMetalLibrary(b, zigui, metal_toolchain);
     if (renderer == .d3d11) zigui.addAnonymousImport("zigui_hlsl_source", .{
         .root_source_file = b.path("shaders/d3d11/zigui.hlsl"),
@@ -144,6 +144,17 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run the complete ZigUI test suite");
     test_step.dependOn(&run_unit_tests.step);
+    if (target.result.os.tag == .macos and platform == .macos and renderer == .metal) {
+        const metal_conformance = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/metal_conformance.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "zigui", .module = zigui }},
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(metal_conformance).step);
+    }
     if (target.result.os.tag == .windows and platform == .windows and renderer == .d3d11) {
         const windows_native = b.addTest(.{
             .root_module = b.createModule(.{
@@ -190,6 +201,33 @@ pub fn build(b: *std.Build) void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(conformance).step);
+
+    // WebP is a platform capability rather than a hidden application
+    // fallback. Keep the cross-target Unsupported contract in the regular
+    // headless suite and force the native ImageIO path through a separate
+    // macOS test root when image support is enabled.
+    if (enable_images) {
+        const webp_headless = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/webp_conformance.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "zigui", .module = conformance_zigui }},
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(webp_headless).step);
+        if (target.result.os.tag == .macos and platform == .macos and renderer == .metal) {
+            const webp_native = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("tests/webp_conformance.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{.{ .name = "zigui", .module = zigui }},
+                }),
+            });
+            test_step.dependOn(&b.addRunArtifact(webp_native).step);
+        }
+    }
 
     // Linux wire formats are target-independent byte contracts. Exercise them
     // on every host even when the selected application backend is not Linux.
@@ -281,7 +319,13 @@ fn validateCombination(platform: Platform, renderer: Renderer) void {
     if (!valid) @panic("invalid ZigUI platform and renderer combination");
 }
 
-fn linkPlatform(module: *std.Build.Module, platform: Platform, enable_media: bool) void {
+fn linkPlatform(
+    b: *std.Build,
+    module: *std.Build.Module,
+    platform: Platform,
+    enable_media: bool,
+    enable_images: bool,
+) void {
     switch (platform) {
         .auto => unreachable,
         .headless => {},
@@ -289,15 +333,24 @@ fn linkPlatform(module: *std.Build.Module, platform: Platform, enable_media: boo
             module.linkFramework("AppKit", .{});
             module.linkFramework("CoreFoundation", .{});
             module.linkFramework("CoreGraphics", .{});
+            module.linkFramework("CoreImage", .{});
             module.linkFramework("CoreVideo", .{});
             module.linkFramework("Foundation", .{});
+            module.linkFramework("LinkPresentation", .{});
+            // ImageIO is used only by the optional macOS WebP image provider.
+            // Other targets keep the in-tree image contract and report
+            // `Unsupported` for WebP rather than linking a hidden codec.
+            if (enable_images) module.linkFramework("ImageIO", .{});
             module.linkFramework("Metal", .{});
+            module.linkFramework("PDFKit", .{});
             module.linkFramework("QuartzCore", .{});
             if (enable_media) {
                 module.linkFramework("AVFoundation", .{});
                 module.linkFramework("CoreMedia", .{});
             }
             module.linkSystemLibrary("objc", .{});
+            module.addCSourceFile(.{ .file = b.path("src/platform/macos/promise_bridge.m"), .flags = &.{"-fblocks"} });
+            module.addCSourceFile(.{ .file = b.path("src/platform/macos/page_capture_bridge.m"), .flags = &.{"-fblocks"} });
         },
         .windows => {
             inline for (&.{

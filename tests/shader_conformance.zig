@@ -41,6 +41,8 @@ test "native shader sources expose every renderer entry point" {
     }
     try testing.expect(std.mem.indexOf(u8, metal_source, "present_vertex") != null);
     try testing.expect(std.mem.indexOf(u8, metal_source, "present_fragment") != null);
+    for ([_][]const u8{ "backdrop_vertex", "backdrop_fragment" }) |entry|
+        try testing.expect(std.mem.indexOf(u8, metal_source, entry) != null);
     try testing.expect(std.mem.indexOf(u8, hlsl_source, "vertex_id == 1 || vertex_id == 3") != null);
 }
 
@@ -121,6 +123,7 @@ test "native shader record declarations match the fixed Zig scene ABI" {
     try testing.expectEqual(@as(usize, 64), @sizeOf(ui.scene_abi.Sprite));
     try testing.expectEqual(@as(usize, 56), @sizeOf(ui.scene_abi.ExternalSurface));
     try testing.expectEqual(@as(usize, 40), @sizeOf(ui.scene_abi.CustomPass));
+    try testing.expectEqual(@as(usize, 44), @sizeOf(ui.scene_abi.BackdropEffect));
 
     const declarations = [_][]const u8{
         "structQuad{Rectbounds;Colorbackground;Colorborder_color;Insetsborder_widths;Radiiradii;};",
@@ -145,6 +148,11 @@ test "native shader record declarations match the fixed Zig scene ABI" {
     const normalized_hlsl = try normalize(testing.allocator, hlsl_source);
     defer testing.allocator.free(normalized_hlsl);
     for (declarations) |declaration| try testing.expect(std.mem.indexOf(u8, normalized_metal, declaration) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        normalized_metal,
+        "structBackdropComposite{Rectbounds;Radiiradii;Pointcapture_origin;Sizecapture_size;floatblur_radius;floatsaturation;floatopacity;};",
+    ) != null);
     for (hlsl_declarations) |declaration| try testing.expect(std.mem.indexOf(u8, normalized_hlsl, declaration) != null);
 }
 

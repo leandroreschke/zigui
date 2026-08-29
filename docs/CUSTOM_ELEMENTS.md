@@ -89,6 +89,19 @@ every native resource it creates. Each encode callback receives the exact
 bounded payload and flags emitted by `PaintContext.gpuPass`; neither value is
 interpreted or discarded by the renderer.
 
+Extensions that need correct 3D occlusion may declare
+`descriptor.requirements.depth = .{}`. On a supporting backend, ZigUI ends the
+ordinary UI encoder, starts an isolated color-load pass with a framework-owned
+depth attachment cleared to the requested finite `[0, 1]` value, and exposes
+that borrowed attachment through `Pass.metal.depth`. The extension still owns
+its pipeline and depth-stencil state; it must configure the pipeline for
+`DepthFormat.depth32_float` and must not retain or release the texture. The
+depth buffer is cleared independently for each extension encode, so native
+extensions cannot leak depth state into one another or ordinary UI painting.
+Backends that do not yet implement this capability reject registration with
+`error.Unsupported`; applications should surface that capability boundary
+instead of silently substituting a different renderer.
+
 ## Performance rules
 
 - Keep model/context pointers stable; do not allocate a new callback object per

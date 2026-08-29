@@ -40,6 +40,20 @@ const Composite = extern struct {
     reserved: [3]f32 = .{ 0, 0, 0 },
 };
 
+const BackdropComposite = extern struct {
+    bounds: geometry.Rect,
+    radii: geometry.CornerRadii,
+    capture_origin: geometry.Point,
+    capture_size: geometry.Size,
+    blur_radius: f32,
+    saturation: f32,
+    opacity: f32 = 1,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(BackdropComposite) == 60);
+}
+
 const ResolvedClip = extern struct {
     bounds: geometry.Rect,
     radii: geometry.CornerRadii,
@@ -61,6 +75,24 @@ const InFlight = struct {
     slot: usize,
 };
 
+const AsyncOffscreenRequest = struct {
+    id: api.OffscreenRequestId,
+    target: api.OffscreenTarget,
+    snapshot: api.SceneSnapshot,
+    /// Async submissions own their transient upload and layer resources so
+    /// they cannot consume the presentation frame slots or stall a window.
+    frame: FrameResources,
+    command_buffer: objc.Id,
+    texture: objc.Id,
+    read_buffer: objc.Id,
+    gpu_stride: usize,
+    /// Retains every texture/surface referenced by the copied scene until the
+    /// command buffer has reached a terminal state. The application may drop
+    /// its resource handle immediately after beginOffscreen returns.
+    retained_resources: std.ArrayList(objc.Id) = .empty,
+    cancelled: bool = false,
+};
+
 const RetiredTexture = struct {
     texture: objc.Id,
     release_after: api.SubmissionEpoch,
@@ -73,6 +105,7 @@ const LayerTarget = struct {
     texture: objc.Id = null,
     width: u32 = 0,
     height: u32 = 0,
+    pixel_format: usize = 0,
 
     fn deinit(self: *LayerTarget) void {
         release(self.texture);
@@ -119,6 +152,7 @@ const FrameResources = struct {
     clips: UploadBuffer = .{},
     layer_targets: std.ArrayList(LayerTarget) = .empty,
     backdrop_targets: std.ArrayList(LayerTarget) = .empty,
+    extension_depth_targets: std.ArrayList(LayerTarget) = .empty,
     busy_epoch: api.SubmissionEpoch = 0,
 
     fn acquireLayerTarget(
@@ -129,7 +163,7 @@ const FrameResources = struct {
         width: u32,
         height: u32,
     ) Error!objc.Id {
-        return acquireTarget(&self.layer_targets, allocator, device, depth, width, height);
+        return acquireTarget(&self.layer_targets, allocator, device, depth, width, height, 81);
     }
 
     fn acquireBackdropTarget(
@@ -140,7 +174,18 @@ const FrameResources = struct {
         width: u32,
         height: u32,
     ) Error!objc.Id {
-        return acquireTarget(&self.backdrop_targets, allocator, device, depth, width, height);
+        return acquireTarget(&self.backdrop_targets, allocator, device, depth, width, height, 81);
+    }
+
+    fn acquireExtensionDepthTarget(
+        self: *FrameResources,
+        allocator: std.mem.Allocator,
+        device: objc.Id,
+        depth: usize,
+        width: u32,
+        height: u32,
+    ) Error!objc.Id {
+        return acquireTarget(&self.extension_depth_targets, allocator, device, depth, width, height, 252);
     }
 
     fn deinit(self: *FrameResources, allocator: std.mem.Allocator) void {
@@ -158,6 +203,8 @@ const FrameResources = struct {
         self.layer_targets.deinit(allocator);
         for (self.backdrop_targets.items) |*target| target.deinit();
         self.backdrop_targets.deinit(allocator);
+        for (self.extension_depth_targets.items) |*target| target.deinit();
+        self.extension_depth_targets.deinit(allocator);
         self.* = .{};
     }
 };
@@ -169,19 +216,20 @@ fn acquireTarget(
     index: usize,
     width: u32,
     height: u32,
+    pixel_format: usize,
 ) Error!objc.Id {
     if (width == 0 or height == 0) return error.InvalidConfiguration;
     while (targets.items.len <= index) try targets.append(allocator, .{});
     const target = &targets.items[index];
-    if (target.texture != null and target.width == width and target.height == height) return target.texture;
+    if (target.texture != null and target.width == width and target.height == height and target.pixel_format == pixel_format) return target.texture;
     const descriptor = objc.send(objc.Id, objc.class("MTLTextureDescriptor"), "texture2DDescriptorWithPixelFormat:width:height:mipmapped:", .{
-        @as(usize, 81), @as(usize, width), @as(usize, height), false,
+        pixel_format, @as(usize, width), @as(usize, height), false,
     }) orelse return error.NoGpuDevice;
     objc.send(void, descriptor, "setUsage:", .{@as(usize, 5)});
     objc.send(void, descriptor, "setStorageMode:", .{@as(usize, 2)});
     const replacement = objc.send(objc.Id, device, "newTextureWithDescriptor:", .{descriptor}) orelse return error.BudgetExceeded;
     release(target.texture);
-    target.* = .{ .texture = replacement, .width = width, .height = height };
+    target.* = .{ .texture = replacement, .width = width, .height = height, .pixel_format = pixel_format };
     return replacement;
 }
 
@@ -193,11 +241,12 @@ const Pipelines = struct {
     color_sprite: objc.Id = null,
     path: objc.Id = null,
     external_surface: objc.Id = null,
+    backdrop: objc.Id = null,
     composite: objc.Id = null,
     present: objc.Id = null,
 
     fn deinit(self: *Pipelines) void {
-        inline for (.{ self.quad, self.shadow, self.underline, self.monochrome_sprite, self.color_sprite, self.path, self.external_surface, self.composite, self.present }) |pipeline| release(pipeline);
+        inline for (.{ self.quad, self.shadow, self.underline, self.monochrome_sprite, self.color_sprite, self.path, self.external_surface, self.backdrop, self.composite, self.present }) |pipeline| release(pipeline);
         self.* = .{};
     }
 };
@@ -225,6 +274,7 @@ const DeviceBounds = struct {
 };
 
 const EncodeTarget = struct { texture: objc.Id, bounds: DeviceBounds };
+const DepthEncodeTarget = struct { texture: objc.Id, clear_depth: f32 };
 const TargetState = struct { target: ?EncodeTarget, layer: u32, isolated: bool = false };
 
 pub const Renderer = struct {
@@ -254,6 +304,9 @@ pub const Renderer = struct {
     maximum_textures: usize,
     maximum_external_surfaces: usize,
     maximum_resources: usize,
+    maximum_offscreen_requests: usize,
+    next_offscreen_id: api.OffscreenRequestId = 1,
+    offscreen_requests: std.AutoHashMap(api.OffscreenRequestId, *AsyncOffscreenRequest),
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -296,6 +349,8 @@ pub const Renderer = struct {
             .maximum_textures = memory.texture_count,
             .maximum_external_surfaces = memory.external_surface_count,
             .maximum_resources = std.math.add(usize, memory.texture_count, memory.external_surface_count) catch return error.BudgetExceeded,
+            .maximum_offscreen_requests = memory.offscreen_request_count,
+            .offscreen_requests = std.AutoHashMap(api.OffscreenRequestId, *AsyncOffscreenRequest).init(allocator),
         };
         return .{ .context = self, .vtable = &vtable };
     }
@@ -306,6 +361,10 @@ pub const Renderer = struct {
         .begin_frame = beginFrame,
         .submit = submit,
         .render_offscreen = renderOffscreen,
+        .begin_offscreen = beginOffscreen,
+        .poll_offscreen = pollOffscreen,
+        .cancel_offscreen = cancelOffscreen,
+        .drain_offscreen = drainOffscreen,
         .completed_epoch = completedEpoch,
         .invalidate_surface = invalidateSurface,
         .recover = recover,
@@ -325,7 +384,7 @@ pub const Renderer = struct {
     }
 
     fn capabilities(_: *anyopaque) api.Capabilities {
-        return .{ .external_surfaces = true, .offscreen_readback = true, .custom_materials = true };
+        return .{ .external_surfaces = true, .offscreen_readback = true, .offscreen_async_readback = true, .custom_materials = true, .backdrop_effects = true };
     }
 
     fn deviceGeneration(context: *anyopaque) api.DeviceGeneration {
@@ -378,10 +437,10 @@ pub const Renderer = struct {
             .texture = root_texture,
             .bounds = .{ .left = 0, .top = 0, .width = active.descriptor.drawable_width, .height = active.descriptor.drawable_height },
         };
-        try self.encode(command_buffer, active.descriptor, view, active.slot, root, active.descriptor.clear_color, &self.pipelines);
+        try self.encode(command_buffer, active.descriptor, view, &self.frame_resources[active.slot], root, active.descriptor.clear_color, &self.pipelines);
         const drawable_texture = objc.send(objc.Id, active.drawable, "texture", .{}) orelse return error.SurfaceUnavailable;
         const drawable_target: EncodeTarget = .{ .texture = drawable_texture, .bounds = root.bounds };
-        const present_encoder = try beginRenderEncoder(command_buffer, drawable_target, .dont_care, null);
+        const present_encoder = try beginRenderEncoder(command_buffer, drawable_target, .dont_care, null, null);
         objc.send(void, present_encoder, "setRenderPipelineState:", .{self.pipelines.present});
         objc.send(void, present_encoder, "setFragmentTexture:atIndex:", .{ root.texture, @as(usize, 0) });
         objc.send(void, present_encoder, "drawPrimitives:vertexStart:vertexCount:", .{
@@ -404,12 +463,11 @@ pub const Renderer = struct {
         command_buffer: objc.Id,
         descriptor: api.FrameDescriptor,
         view: api.SceneView,
-        frame_slot: usize,
+        frame: *FrameResources,
         root: EncodeTarget,
         clear_color: geometry.Color,
         pipelines: *const Pipelines,
     ) Error!void {
-        const frame = &self.frame_resources[frame_slot];
         const dummy_material: scene_abi.Material = .{
             .kind = @backingInt(scene_abi.MaterialKind.none),
             .stop_start = 0,
@@ -459,7 +517,7 @@ pub const Renderer = struct {
         var targets: [65]TargetState = undefined;
         targets[0] = .{ .target = root, .layer = scene.none_index };
         var depth: usize = 0;
-        var encoder = try beginRenderEncoder(command_buffer, root, .clear, clear_color);
+        var encoder = try beginRenderEncoder(command_buffer, root, .clear, clear_color, null);
         var encoder_open = true;
         errdefer if (encoder_open) objc.send(void, encoder, "endEncoding", .{});
 
@@ -487,7 +545,7 @@ pub const Renderer = struct {
                     targets[depth].isolated = true;
                     objc.send(void, encoder, "endEncoding", .{});
                     encoder_open = false;
-                    encoder = try beginRenderEncoder(command_buffer, child, .clear, .transparent);
+                    encoder = try beginRenderEncoder(command_buffer, child, .clear, .transparent, null);
                     encoder_open = true;
                     continue;
                 },
@@ -517,6 +575,22 @@ pub const Renderer = struct {
             }
             const target = targets[depth].target orelse continue;
             if (operation.count == 0) continue;
+            if (kind == .backdrop_effect) {
+                const effect = view.backdrop_effects[operation.start];
+                try self.encodeBackdropEffect(
+                    command_buffer,
+                    descriptor,
+                    frame,
+                    depth,
+                    target,
+                    effect,
+                    operation,
+                    view,
+                    &encoder,
+                    &encoder_open,
+                );
+                continue;
+            }
             try setClip(encoder, descriptor, view, operation.clip, target.bounds);
             const logical_target = target.bounds.logical(descriptor.scale_factor);
             const globals: Globals = .{
@@ -531,9 +605,33 @@ pub const Renderer = struct {
             if (kind == .custom_passes) {
                 const clip_bounds = try resolvedClipRect(descriptor, view, operation.clip);
                 for (view.custom_passes[operation.start..][0..operation.count]) |pass| {
+                    const extension_id = extension.decodeId(pass.extension);
+                    const requirements = try self.extensions.requirements(extension_id);
+                    var depth_attachment: ?extension.DepthAttachment = null;
+                    if (requirements.depth) |request| {
+                        objc.send(void, encoder, "endEncoding", .{});
+                        encoder_open = false;
+                        const depth_texture = try frame.acquireExtensionDepthTarget(
+                            self.allocator,
+                            self.device,
+                            depth,
+                            target.bounds.width,
+                            target.bounds.height,
+                        );
+                        encoder = try beginRenderEncoder(command_buffer, target, .load, null, .{
+                            .texture = depth_texture,
+                            .clear_depth = request.clear_depth,
+                        });
+                        encoder_open = true;
+                        depth_attachment = .{
+                            .texture = pointerValue(depth_texture),
+                            .format = request.format,
+                        };
+                    }
+                    try setClip(encoder, descriptor, view, operation.clip, target.bounds);
                     const payload = view.custom_payload[@as(usize, pass.payload_start)..][0..pass.payload_length];
                     try self.extensions.encode(
-                        extension.decodeId(pass.extension),
+                        extension_id,
                         .{ .metal = .{
                             .device = pointerValue(self.device),
                             .command_queue = pointerValue(self.command_queue),
@@ -543,6 +641,7 @@ pub const Renderer = struct {
                             .command_buffer = pointerValue(command_buffer),
                             .render_encoder = pointerValue(encoder),
                             .target_texture = pointerValue(target.texture),
+                            .depth = depth_attachment,
                             .geometry = .{
                                 .window = descriptor.window,
                                 .logical_size = descriptor.logical_size,
@@ -564,6 +663,12 @@ pub const Renderer = struct {
                         self.generation,
                         self.submitted +| 1,
                     );
+                    if (requirements.depth != null) {
+                        objc.send(void, encoder, "endEncoding", .{});
+                        encoder_open = false;
+                        encoder = try beginRenderEncoder(command_buffer, target, .load, null, null);
+                        encoder_open = true;
+                    }
                 }
                 continue;
             }
@@ -655,7 +760,7 @@ pub const Renderer = struct {
         });
         objc.send(void, blit, "endEncoding", .{});
 
-        const encoder = try beginRenderEncoder(command_buffer, parent, .load, null);
+        const encoder = try beginRenderEncoder(command_buffer, parent, .load, null, null);
         errdefer objc.send(void, encoder, "endEncoding", .{});
         const logical_parent = parent.bounds.logical(descriptor.scale_factor);
         const logical_child = child.bounds.logical(descriptor.scale_factor);
@@ -680,6 +785,88 @@ pub const Renderer = struct {
             @as(usize, 4), @as(usize, 0), @as(usize, 4),
         });
         return encoder;
+    }
+
+    fn encodeBackdropEffect(
+        self: *Renderer,
+        command_buffer: objc.Id,
+        descriptor: api.FrameDescriptor,
+        frame: *FrameResources,
+        depth: usize,
+        target: EncodeTarget,
+        effect: scene_abi.BackdropEffect,
+        operation: scene_abi.Operation,
+        view: api.SceneView,
+        encoder: *objc.Id,
+        encoder_open: *bool,
+    ) Error!void {
+        const transform = layerTransform(view, operation.layer);
+        const world_bounds = transform.transformRectBounds(effect.bounds);
+        const capture_bounds = cropToTarget(
+            expandRect(world_bounds, effect.blur_radius * 2),
+            descriptor.scale_factor,
+            target.bounds,
+        ) orelse return;
+        const backdrop = try frame.acquireBackdropTarget(
+            self.allocator,
+            self.device,
+            depth,
+            capture_bounds.width,
+            capture_bounds.height,
+        );
+
+        objc.send(void, encoder.*, "endEncoding", .{});
+        encoder_open.* = false;
+        const blit = objc.send(objc.Id, command_buffer, "blitCommandEncoder", .{}) orelse return error.DeviceLost;
+        objc.send(void, blit, "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:", .{
+            target.texture,
+            @as(usize, 0),
+            @as(usize, 0),
+            Origin{
+                .x = capture_bounds.left - target.bounds.left,
+                .y = capture_bounds.top - target.bounds.top,
+                .z = 0,
+            },
+            Extent{ .width = capture_bounds.width, .height = capture_bounds.height, .depth = 1 },
+            backdrop,
+            @as(usize, 0),
+            @as(usize, 0),
+            Origin{ .x = 0, .y = 0, .z = 0 },
+        });
+        objc.send(void, blit, "endEncoding", .{});
+
+        encoder.* = try beginRenderEncoder(command_buffer, target, .load, null, null);
+        encoder_open.* = true;
+        try setClip(encoder.*, descriptor, view, operation.clip, target.bounds);
+        const logical_target = target.bounds.logical(descriptor.scale_factor);
+        const capture_logical = capture_bounds.logical(descriptor.scale_factor);
+        const globals: Globals = .{
+            .viewport = .{ logical_target.size.width, logical_target.size.height },
+            .viewport_origin = .{ logical_target.origin.x, logical_target.origin.y },
+            .transform = transform,
+            .material_index = scene.none_index,
+            .clip_index = operation.clip,
+            .opacity = 1,
+            .blend_mode = @backingInt(scene_abi.BlendMode.normal),
+        };
+        const item: BackdropComposite = .{
+            .bounds = effect.bounds,
+            .radii = effect.radii,
+            .capture_origin = capture_logical.origin,
+            .capture_size = capture_logical.size,
+            .blur_radius = effect.blur_radius * descriptor.scale_factor.value,
+            .saturation = effect.saturation,
+            .opacity = effect.opacity,
+        };
+        objc.send(void, encoder.*, "setRenderPipelineState:", .{self.pipelines.backdrop});
+        objc.send(void, encoder.*, "setVertexBytes:length:atIndex:", .{ &item, @as(usize, @sizeOf(BackdropComposite)), @as(usize, 0) });
+        objc.send(void, encoder.*, "setFragmentBytes:length:atIndex:", .{ &item, @as(usize, @sizeOf(BackdropComposite)), @as(usize, 0) });
+        objc.send(void, encoder.*, "setVertexBytes:length:atIndex:", .{ &globals, @as(usize, @sizeOf(Globals)), @as(usize, 10) });
+        objc.send(void, encoder.*, "setFragmentBytes:length:atIndex:", .{ &globals, @as(usize, @sizeOf(Globals)), @as(usize, 10) });
+        objc.send(void, encoder.*, "setFragmentTexture:atIndex:", .{ backdrop, @as(usize, 0) });
+        objc.send(void, encoder.*, "drawPrimitives:vertexStart:vertexCount:", .{
+            @as(usize, 4), @as(usize, 0), @as(usize, 4),
+        });
     }
 
     fn preparePaths(self: *Renderer, descriptor: api.FrameDescriptor, view: api.SceneView) Error!void {
@@ -760,7 +947,7 @@ pub const Renderer = struct {
             .texture = texture,
             .bounds = .{ .left = 0, .top = 0, .width = target.width, .height = target.height },
         };
-        try self.encode(command_buffer, descriptor, view, slot, root, .transparent, &self.pipelines);
+        try self.encode(command_buffer, descriptor, view, &self.frame_resources[slot], root, .transparent, &self.pipelines);
 
         var read_buffer: objc.Id = null;
         defer release(read_buffer);
@@ -795,6 +982,196 @@ pub const Renderer = struct {
         return try convertReadback(allocator, target, source, gpu_stride);
     }
 
+    fn beginOffscreen(
+        context: *anyopaque,
+        target: api.OffscreenTarget,
+        view: api.SceneView,
+    ) Error!api.OffscreenRequestId {
+        const self = cast(context);
+        if (!target.readback) return error.InvalidConfiguration;
+        if (self.active != null) return error.FrameActive;
+        if (self.offscreen_requests.count() >= self.maximum_offscreen_requests)
+            return error.BudgetExceeded;
+        try scene.validate(view);
+        try self.collect(false);
+        try self.offscreen_requests.ensureUnusedCapacity(1);
+
+        const request = try self.allocator.create(AsyncOffscreenRequest);
+        request.* = undefined;
+        request.id = self.nextOffscreenIdValue();
+        request.target = target;
+        request.frame = .{};
+        request.command_buffer = null;
+        request.texture = null;
+        request.read_buffer = null;
+        request.gpu_stride = 0;
+        request.retained_resources = .empty;
+        request.cancelled = false;
+        request.snapshot = .{ .allocator = self.allocator };
+        errdefer self.destroyOffscreenRequest(request);
+        request.snapshot = try api.SceneSnapshot.init(self.allocator, view);
+        try self.retainSceneResources(request, request.snapshot.view());
+
+        const texture_descriptor = objc.send(objc.Id, objc.class("MTLTextureDescriptor"), "texture2DDescriptorWithPixelFormat:width:height:mipmapped:", .{
+            @as(usize, 81), @as(usize, target.width), @as(usize, target.height), false,
+        }) orelse return error.NoGpuDevice;
+        objc.send(void, texture_descriptor, "setUsage:", .{@as(usize, 5)});
+        objc.send(void, texture_descriptor, "setStorageMode:", .{@as(usize, 2)});
+        request.texture = objc.send(objc.Id, self.device, "newTextureWithDescriptor:", .{texture_descriptor}) orelse return error.BudgetExceeded;
+        const command_buffer = objc.send(objc.Id, self.command_queue, "commandBuffer", .{}) orelse return error.DeviceLost;
+        request.command_buffer = retain(command_buffer);
+        const descriptor: api.FrameDescriptor = .{
+            .window = .invalid,
+            .logical_size = .{
+                .width = @as(f32, @floatFromInt(target.width)) / target.scale_factor.value,
+                .height = @as(f32, @floatFromInt(target.height)) / target.scale_factor.value,
+            },
+            .drawable_width = target.width,
+            .drawable_height = target.height,
+            .scale_factor = target.scale_factor,
+            .clear_color = .transparent,
+        };
+        const root: EncodeTarget = .{
+            .texture = request.texture,
+            .bounds = .{ .left = 0, .top = 0, .width = target.width, .height = target.height },
+        };
+        try self.encode(command_buffer, descriptor, request.snapshot.view(), &request.frame, root, .transparent, &self.pipelines);
+
+        const unaligned_stride = std.math.mul(usize, target.width, 4) catch return error.BudgetExceeded;
+        request.gpu_stride = (unaligned_stride + 255) & ~@as(usize, 255);
+        const length = std.math.mul(usize, request.gpu_stride, target.height) catch return error.BudgetExceeded;
+        request.read_buffer = objc.send(objc.Id, self.device, "newBufferWithLength:options:", .{ length, @as(usize, 0) }) orelse return error.BudgetExceeded;
+        const blit = objc.send(objc.Id, command_buffer, "blitCommandEncoder", .{}) orelse return error.DeviceLost;
+        objc.send(void, blit, "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:", .{
+            request.texture,
+            @as(usize, 0),
+            @as(usize, 0),
+            Origin{ .x = 0, .y = 0, .z = 0 },
+            Extent{ .width = target.width, .height = target.height, .depth = 1 },
+            request.read_buffer,
+            @as(usize, 0),
+            request.gpu_stride,
+            request.gpu_stride * @as(usize, target.height),
+        });
+        objc.send(void, blit, "endEncoding", .{});
+        objc.send(void, command_buffer, "commit", .{});
+        self.offscreen_requests.putAssumeCapacity(request.id, request);
+        return request.id;
+    }
+
+    fn retainSceneResources(self: *Renderer, request: *AsyncOffscreenRequest, view: api.SceneView) Error!void {
+        for (view.operations) |operation| {
+            const kind = std.enums.fromInt(scene_abi.OperationKind, operation.kind) orelse return error.InvalidScene;
+            switch (kind) {
+                .monochrome_sprites => for (view.monochrome_sprites[operation.start..][0..operation.count]) |sprite| {
+                    const source = self.textures.get(sprite.texture) orelse return error.InvalidHandle;
+                    const retained = retain(source);
+                    request.retained_resources.append(self.allocator, retained) catch |err| {
+                        release(retained);
+                        return err;
+                    };
+                },
+                .color_sprites => for (view.color_sprites[operation.start..][0..operation.count]) |sprite| {
+                    const source = self.textures.get(sprite.texture) orelse return error.InvalidHandle;
+                    const retained = retain(source);
+                    request.retained_resources.append(self.allocator, retained) catch |err| {
+                        release(retained);
+                        return err;
+                    };
+                },
+                .external_surfaces => for (view.external_surfaces[operation.start..][0..operation.count]) |surface_value| {
+                    const source = self.external_surfaces.get(surface_value.surface) orelse return error.InvalidHandle;
+                    const retained = retain(source);
+                    request.retained_resources.append(self.allocator, retained) catch |err| {
+                        release(retained);
+                        return err;
+                    };
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn pollOffscreen(
+        context: *anyopaque,
+        id: api.OffscreenRequestId,
+        allocator: std.mem.Allocator,
+    ) Error!api.OffscreenPoll {
+        const self = cast(context);
+        const request = self.offscreen_requests.get(id) orelse return error.InvalidHandle;
+        const status = objc.send(usize, request.command_buffer, "status", .{});
+        if (status < 4) return .pending;
+        if (request.cancelled or status == 6) {
+            self.finishOffscreenRequest(id, request);
+            return .cancelled;
+        }
+        if (status != 4) {
+            self.finishOffscreenRequest(id, request);
+            return .{ .failed = if (status == 5) error.DeviceLost else error.PlatformFailure };
+        }
+        const source_pointer = objc.send(?*anyopaque, request.read_buffer, "contents", .{}) orelse {
+            self.finishOffscreenRequest(id, request);
+            return .{ .failed = error.DeviceLost };
+        };
+        const source: [*]const u8 = @ptrCast(source_pointer);
+        const readback = convertReadback(allocator, request.target, source, request.gpu_stride) catch |err| {
+            self.finishOffscreenRequest(id, request);
+            return .{ .failed = err };
+        };
+        self.finishOffscreenRequest(id, request);
+        return .{ .ready = readback };
+    }
+
+    fn cancelOffscreen(context: *anyopaque, id: api.OffscreenRequestId) Error!void {
+        const request = cast(context).offscreen_requests.get(id) orelse return error.InvalidHandle;
+        request.cancelled = true;
+    }
+
+    fn drainOffscreen(context: *anyopaque) void {
+        const self = cast(context);
+        while (self.offscreen_requests.count() != 0) {
+            var iterator = self.offscreen_requests.iterator();
+            const entry = iterator.next().?;
+            const request = entry.value_ptr.*;
+            if (request.command_buffer) |command_buffer| objc.send(void, command_buffer, "waitUntilCompleted", .{});
+            self.finishOffscreenRequest(entry.key_ptr.*, request);
+        }
+    }
+
+    fn nextOffscreenIdValue(renderer: *Renderer) api.OffscreenRequestId {
+        var id = renderer.next_offscreen_id;
+        while (id == 0 or renderer.offscreen_requests.contains(id)) {
+            id +%= 1;
+            if (id == 0) id = 1;
+        }
+        renderer.next_offscreen_id = id +% 1;
+        if (renderer.next_offscreen_id == 0) renderer.next_offscreen_id = 1;
+        return id;
+    }
+
+    fn destroyOffscreenRequest(renderer: *Renderer, request: *AsyncOffscreenRequest) void {
+        if (request.command_buffer) |value| release(value);
+        if (request.read_buffer) |value| release(value);
+        if (request.texture) |value| release(value);
+        request.frame.deinit(renderer.allocator);
+        for (request.retained_resources.items) |value| release(value);
+        request.retained_resources.deinit(renderer.allocator);
+        request.snapshot.deinit();
+        renderer.allocator.destroy(request);
+    }
+
+    fn finishOffscreenRequest(renderer: *Renderer, id: api.OffscreenRequestId, request: *AsyncOffscreenRequest) void {
+        _ = renderer.offscreen_requests.remove(id);
+        request.frame.deinit(renderer.allocator);
+        for (request.retained_resources.items) |value| release(value);
+        request.retained_resources.deinit(renderer.allocator);
+        request.snapshot.deinit();
+        release(request.command_buffer);
+        release(request.read_buffer);
+        release(request.texture);
+        renderer.allocator.destroy(request);
+    }
+
     fn completedEpoch(context: *anyopaque) api.SubmissionEpoch {
         const self = cast(context);
         self.collect(false) catch {};
@@ -808,6 +1185,7 @@ pub const Renderer = struct {
     fn recover(context: *anyopaque, policy: config.GpuPolicy) Error!void {
         const self = cast(context);
         while (self.in_flight.items.len != 0) try self.waitOldest();
+        drainOffscreen(self);
         const next_device = MTLCreateSystemDefaultDevice() orelse return error.NoGpuDevice;
         errdefer release(next_device);
         const next_queue = objc.send(objc.Id, next_device, "newCommandQueue", .{}) orelse return error.NoGpuDevice;
@@ -961,6 +1339,7 @@ pub const Renderer = struct {
     fn deinit(context: *anyopaque) void {
         const self = cast(context);
         while (self.in_flight.items.len != 0) self.waitOldest() catch break;
+        drainOffscreen(self);
         self.pipelines.deinit();
         var iterator = self.textures.iterator();
         while (iterator.next()) |entry| release(entry.value_ptr.*);
@@ -971,6 +1350,7 @@ pub const Renderer = struct {
         self.external_surfaces.deinit();
         self.retired_textures.deinit(self.allocator);
         self.in_flight.deinit(self.allocator);
+        self.offscreen_requests.deinit();
         self.tessellator.deinit();
         self.path_vertices.deinit(self.allocator);
         self.path_draws.deinit(self.allocator);
@@ -1042,6 +1422,7 @@ fn createPipelines(device: objc.Id, library: objc.Id) Error!Pipelines {
     pipelines.color_sprite = try createPipeline(device, library, "sprite_vertex", "color_sprite_fragment", .source_over);
     pipelines.path = try createPipeline(device, library, "path_vertex", "path_fragment", .source_over);
     pipelines.external_surface = try createPipeline(device, library, "external_surface_vertex", "external_surface_fragment", .source_over);
+    pipelines.backdrop = try createPipeline(device, library, "backdrop_vertex", "backdrop_fragment", .replace);
     pipelines.composite = try createPipeline(device, library, "composite_vertex", "composite_fragment", .replace);
     pipelines.present = try createPipeline(device, library, "present_vertex", "present_fragment", .replace);
     return pipelines;
@@ -1085,6 +1466,7 @@ fn beginRenderEncoder(
     target: EncodeTarget,
     load_action: LoadAction,
     clear_color: ?geometry.Color,
+    depth_target: ?DepthEncodeTarget,
 ) Error!objc.Id {
     const pass = objc.send(objc.Id, objc.class("MTLRenderPassDescriptor"), "renderPassDescriptor", .{}) orelse return error.DeviceLost;
     const attachments = objc.send(objc.Id, pass, "colorAttachments", .{});
@@ -1100,6 +1482,13 @@ fn beginRenderEncoder(
             .blue = color.b,
             .alpha = color.a,
         }});
+    }
+    if (depth_target) |depth| {
+        const depth_attachment = objc.send(objc.Id, pass, "depthAttachment", .{});
+        objc.send(void, depth_attachment, "setTexture:", .{depth.texture});
+        objc.send(void, depth_attachment, "setLoadAction:", .{@backingInt(LoadAction.clear)});
+        objc.send(void, depth_attachment, "setStoreAction:", .{@as(usize, 0)});
+        objc.send(void, depth_attachment, "setClearDepth:", .{@as(f64, depth.clear_depth)});
     }
     const encoder = objc.send(objc.Id, command_buffer, "renderCommandEncoderWithDescriptor:", .{pass}) orelse return error.DeviceLost;
     objc.send(void, encoder, "setScissorRect:", .{ScissorRect{
@@ -1122,6 +1511,39 @@ fn cropLayerBounds(bounds: geometry.Rect, descriptor: api.FrameDescriptor) ?Devi
     bottom = @min(descriptor.drawable_height, bottom +| 1);
     if (right <= left or bottom <= top) return null;
     return .{ .left = left, .top = top, .width = right - left, .height = bottom - top };
+}
+
+fn cropToTarget(bounds: geometry.Rect, scale: geometry.ScaleFactor, target: DeviceBounds) ?DeviceBounds {
+    if (bounds.isEmpty()) return null;
+    const raw_left = @as(f64, bounds.minX()) * @as(f64, scale.value);
+    const raw_top = @as(f64, bounds.minY()) * @as(f64, scale.value);
+    const raw_right = @as(f64, bounds.maxX()) * @as(f64, scale.value);
+    const raw_bottom = @as(f64, bounds.maxY()) * @as(f64, scale.value);
+    if (!std.math.isFinite(raw_left) or !std.math.isFinite(raw_top) or
+        !std.math.isFinite(raw_right) or !std.math.isFinite(raw_bottom)) return null;
+    const target_left = @as(f64, @floatFromInt(target.left));
+    const target_top = @as(f64, @floatFromInt(target.top));
+    const target_right = @as(f64, @floatFromInt(target.right()));
+    const target_bottom = @as(f64, @floatFromInt(target.bottom()));
+    const left_value = @max(target_left, @min(target_right, raw_left));
+    const top_value = @max(target_top, @min(target_bottom, raw_top));
+    const right_value = @max(target_left, @min(target_right, raw_right));
+    const bottom_value = @max(target_top, @min(target_bottom, raw_bottom));
+    const left: u32 = @intFromFloat(@floor(left_value));
+    const top: u32 = @intFromFloat(@floor(top_value));
+    const right: u32 = @intFromFloat(@ceil(right_value));
+    const bottom: u32 = @intFromFloat(@ceil(bottom_value));
+    if (right <= left or bottom <= top) return null;
+    return .{ .left = left, .top = top, .width = right - left, .height = bottom - top };
+}
+
+fn expandRect(rect: geometry.Rect, amount: f32) geometry.Rect {
+    return geometry.Rect.fromXYWH(
+        rect.origin.x - amount,
+        rect.origin.y - amount,
+        rect.size.width + amount * 2,
+        rect.size.height + amount * 2,
+    );
 }
 
 fn clampedDeviceFloor(value: f32, scale: geometry.ScaleFactor, maximum: u32) u32 {

@@ -103,7 +103,12 @@ pub const Decoder = struct {
             self.offset += 1;
             switch (introducer) {
                 0x3b => {
-                    if (self.offset != self.bytes.len) return error.InvalidImage;
+                    // Some widely deployed encoders pad the completed stream
+                    // with zero bytes after the required trailer. Accept only
+                    // that inert padding; non-zero trailing payloads remain
+                    // rejected so malformed/polyglot data is not hidden.
+                    for (self.bytes[self.offset..]) |byte| if (byte != 0) return error.InvalidImage;
+                    self.offset = self.bytes.len;
                     self.finished = true;
                     return null;
                 },

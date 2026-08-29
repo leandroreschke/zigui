@@ -190,7 +190,7 @@ pub const Adapter = struct {
         for (tree.nodes) |node| {
             const element = state.elements.getPtr(node.id.encode()) orelse unreachable;
             const object = element.object;
-            objc.send(void, object, "setAccessibilityRole:", .{objc.nsString(roleName(node.role))});
+            objc.send(void, object, "setAccessibilityRole:", .{objc.nsString(roleName(node))});
             objc.send(void, object, "setAccessibilityLabel:", .{if (node.label.len == 0) @as(objc.Id, null) else objc.nsString(node.label)});
             objc.send(void, object, "setAccessibilityHelp:", .{if (node.description.len == 0) @as(objc.Id, null) else objc.nsString(node.description)});
             objc.send(void, object, "setAccessibilityFrame:", .{self.host.screenRect(tree.window, node.bounds)});
@@ -341,6 +341,7 @@ const methods = [_]Method{
     .{ .name = "accessibilityPerformShowMenu", .implementation = @ptrCast(&performShowMenu), .encoding = "B@:" },
     .{ .name = "setAccessibilityFocused:", .implementation = @ptrCast(&setFocused), .encoding = "v@:B" },
     .{ .name = "isAccessibilityFocused", .implementation = @ptrCast(&isFocused), .encoding = "B@:" },
+    .{ .name = "accessibilityIsAttributeSettable:", .implementation = @ptrCast(&isAttributeSettable), .encoding = "B@:@" },
     .{ .name = "setAccessibilityValue:", .implementation = @ptrCast(&setValue), .encoding = "v@:@" },
     .{ .name = "setAccessibilitySelectedTextRange:", .implementation = @ptrCast(&setSelectedTextRange), .encoding = "v@:{_NSRange=QQ}" },
 };
@@ -385,6 +386,23 @@ pub fn focusedElement(raw: *anyopaque, id: handles.WindowId) objc.Id {
     return cast(raw).focusedElement(id);
 }
 
+fn isAttributeSettable(object: objc.Id, _: objc.Sel, attribute: objc.Id) callconv(.c) bool {
+    const self = elementAdapter(object) orelse return false;
+    const window = objc.getIvar(u64, object, "_ziguiWindow") orelse return false;
+    const semantic = objc.getIvar(u64, object, "_ziguiSemantic") orelse return false;
+    const state = self.windows.getPtr(window) orelse return false;
+    const element = state.elements.getPtr(semantic) orelse return false;
+    const name = if (attribute == null) "" else objc.utf8(attribute);
+    if (attributeSettableForActions(element.actions, name)) |settable| return settable;
+    return objc.sendSuper(
+        bool,
+        object,
+        objc.class_getSuperclass(objc.object_getClass(object)),
+        "accessibilityIsAttributeSettable:",
+        .{attribute},
+    );
+}
+
 fn setValue(object: objc.Id, _: objc.Sel, value: objc.Id) callconv(.c) void {
     const self = elementAdapter(object) orelse return;
     if (self.updating) {
@@ -410,6 +428,16 @@ fn actionMask(actions: []const api.Action) u32 {
     return result;
 }
 
+fn attributeSettableForActions(actions: u32, attribute: []const u8) ?bool {
+    if (std.mem.eql(u8, attribute, "AXValue"))
+        return actions & (@as(u32, 1) << @backingInt(api.Action.set_value)) != 0;
+    if (std.mem.eql(u8, attribute, "AXSelectedTextRange"))
+        return actions & (@as(u32, 1) << @backingInt(api.Action.set_selection)) != 0;
+    if (std.mem.eql(u8, attribute, "AXFocused"))
+        return actions & ((@as(u32, 1) << @backingInt(api.Action.focus)) | (@as(u32, 1) << @backingInt(api.Action.blur))) != 0;
+    return null;
+}
+
 fn nodeHash(node: api.Node) u64 {
     var hash = std.hash.Wyhash.init(0x61783131795f6e6f);
     hash.update(node.label);
@@ -425,8 +453,9 @@ fn nodeHash(node: api.Node) u64 {
     return hash.final();
 }
 
-fn roleName(role: api.Role) []const u8 {
-    return switch (role) {
+fn roleName(node: api.Node) []const u8 {
+    if (node.role == .text_field and node.multiline) return "AXTextArea";
+    return switch (node.role) {
         .none, .group => "AXGroup",
         .application => "AXApplication",
         .window => "AXWindow",
@@ -464,6 +493,21 @@ fn roleName(role: api.Role) []const u8 {
         .scroll_view => "AXScrollArea",
         .canvas => "AXGroup",
     };
+}
+
+test "multiline text fields use the native text area role" {
+    try std.testing.expectEqualStrings("AXTextField", roleName(.{ .role = .text_field }));
+    try std.testing.expectEqualStrings("AXTextArea", roleName(.{ .role = .text_field, .multiline = true }));
+    try std.testing.expectEqualStrings("AXSearchField", roleName(.{ .role = .search_field, .multiline = true }));
+}
+
+test "editable accessibility attributes follow semantic actions" {
+    const actions = actionMask(&.{ .focus, .blur, .set_value, .set_selection });
+    try std.testing.expectEqual(true, attributeSettableForActions(actions, "AXValue").?);
+    try std.testing.expectEqual(true, attributeSettableForActions(actions, "AXSelectedTextRange").?);
+    try std.testing.expectEqual(true, attributeSettableForActions(actions, "AXFocused").?);
+    try std.testing.expectEqual(false, attributeSettableForActions(0, "AXValue").?);
+    try std.testing.expect(attributeSettableForActions(actions, "AXChildren") == null);
 }
 
 fn decodeHandle(comptime T: type, encoded: u64) T {

@@ -3,6 +3,8 @@ const config = @import("../core/config.zig");
 const Error = @import("../core/error.zig").Error;
 const geometry = @import("../core/geometry.zig");
 const handles = @import("../core/handle.zig");
+const extension = @import("extension.zig");
+const scene_abi = @import("../scene/abi.zig");
 
 pub const SubmissionEpoch = u64;
 pub const DeviceGeneration = u32;
@@ -11,11 +13,12 @@ pub const Capabilities = packed struct {
     subpixel_text: bool = false,
     external_surfaces: bool = false,
     offscreen_readback: bool = false,
+    offscreen_async_readback: bool = false,
     wide_color: bool = false,
     hdr: bool = false,
     timestamp_queries: bool = false,
     custom_materials: bool = false,
-    _padding: u1 = 0,
+    backdrop_effects: bool = false,
 };
 
 pub const SurfaceState = enum {
@@ -60,6 +63,22 @@ pub const OffscreenTarget = struct {
     scale_factor: geometry.ScaleFactor,
     format: PixelFormat = .bgra8_srgb,
     readback: bool = true,
+};
+
+/// Stable identity for an asynchronous offscreen submission. IDs are owned
+/// by one Renderer and are never reused while a request is live.
+pub const OffscreenRequestId = u64;
+
+/// A non-blocking result from an asynchronous offscreen request. `ready` is
+/// the sole owner of the returned pixel bytes; callers must deinitialize it
+/// with the allocator passed to `Renderer.pollOffscreen`. Terminal results
+/// are consumed exactly once, so polling an already-consumed request returns
+/// `error.InvalidHandle`.
+pub const OffscreenPoll = union(enum) {
+    pending,
+    ready: Readback,
+    failed: Error,
+    cancelled,
 };
 
 pub const PixelFormat = enum { a8, rgba8, rgba8_srgb, bgra8, bgra8_srgb, rgba16_float };
@@ -144,22 +163,116 @@ pub const Readback = struct {
     }
 };
 
+/// Owned copy of every borrowed slice in a SceneView. Backends use this at
+/// asynchronous submission boundaries so a caller may rebuild or destroy its
+/// Scene immediately after `beginOffscreen` returns.
+pub const SceneSnapshot = struct {
+    allocator: std.mem.Allocator,
+    operations: []scene_abi.Operation = &.{},
+    materials: []scene_abi.Material = &.{},
+    gradient_stops: []scene_abi.GradientStop = &.{},
+    clips: []scene_abi.Clip = &.{},
+    layers: []scene_abi.Layer = &.{},
+    shadows: []scene_abi.Shadow = &.{},
+    quads: []scene_abi.Quad = &.{},
+    paths: []scene_abi.Path = &.{},
+    path_vertices: []scene_abi.PathVertex = &.{},
+    underlines: []scene_abi.Underline = &.{},
+    monochrome_sprites: []scene_abi.Sprite = &.{},
+    color_sprites: []scene_abi.Sprite = &.{},
+    external_surfaces: []scene_abi.ExternalSurface = &.{},
+    custom_passes: []scene_abi.CustomPass = &.{},
+    custom_payload: []u8 = &.{},
+    backdrop_effects: []scene_abi.BackdropEffect = &.{},
+
+    pub fn init(allocator: std.mem.Allocator, source: SceneView) Error!SceneSnapshot {
+        var snapshot: SceneSnapshot = .{ .allocator = allocator };
+        errdefer snapshot.deinit();
+        snapshot.operations = try allocator.dupe(scene_abi.Operation, source.operations);
+        snapshot.materials = try allocator.dupe(scene_abi.Material, source.materials);
+        snapshot.gradient_stops = try allocator.dupe(scene_abi.GradientStop, source.gradient_stops);
+        snapshot.clips = try allocator.dupe(scene_abi.Clip, source.clips);
+        snapshot.layers = try allocator.dupe(scene_abi.Layer, source.layers);
+        snapshot.shadows = try allocator.dupe(scene_abi.Shadow, source.shadows);
+        snapshot.quads = try allocator.dupe(scene_abi.Quad, source.quads);
+        snapshot.paths = try allocator.dupe(scene_abi.Path, source.paths);
+        snapshot.path_vertices = try allocator.dupe(scene_abi.PathVertex, source.path_vertices);
+        snapshot.underlines = try allocator.dupe(scene_abi.Underline, source.underlines);
+        snapshot.monochrome_sprites = try allocator.dupe(scene_abi.Sprite, source.monochrome_sprites);
+        snapshot.color_sprites = try allocator.dupe(scene_abi.Sprite, source.color_sprites);
+        snapshot.external_surfaces = try allocator.dupe(scene_abi.ExternalSurface, source.external_surfaces);
+        snapshot.custom_passes = try allocator.dupe(scene_abi.CustomPass, source.custom_passes);
+        snapshot.custom_payload = try allocator.dupe(u8, source.custom_payload);
+        snapshot.backdrop_effects = try allocator.dupe(scene_abi.BackdropEffect, source.backdrop_effects);
+        return snapshot;
+    }
+
+    pub fn view(self: *const SceneSnapshot) SceneView {
+        return .{
+            .operations = self.operations,
+            .materials = self.materials,
+            .gradient_stops = self.gradient_stops,
+            .clips = self.clips,
+            .layers = self.layers,
+            .shadows = self.shadows,
+            .quads = self.quads,
+            .paths = self.paths,
+            .path_vertices = self.path_vertices,
+            .underlines = self.underlines,
+            .monochrome_sprites = self.monochrome_sprites,
+            .color_sprites = self.color_sprites,
+            .external_surfaces = self.external_surfaces,
+            .custom_passes = self.custom_passes,
+            .custom_payload = self.custom_payload,
+            .backdrop_effects = self.backdrop_effects,
+        };
+    }
+
+    pub fn deinit(self: *SceneSnapshot) void {
+        self.allocator.free(self.operations);
+        self.allocator.free(self.materials);
+        self.allocator.free(self.gradient_stops);
+        self.allocator.free(self.clips);
+        self.allocator.free(self.layers);
+        self.allocator.free(self.shadows);
+        self.allocator.free(self.quads);
+        self.allocator.free(self.paths);
+        self.allocator.free(self.path_vertices);
+        self.allocator.free(self.underlines);
+        self.allocator.free(self.monochrome_sprites);
+        self.allocator.free(self.color_sprites);
+        self.allocator.free(self.external_surfaces);
+        self.allocator.free(self.custom_passes);
+        self.allocator.free(self.custom_payload);
+        self.allocator.free(self.backdrop_effects);
+        self.* = undefined;
+    }
+};
+
 pub const SceneView = struct {
-    operations: []const @import("../scene/abi.zig").Operation,
-    materials: []const @import("../scene/abi.zig").Material,
-    gradient_stops: []const @import("../scene/abi.zig").GradientStop,
-    clips: []const @import("../scene/abi.zig").Clip,
-    layers: []const @import("../scene/abi.zig").Layer,
-    shadows: []const @import("../scene/abi.zig").Shadow,
-    quads: []const @import("../scene/abi.zig").Quad,
-    paths: []const @import("../scene/abi.zig").Path,
-    path_vertices: []const @import("../scene/abi.zig").PathVertex,
-    underlines: []const @import("../scene/abi.zig").Underline,
-    monochrome_sprites: []const @import("../scene/abi.zig").Sprite,
-    color_sprites: []const @import("../scene/abi.zig").Sprite,
-    external_surfaces: []const @import("../scene/abi.zig").ExternalSurface,
-    custom_passes: []const @import("../scene/abi.zig").CustomPass,
+    operations: []const scene_abi.Operation,
+    materials: []const scene_abi.Material,
+    gradient_stops: []const scene_abi.GradientStop,
+    clips: []const scene_abi.Clip,
+    layers: []const scene_abi.Layer,
+    shadows: []const scene_abi.Shadow,
+    quads: []const scene_abi.Quad,
+    paths: []const scene_abi.Path,
+    path_vertices: []const scene_abi.PathVertex,
+    underlines: []const scene_abi.Underline,
+    monochrome_sprites: []const scene_abi.Sprite,
+    color_sprites: []const scene_abi.Sprite,
+    external_surfaces: []const scene_abi.ExternalSurface,
+    custom_passes: []const scene_abi.CustomPass,
     custom_payload: []const u8,
+    backdrop_effects: []const scene_abi.BackdropEffect = &.{},
+
+    pub fn requiresBackdropEffects(self: SceneView) bool {
+        for (self.operations) |operation| {
+            if (operation.kind == @backingInt(@import("../scene/abi.zig").OperationKind.backdrop_effect)) return true;
+        }
+        return false;
+    }
 };
 
 /// Computes the bytes uploaded by the structured-buffer backends after path
@@ -192,6 +305,13 @@ pub const Renderer = struct {
         begin_frame: *const fn (*anyopaque, FrameDescriptor) Error!FrameToken,
         submit: *const fn (*anyopaque, FrameToken, SceneView) Error!Submission,
         render_offscreen: *const fn (*anyopaque, OffscreenTarget, SceneView, std.mem.Allocator) Error!?Readback,
+        /// Optional non-blocking offscreen path. Backends that do not provide
+        /// asynchronous GPU readback leave these hooks null and the public
+        /// methods return `error.Unsupported`.
+        begin_offscreen: ?*const fn (*anyopaque, OffscreenTarget, SceneView) Error!OffscreenRequestId = null,
+        poll_offscreen: ?*const fn (*anyopaque, OffscreenRequestId, std.mem.Allocator) Error!OffscreenPoll = null,
+        cancel_offscreen: ?*const fn (*anyopaque, OffscreenRequestId) Error!void = null,
+        drain_offscreen: ?*const fn (*anyopaque) void = null,
         completed_epoch: *const fn (*anyopaque) SubmissionEpoch,
         invalidate_surface: *const fn (*anyopaque, handles.WindowId) Error!void,
         recover: *const fn (*anyopaque, config.GpuPolicy) Error!void,
@@ -224,6 +344,7 @@ pub const Renderer = struct {
 
     pub fn submit(self: Renderer, token: FrameToken, scene: SceneView) Error!Submission {
         if (token.value == 0 or token.device_generation == 0) return error.InvalidHandle;
+        if (scene.requiresBackdropEffects() and !self.capabilities().backdrop_effects) return error.Unsupported;
         const result = try self.vtable.submit(self.context, token, scene);
         if (result.epoch == 0 or result.device_generation == 0 or
             result.device_generation != token.device_generation) return error.PlatformFailure;
@@ -237,6 +358,7 @@ pub const Renderer = struct {
         allocator: std.mem.Allocator,
     ) Error!?Readback {
         try validateOffscreenTarget(target);
+        if (scene.requiresBackdropEffects() and !self.capabilities().backdrop_effects) return error.Unsupported;
         var result = try self.vtable.render_offscreen(self.context, target, scene, allocator);
         if (target.readback and result == null) return error.PlatformFailure;
         if (result) |*readback| validateReadback(target, readback.*) catch |err| {
@@ -244,6 +366,49 @@ pub const Renderer = struct {
             return err;
         };
         return result;
+    }
+
+    /// Begins a bounded asynchronous offscreen render. The backend must copy
+    /// every borrowed SceneView slice before returning; after this call the
+    /// caller may rebuild or destroy the source Scene immediately. No GPU
+    /// completion wait is permitted on this path.
+    pub fn beginOffscreen(self: Renderer, target: OffscreenTarget, scene: SceneView) Error!OffscreenRequestId {
+        try validateOffscreenTarget(target);
+        if (!target.readback) return error.InvalidConfiguration;
+        if (scene.requiresBackdropEffects() and !self.capabilities().backdrop_effects) return error.Unsupported;
+        if (!self.capabilities().offscreen_async_readback) return error.Unsupported;
+        const begin = self.vtable.begin_offscreen orelse return error.Unsupported;
+        const id = try begin(self.context, target, scene);
+        if (id == 0) return error.PlatformFailure;
+        return id;
+    }
+
+    /// Polls one asynchronous request without waiting for the GPU. A terminal
+    /// result consumes the request exactly once; `ready` owns its returned
+    /// pixels and must be deinitialized by the caller.
+    pub fn pollOffscreen(
+        self: Renderer,
+        id: OffscreenRequestId,
+        allocator: std.mem.Allocator,
+    ) Error!OffscreenPoll {
+        if (id == 0) return error.InvalidHandle;
+        const poll = self.vtable.poll_offscreen orelse return error.Unsupported;
+        return poll(self.context, id, allocator);
+    }
+
+    /// Requests cancellation without waiting. A cancelled request remains
+    /// owned by the backend until its GPU submission reaches a terminal state.
+    pub fn cancelOffscreen(self: Renderer, id: OffscreenRequestId) Error!void {
+        if (id == 0) return error.InvalidHandle;
+        const cancel = self.vtable.cancel_offscreen orelse return error.Unsupported;
+        return cancel(self.context, id);
+    }
+
+    /// Teardown-only drain. Implementations may wait for GPU work here; this
+    /// method is never used by the frame path and exists to establish that no
+    /// request retains backend resources before renderer destruction.
+    pub fn drainOffscreen(self: Renderer) void {
+        if (self.vtable.drain_offscreen) |drain| drain(self.context);
     }
 
     pub fn completedEpoch(self: Renderer) SubmissionEpoch {
@@ -310,8 +475,9 @@ pub const Renderer = struct {
         try self.vtable.destroy_external_surface(self.context, id, release_after);
     }
 
-    pub fn registerExtension(self: Renderer, descriptor: @import("extension.zig").Descriptor) Error!handles.RenderExtensionId {
+    pub fn registerExtension(self: Renderer, descriptor: extension.Descriptor) Error!handles.RenderExtensionId {
         if (!validLabel(descriptor.label)) return error.InvalidConfiguration;
+        try extension.validateRequirements(descriptor.requirements);
         const result = try self.vtable.register_extension(self.context, descriptor);
         if (!result.isValid()) return error.PlatformFailure;
         return result;

@@ -9,12 +9,17 @@ const action = @import("action.zig");
 const focus = @import("focus.zig");
 const hit_tree = @import("hit_tree.zig");
 const coordinator_mod = @import("../runtime/coordinator.zig");
+const layout = @import("../layout/style.zig");
 
 pub const Result = struct {
     handled: bool = false,
     default_prevented: bool = false,
     target: handles.NodeId = .invalid,
     focus_changed: bool = false,
+    /// Explicit phase work requested by a handled custom element event.
+    /// App applies this to the owning component after dispatch completes.
+    narrow_dirty: ?layout.Dirty = null,
+    narrow_component: ?handles.ComponentId = null,
 };
 
 pub const CapturedFocusEndpoint = struct {
@@ -152,7 +157,7 @@ pub const Router = struct {
 
         switch (value.*) {
             .key_down => |key| if (!key.composing) {
-                if (self.actions.resolve(key, self.active_contexts.items)) |action_id| {
+                if (self.actions.resolveWithTextInput(key, self.active_contexts.items, self.textInputFocused(nodes))) |action_id| {
                     result.handled = try self.dispatchAction(nodes, coordinator, target, .{
                         .id = action_id,
                         .source = .keyboard,
@@ -181,17 +186,17 @@ pub const Router = struct {
             for (path[0 .. path.len - 1]) |node_id| {
                 state.current = node_id;
                 state.phase = .capture;
-                try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &state, value, .capture);
+                try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &state, value, .capture, &state.requested_autofocus_after_reconcile);
                 if (state.propagation_stopped) break;
             }
         }
         if (!state.propagation_stopped) {
             state.current = target;
             state.phase = .target;
-            try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, target, &state, value, .capture);
-            if (!state.propagation_stopped) try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, target, &state, value, .target);
-            if (!state.propagation_stopped) try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, target, &state, value, .bubble);
-            if (!state.propagation_stopped) try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, target, &state, value);
+            try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, target, &state, value, .capture, &state.requested_autofocus_after_reconcile);
+            if (!state.propagation_stopped) try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, target, &state, value, .target, &state.requested_autofocus_after_reconcile);
+            if (!state.propagation_stopped) try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, target, &state, value, .bubble, &state.requested_autofocus_after_reconcile);
+            if (!state.propagation_stopped) try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, target, &state, value, &state.requested_autofocus_after_reconcile);
         }
         if (!state.propagation_stopped and path.len > 1) {
             var index = path.len - 1;
@@ -199,7 +204,7 @@ pub const Router = struct {
                 index -= 1;
                 state.current = path[index];
                 state.phase = .bubble;
-                try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, path[index], &state, value, .bubble);
+                try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, path[index], &state, value, .bubble, &state.requested_autofocus_after_reconcile);
                 if (state.propagation_stopped) break;
             }
         }
@@ -235,6 +240,10 @@ pub const Router = struct {
         }
         result.handled = result.handled or state.handled;
         result.default_prevented = state.default_prevented;
+        if (state.requested_dirty) |dirty| {
+            result.narrow_dirty = dirty;
+            result.narrow_component = nodes.getConst(target).?.component;
+        }
         if (!focus_before.eql(self.focus_manager.focused)) {
             try self.sendFocusTransition(nodes, coordinator, focus_before, self.focus_manager.focused);
             result.focus_changed = true;
@@ -259,14 +268,26 @@ pub const Router = struct {
         while (current.isValid()) {
             const record = nodes.getConst(current) orelse break;
             dispatch_state.current = current;
-            var context = makeContext(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, current) orelse break;
+            var context = makeContext(
+                nodes,
+                self.hits,
+                coordinator,
+                self.window,
+                self.native_text_input,
+                self.native_clipboard,
+                current,
+                &dispatch_state.requested_autofocus_after_reconcile,
+            ) orelse break;
             for (record.action_handlers) |handler| {
                 if (!handler.action.eql(action_event.id) or action.contextSpecificity(handler.context, self.active_contexts.items) == null) continue;
                 try handler.callback(handler.callback_context, &dispatch_state, action_event, &context);
-                if (dispatch_state.propagation_stopped) return dispatch_state.handled;
+                if (dispatch_state.propagation_stopped) break;
             }
+            if (dispatch_state.propagation_stopped) break;
             current = record.parent;
         }
+        if (dispatch_state.requested_autofocus_after_reconcile)
+            self.focus_manager.requestAutofocusAfterReconcile();
         return dispatch_state.handled;
     }
 
@@ -320,8 +341,8 @@ pub const Router = struct {
         if (next.isValid()) {
             const value: event.Event = .focus_in;
             var state: event.Dispatch = .{ .window = self.window, .target = next, .current = next, .phase = .target };
-            try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, next, &state, &value, .bubble);
-            try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, next, &state, &value);
+            try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, next, &state, &value, .bubble, null);
+            try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, next, &state, &value, null);
         }
     }
 
@@ -394,8 +415,8 @@ pub const Router = struct {
                 .current = node_id,
                 .phase = .target,
             };
-            try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &dispatch_state, &synthetic, .bubble);
-            try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &dispatch_state, &synthetic);
+            try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &dispatch_state, &synthetic, .bubble, null);
+            try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &dispatch_state, &synthetic, null);
         }
         var enter_index = common;
         while (enter_index < next_path.len) : (enter_index += 1) {
@@ -407,8 +428,8 @@ pub const Router = struct {
                 .current = node_id,
                 .phase = .target,
             };
-            try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &dispatch_state, &synthetic, .bubble);
-            try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &dispatch_state, &synthetic);
+            try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &dispatch_state, &synthetic, .bubble, null);
+            try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &dispatch_state, &synthetic, null);
         }
         self.hover_path.clearRetainingCapacity();
         self.hover_path.appendSliceAssumeCapacity(next_path);
@@ -426,14 +447,14 @@ pub const Router = struct {
         if (previous.isValid()) {
             const value: event.Event = .focus_out;
             var state: event.Dispatch = .{ .window = self.window, .target = previous, .current = previous, .phase = .target };
-            try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, previous, &state, &value, .bubble);
-            try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, previous, &state, &value);
+            try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, previous, &state, &value, .bubble, null);
+            try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, previous, &state, &value, null);
         }
         if (next.isValid()) {
             const value: event.Event = .focus_in;
             var state: event.Dispatch = .{ .window = self.window, .target = next, .current = next, .phase = .target };
-            try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, next, &state, &value, .bubble);
-            try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, next, &state, &value);
+            try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, next, &state, &value, .bubble, null);
+            try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, next, &state, &value, null);
         }
     }
 
@@ -457,6 +478,12 @@ pub const Router = struct {
         fallback[0] = target;
         return fallback;
     }
+
+    fn textInputFocused(self: *const Router, nodes: *const compose_store.Store) bool {
+        const focused = self.focus_manager.focused;
+        const record = nodes.getConst(focused) orelse return false;
+        return record.semantics.role == .text_field or record.semantics.role == .search_field;
+    }
 };
 
 fn callHandlers(
@@ -470,9 +497,10 @@ fn callHandlers(
     state: *event.Dispatch,
     value: *const event.Event,
     phase: event.Phase,
+    autofocus_request: ?*bool,
 ) Error!void {
     const record = nodes.getConst(node_id) orelse return;
-    var context = makeContext(nodes, hits, coordinator, window, native_text_input, native_clipboard, node_id) orelse return;
+    var context = makeContext(nodes, hits, coordinator, window, native_text_input, native_clipboard, node_id, autofocus_request) orelse return;
     for (record.handlers) |handler| {
         if (handler.phase != phase) continue;
         try handler.callback(handler.context, state, value, &context);
@@ -490,9 +518,11 @@ fn callCustom(
     node_id: handles.NodeId,
     state: *event.Dispatch,
     value: *const event.Event,
+    autofocus_request: ?*bool,
 ) Error!void {
     const record = nodes.getConst(node_id) orelse return;
-    var context = makeContext(nodes, hits, coordinator, window, native_text_input, native_clipboard, node_id) orelse return;
+    var context = makeContext(nodes, hits, coordinator, window, native_text_input, native_clipboard, node_id, autofocus_request) orelse return;
+    context.custom_event_dirty = &state.requested_dirty;
     switch (record.kind) {
         .custom => |custom_node| if (custom_node.vtable.event) |callback| try callback(custom_node.context, state, value, &context),
         else => {},
@@ -507,6 +537,7 @@ fn makeContext(
     native_text_input: ?event.NativeTextInput,
     native_clipboard: ?event.NativeClipboard,
     node_id: handles.NodeId,
+    autofocus_request: ?*bool,
 ) ?event.Context {
     const record = nodes.getConst(node_id) orelse return null;
     const visual = hits.visualEntry(node_id);
@@ -522,6 +553,7 @@ fn makeContext(
         .world_to_local = if (visual) |entry| entry.inverse_transform else .identity,
         .native_text_input = native_text_input,
         .native_clipboard = native_clipboard,
+        .autofocus_request = autofocus_request,
     };
 }
 

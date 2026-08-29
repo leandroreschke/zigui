@@ -28,7 +28,7 @@ pub const Toggle = struct {
         children[0] = if (self.kind == .checkbox) try self.checkbox(ctx) else try self.switchControl(ctx);
         children[1] = .{
             .kind = .{ .text = self.label },
-            .style = .{ .text = .{ .font_size = self.theme.font_size, .color = self.theme.text } },
+            .style = .{ .text = .{ .font_families = self.theme.font_families, .font_size = self.theme.font_size, .color = self.theme.text } },
         };
         const handlers = try ctx.allocator.alloc(input.Handler, 1);
         handlers[0] = .{ .context = self, .callback = handle };

@@ -53,7 +53,7 @@ pub const Tabs = struct {
             const actions = try ctx.allocator.dupe(a11y.Action, available_actions);
             const label_children = try ctx.allocator.dupe(node.Spec, &.{node.Spec{
                 .kind = .{ .text = label },
-                .style = .{ .text = .{ .font_size = self.theme.font_size, .color = if (selected) self.theme.text else self.theme.muted_text } },
+                .style = .{ .text = .{ .font_families = self.theme.font_families, .font_size = self.theme.font_size, .color = if (selected) self.theme.text else self.theme.muted_text } },
             }});
             tab_nodes[index] = .{
                 .key = @intCast(index + 1),

@@ -9,8 +9,9 @@ const custom = @import("../compose/custom.zig");
 /// do not participate in ZigUI clipping or transforms.
 pub const NativeMediaView = struct {
     id: handles.NativeMediaId,
+    visible: bool = true,
 
     pub fn paint(self: *NativeMediaView, context: *custom.PaintContext, bounds: geometry.Rect) Error!void {
-        try context.nativeMedia(self.id, bounds);
+        try context.nativeMediaWithVisibility(self.id, bounds, self.visible);
     }
 };

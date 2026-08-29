@@ -19,11 +19,14 @@ is stored in the source tree.
   in this repository.
 
 Examples include AppKit window/input contracts, Metal, Win32 window/input
-contracts, D3D11, UI Automation, native IME contracts, and the native Vulkan
-loader ABI opened through `std.DynLib` with dynamically resolved driver
-dispatch. Native APIs are boundary contracts, not alternate engines:
-ZigUI still owns layout, Unicode processing, OpenType shaping, font fallback,
-glyph rasterization, image decoding, SVG, and scene generation on every target.
+contracts, D3D11, UI Automation, native IME contracts, ImageIO's bounded
+macOS WebP image provider, and the native Vulkan loader ABI opened through
+`std.DynLib` with dynamically resolved driver dispatch. Native APIs are
+boundary contracts, not alternate engines: ZigUI still owns layout, Unicode
+processing, OpenType shaping, font fallback, glyph rasterization, the in-tree
+image decoders, SVG, and scene generation on every target; a documented native
+format provider may be used only where the target contract explicitly exposes
+that capability.
 
 ## Not permitted
 
@@ -45,7 +48,8 @@ ZigUI implements and tests its own:
   rasterization, and supported color-font formats on Linux;
 - Wayland, X11, keyboard, clipboard, drag/drop, D-Bus, and AT-SPI protocols;
 - Vulkan loading and dispatch;
-- enabled image and SVG decoders;
+- enabled in-tree image and SVG decoders, plus the explicitly documented
+  macOS ImageIO WebP provider;
 - deterministic headless and testing infrastructure.
 
 Apple and Windows font directories are discovered through narrow native

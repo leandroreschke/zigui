@@ -56,11 +56,11 @@ pub const Select = struct {
         const button_children = try ctx.allocator.alloc(node.Spec, 2 + 2 * @as(usize, @intFromBool(self.open)));
         button_children[0] = .{
             .kind = .{ .text = selected_label },
-            .style = .{ .layout = .{ .flex_grow = 1 }, .text = .{ .font_size = self.theme.font_size, .color = if (selected_valid) self.theme.text else self.theme.muted_text } },
+            .style = .{ .layout = .{ .flex_grow = 1 }, .text = .{ .font_families = self.theme.font_families, .font_size = self.theme.font_size, .color = if (selected_valid) self.theme.text else self.theme.muted_text } },
         };
         button_children[1] = .{
             .kind = .{ .text = if (self.open) "▴" else "▾" },
-            .style = .{ .text = .{ .font_size = 12, .color = self.theme.muted_text } },
+            .style = .{ .text = .{ .font_families = self.theme.font_families, .font_size = 12, .color = self.theme.muted_text } },
         };
         if (self.open) {
             button_children[2] = try self.dismissSurface(ctx);
@@ -82,7 +82,7 @@ pub const Select = struct {
                 },
                 .paint = .{
                     .background = .{ .solid = self.theme.surface },
-                    .border = .{ .widths = geometry.Insets.all(if (self.open) self.theme.focus_ring_width else 1), .color = if (self.open) self.theme.accent else self.theme.border },
+                    .border = .{ .widths = geometry.Insets.all(if (self.open) self.theme.focus_ring_width else 1), .color = if (self.open) self.theme.focus_ring else self.theme.border },
                     .radii = geometry.CornerRadii.all(self.theme.radius),
                     .opacity = if (self.disabled) self.theme.disabled_opacity else 1,
                 },
@@ -132,8 +132,8 @@ pub const Select = struct {
             const handlers = try ctx.allocator.dupe(input.Handler, &.{.{ .context = slot, .callback = handle }});
             const actions = try ctx.allocator.dupe(a11y.Action, &.{.activate});
             const option_children = try ctx.allocator.alloc(node.Spec, 2);
-            option_children[0] = .{ .kind = .{ .text = if (selected) "✓" else "" }, .style = .{ .layout = .{ .width = .{ .points = 16 } }, .text = .{ .font_size = 13, .color = self.theme.accent } } };
-            option_children[1] = .{ .kind = .{ .text = label }, .style = .{ .text = .{ .font_size = self.theme.font_size, .color = self.theme.text } } };
+            option_children[0] = .{ .kind = .{ .text = if (selected) "✓" else "" }, .style = .{ .layout = .{ .width = .{ .points = 16 } }, .text = .{ .font_families = self.theme.font_families, .font_size = 13, .color = self.theme.accent } } };
+            option_children[1] = .{ .kind = .{ .text = label }, .style = .{ .text = .{ .font_families = self.theme.font_families, .font_size = self.theme.font_size, .color = self.theme.text } } };
             options[index] = .{
                 .key = @intCast(index + 1),
                 .kind = .container,

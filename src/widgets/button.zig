@@ -17,18 +17,21 @@ pub const Button = struct {
     disabled: bool = false,
     hovered: bool = false,
     pressed: bool = false,
+    focused: bool = false,
     pressed_pointer: ?u64 = null,
 
     pub fn build(self: *Button, ctx: *component.BuildContext) Error!node.Spec {
         if (self.disabled) {
             self.hovered = false;
             self.pressed = false;
+            self.focused = false;
             self.pressed_pointer = null;
         }
         const children = try ctx.allocator.alloc(node.Spec, 1);
         children[0] = .{
             .kind = .{ .text = self.label },
             .style = .{ .text = .{
+                .font_families = self.theme.font_families,
                 .font_size = self.theme.font_size,
                 .color = self.theme.text,
                 .wrap = .none,
@@ -56,11 +59,14 @@ pub const Button = struct {
                 },
                 .paint = .{
                     .background = .{ .solid = self.background() },
-                    .border = .{ .widths = geometry.Insets.all(if (self.variant == .quiet) 0 else 1), .color = self.theme.border },
+                    .border = .{
+                        .widths = geometry.Insets.all(if (self.focused) self.theme.focus_ring_width else if (self.variant == .quiet) 0 else 1),
+                        .color = if (self.focused) self.theme.focus_ring else self.theme.border,
+                    },
                     .radii = geometry.CornerRadii.all(self.theme.radius),
                     .opacity = if (self.disabled) self.theme.disabled_opacity else 1,
                 },
-                .interaction = .{ .cursor = if (self.disabled) .not_allowed else .pointer, .focusable = true, .disabled = self.disabled },
+                .interaction = .{ .cursor = if (self.disabled) .not_allowed else .pointer, .focusable = !self.disabled, .disabled = self.disabled },
             },
             .handlers = handlers,
             .semantics = .{
@@ -95,13 +101,23 @@ pub const Button = struct {
             return;
         }
         switch (value.*) {
+            .focus_in => {
+                self.focused = true;
+                try event_context.invalidate(.{});
+            },
+            .focus_out => {
+                self.focused = false;
+                self.pressed = false;
+                self.pressed_pointer = null;
+                try event_context.invalidate(.{});
+            },
             .pointer_enter => {
                 self.hovered = true;
-                try event_context.invalidate(.{ .compose = false, .layout = false, .resources = false, .semantics = false });
+                try event_context.invalidate(.{});
             },
             .pointer_leave => {
                 self.hovered = false;
-                try event_context.invalidate(.{ .compose = false, .layout = false, .resources = false, .semantics = false });
+                try event_context.invalidate(.{});
             },
             .pointer_down => |pointer| if (pointer.button == .primary) {
                 self.pressed = true;
@@ -109,7 +125,7 @@ pub const Button = struct {
                 dispatch.capturePointer(dispatch.current);
                 dispatch.requestFocus(dispatch.current);
                 dispatch.handled = true;
-                try event_context.invalidate(.{ .compose = false, .layout = false, .resources = false, .semantics = false });
+                try event_context.invalidate(.{});
             },
             .pointer_up => |pointer| if (pointer.button == .primary and self.pressed_pointer == pointer.pointer_id) {
                 self.pressed = false;
@@ -117,7 +133,7 @@ pub const Button = struct {
                 dispatch.releasePointer();
                 dispatch.handled = true;
                 if (event_context.contains(pointer.position)) try self.on_activate.call(event_context);
-                try event_context.invalidate(.{ .compose = false, .layout = false, .resources = false, .semantics = false });
+                try event_context.invalidate(.{});
             },
             .pointer_cancel => |pointer| if (self.pressed_pointer == pointer.pointer_id) {
                 self.hovered = false;
@@ -125,7 +141,7 @@ pub const Button = struct {
                 self.pressed_pointer = null;
                 dispatch.releasePointer();
                 dispatch.handled = true;
-                try event_context.invalidate(.{ .compose = false, .layout = false, .resources = false, .semantics = false });
+                try event_context.invalidate(.{});
             },
             .key_down => |key| if (!key.repeat and (key.key == .enter or key.key == .space)) {
                 dispatch.handled = true;

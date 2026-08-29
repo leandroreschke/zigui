@@ -83,6 +83,9 @@ fn operationBounds(view: api.SceneView, operation: scene_abi.Operation, kind: sc
         .custom_passes => {
             for (view.custom_passes[start..][0..count]) |pass| result = include(result, transform.transformRectBounds(pass.bounds));
         },
+        .backdrop_effect => {
+            for (view.backdrop_effects[start..][0..count]) |effect| result = include(result, transform.transformRectBounds(effect.bounds));
+        },
     }
     return result;
 }

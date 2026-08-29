@@ -1,0 +1,901 @@
+//! AppKit file-promise materialization.
+//!
+//! This module owns the native receiver and Objective-C block lifetimes.  Its
+//! public face is `platform.PromisedFiles`; Foundation objects never escape
+//! this file.  A receive operation deliberately has one destination and one
+//! callback context per receiver so partial results and teardown can be
+//! accounted for without borrowing pasteboard memory.
+
+const std = @import("std");
+const Error = @import("../../core/error.zig").Error;
+const handles = @import("../../core/handle.zig");
+const api = @import("../api.zig");
+const objc = @import("objc.zig");
+
+extern "c" var _dispatch_main_q: u8;
+extern "c" fn dispatch_async_f(
+    queue: objc.Id,
+    context: ?*anyopaque,
+    work: *const fn (?*anyopaque) callconv(.c) void,
+) void;
+extern "c" fn zigui_promise_make_reader(
+    context: ?*anyopaque,
+    callback: *const fn (?*anyopaque, objc.Id, objc.Id) callconv(.c) void,
+    retain_context: *const fn (?*anyopaque) callconv(.c) void,
+    release_context: *const fn (?*anyopaque) callconv(.c) void,
+) ?*anyopaque;
+extern "c" fn zigui_promise_release_reader(reader: ?*anyopaque) void;
+extern "c" fn zigui_promise_receive(
+    receiver: objc.Id,
+    destination: objc.Id,
+    operation_queue: objc.Id,
+    reader: ?*anyopaque,
+) void;
+extern "c" fn zigui_promise_test_invoke_reader(reader: ?*anyopaque) void;
+extern "c" fn zigui_promise_test_invoke_failure(reader: ?*anyopaque) void;
+
+const max_error_bytes = 4 * 1024;
+const fallback_error = "The promised file could not be materialized.";
+
+const BridgeState = struct {
+    allocator: std.mem.Allocator,
+    context: std.atomic.Value(usize),
+    references: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+    /// Main-queue deliveries retain their callback context independently of
+    /// the operation's ownership. This is the precise teardown barrier: the
+    /// base/context references may remain held by a provider after its queue
+    /// has stopped, so they must not be used as a run-loop drain condition.
+    pending_main_callbacks: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Includes all provider-owned descriptor, destination, and callback
+    /// payload bytes. Callback delivery may begin off the main thread, so the
+    /// reservation itself is atomic even though the operation tables are
+    /// main-thread confined.
+    reserved_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    maximum_bytes: usize,
+
+    fn retain(self: *BridgeState) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *BridgeState) void {
+        if (self.references.fetchSub(1, .acq_rel) == 1) self.allocator.destroy(self);
+    }
+
+    fn reserveBytes(self: *BridgeState, amount: usize) bool {
+        if (amount == 0) return true;
+        var current = self.reserved_bytes.load(.acquire);
+        while (true) {
+            const next = std.math.add(usize, current, amount) catch return false;
+            if (next > self.maximum_bytes) return false;
+            if (self.reserved_bytes.cmpxchgWeak(current, next, .acq_rel, .acquire) == null) return true;
+            current = self.reserved_bytes.load(.acquire);
+        }
+    }
+
+    fn releaseBytes(self: *BridgeState, amount: usize) void {
+        if (amount != 0) _ = self.reserved_bytes.fetchSub(amount, .acq_rel);
+    }
+};
+
+const CallbackContext = struct {
+    state: *BridgeState,
+    operation: handles.PromisedFileOperationId,
+    descriptor_index: usize,
+    references: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+
+    fn retain(self: *CallbackContext) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *CallbackContext) void {
+        if (self.references.fetchSub(1, .acq_rel) == 1) {
+            const state = self.state;
+            state.allocator.destroy(self);
+            state.release();
+        }
+    }
+};
+
+const CallbackPayload = struct {
+    callback: *CallbackContext,
+    path: ?[]u8 = null,
+    error_description: ?[]u8 = null,
+    reserved_bytes: usize = 0,
+};
+
+const Batch = struct {
+    allocator: std.mem.Allocator,
+    receivers: []objc.Id,
+    descriptors: []api.PromisedFileDescriptor,
+    bytes: usize,
+    released: bool = false,
+    operation_refs: usize = 0,
+    started: bool = false,
+
+    fn deinit(self: *Batch) void {
+        for (self.receivers) |receiver| objc.release(receiver);
+        self.allocator.free(self.receivers);
+        for (self.descriptors) |descriptor| {
+            self.allocator.free(@constCast(descriptor.suggested_name));
+            if (descriptor.content_type.len != 0) self.allocator.free(@constCast(descriptor.content_type));
+        }
+        self.allocator.free(self.descriptors);
+        self.* = undefined;
+    }
+};
+
+const Operation = struct {
+    allocator: std.mem.Allocator,
+    batch: handles.PromisedFileBatchId,
+    destination: []u8,
+    operation_queue: objc.Id,
+    callbacks: []*CallbackContext,
+    readers: []?*anyopaque,
+    seen: []bool,
+    outputs: []api.PromisedFileOutput,
+    expected_callbacks: usize,
+    native_count: usize = 0,
+    callbacks_seen: usize = 0,
+    successful_outputs: usize = 0,
+    failed_outputs: usize = 0,
+    bytes: usize = 0,
+    terminal: bool = false,
+    status: api.PromisedFileTerminalStatus = .failed,
+    public_visible: bool = true,
+    poll_consumed: bool = false,
+    release_requested: bool = false,
+    cancelled: bool = false,
+    native_released: bool = false,
+
+    fn deinit(self: *Operation, state: *BridgeState) void {
+        if (!self.native_released) {
+            for (self.readers) |reader| if (reader) |value| zigui_promise_release_reader(value);
+        }
+        for (self.callbacks) |callback| callback.release();
+        for (self.outputs) |output| {
+            if (output.path) |path| self.allocator.free(@constCast(path));
+            if (output.error_description) |description| self.allocator.free(@constCast(description));
+        }
+        self.allocator.free(self.outputs);
+        self.allocator.free(self.seen);
+        self.allocator.free(self.readers);
+        self.allocator.free(self.callbacks);
+        objc.release(self.operation_queue);
+        self.allocator.free(self.destination);
+        state.releaseBytes(self.bytes);
+        self.* = undefined;
+    }
+
+    fn releaseNative(self: *Operation) void {
+        if (self.native_released) return;
+        for (self.readers) |reader| if (reader) |value| zigui_promise_release_reader(value);
+        self.native_released = true;
+    }
+};
+
+pub const Service = struct {
+    allocator: std.mem.Allocator,
+    batches: handles.SlotPool(Batch, handles.PromisedFileBatchId),
+    operations: handles.SlotPool(Operation, handles.PromisedFileOperationId),
+    state: *BridgeState,
+    maximum_batches: usize,
+    maximum_operations: usize,
+    maximum_files: usize,
+    maximum_bytes: usize,
+    retained_bytes: usize = 0,
+    wake_context: ?*anyopaque = null,
+    wake_fn: ?*const fn (?*anyopaque) void = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        maximum_batches: usize,
+        maximum_operations: usize,
+        maximum_files: usize,
+        maximum_bytes: usize,
+        wake_context: ?*anyopaque,
+        wake_fn: ?*const fn (?*anyopaque) void,
+    ) Error!Service {
+        if (maximum_batches == 0 or maximum_operations == 0 or maximum_files == 0 or maximum_bytes == 0)
+            return error.InvalidConfiguration;
+        const state = try allocator.create(BridgeState);
+        state.* = .{
+            .allocator = allocator,
+            .context = std.atomic.Value(usize).init(0),
+            .maximum_bytes = maximum_bytes,
+        };
+        return .{
+            .allocator = allocator,
+            .batches = handles.SlotPool(Batch, handles.PromisedFileBatchId).init(allocator),
+            .operations = handles.SlotPool(Operation, handles.PromisedFileOperationId).init(allocator),
+            .state = state,
+            .maximum_batches = maximum_batches,
+            .maximum_operations = maximum_operations,
+            .maximum_files = maximum_files,
+            .maximum_bytes = maximum_bytes,
+            .wake_context = wake_context,
+            .wake_fn = wake_fn,
+        };
+    }
+
+    pub fn bind(self: *Service) void {
+        self.state.context.store(@intFromPtr(self), .release);
+    }
+
+    pub fn deinit(self: *Service) void {
+        self.state.context.store(0, .release);
+
+        // Cancellation is cooperative.  Stop the provider queues before
+        // releasing their blocks, then drain main-queue deliveries while the
+        // bridge's base reference keeps its address valid.
+        var op_iterator = self.operations.iterator();
+        while (op_iterator.next()) |entry| {
+            entry.value.cancelled = true;
+            entry.value.terminal = true;
+            cancelAndDrainQueue(entry.value.operation_queue);
+        }
+        var release_iterator = self.operations.iterator();
+        while (release_iterator.next()) |entry| entry.value.releaseNative();
+        self.drainMainQueue();
+
+        while (self.operations.live_count != 0) {
+            var iterator = self.operations.iterator();
+            const entry = iterator.next() orelse break;
+            const value = self.operations.remove(entry.id) orelse break;
+            var operation = value;
+            operation.deinit(self.state);
+        }
+        while (self.batches.live_count != 0) {
+            var iterator = self.batches.iterator();
+            const entry = iterator.next() orelse break;
+            const value = self.batches.remove(entry.id) orelse break;
+            var batch = value;
+            self.retained_bytes -|= batch.bytes;
+            self.state.releaseBytes(batch.bytes);
+            batch.deinit();
+        }
+        self.operations.deinit();
+        self.batches.deinit();
+        std.debug.assert(self.state.reserved_bytes.load(.acquire) == 0);
+        self.state.release();
+        self.* = undefined;
+    }
+
+    pub fn interface(self: *Service) api.PromisedFiles {
+        self.bind();
+        return .{
+            .context = self,
+            .describe_batch_fn = describeBatch,
+            .begin_fn = beginReceive,
+            .poll_fn = pollReceive,
+            .cancel_fn = cancelReceive,
+            .release_batch_fn = releaseBatch,
+            .release_operation_fn = releaseOperation,
+            .limits = .{
+                .maximum_batches = self.maximum_batches,
+                .maximum_operations = self.maximum_operations,
+                .maximum_files = self.maximum_files,
+                .maximum_bytes = self.maximum_bytes,
+            },
+        };
+    }
+
+    /// Captures native receivers from a pasteboard. This is called only for a
+    /// performed drop or clipboard read; enter/update/prepare use
+    /// `promiseCount` so hover probing never leaks a batch per event.
+    pub fn capturePasteboard(self: *Service, pasteboard: objc.Id) Error!?handles.PromisedFileBatchId {
+        var pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
+        const receiver_class = objc.class("NSFilePromiseReceiver") orelse return null;
+        const objects = objc.send(objc.Id, pasteboard, "readObjectsForClasses:options:", .{
+            objc.arrayWithObject(receiver_class), @as(objc.Id, null),
+        }) orelse return null;
+        const count = objc.send(usize, objects, "count", .{});
+        if (count == 0) return null;
+        if (count > self.maximum_files or self.batches.live_count >= self.maximum_batches)
+            return error.BudgetExceeded;
+        if (self.state.reserved_bytes.load(.acquire) >= self.maximum_bytes) return error.BudgetExceeded;
+
+        const receivers = try self.allocator.alloc(objc.Id, count);
+        var receiver_count: usize = 0;
+        errdefer {
+            for (receivers[0..receiver_count]) |receiver| objc.release(receiver);
+            self.allocator.free(receivers);
+        }
+        const descriptors = try self.allocator.alloc(api.PromisedFileDescriptor, count);
+        var descriptor_count: usize = 0;
+        errdefer {
+            for (descriptors[0..descriptor_count]) |descriptor| {
+                self.allocator.free(@constCast(descriptor.suggested_name));
+                if (descriptor.content_type.len != 0) self.allocator.free(@constCast(descriptor.content_type));
+            }
+            self.allocator.free(descriptors);
+        }
+        var bytes: usize = 0;
+        for (0..count) |index| {
+            const receiver = objc.send(objc.Id, objects, "objectAtIndex:", .{index}) orelse return error.PlatformFailure;
+            const name = objc.utf8(objc.send(objc.Id, receiver, "fileName", .{}));
+            if (name.len == 0 or !validText(name)) return error.PlatformFailure;
+            const content_type = objc.utf8(objc.send(objc.Id, receiver, "fileType", .{}));
+            bytes = std.math.add(usize, bytes, name.len) catch return error.BudgetExceeded;
+            bytes = std.math.add(usize, bytes, content_type.len) catch return error.BudgetExceeded;
+            if (bytes > self.maximum_bytes -| self.retained_bytes) return error.BudgetExceeded;
+            receivers[index] = objc.retain(receiver);
+            receiver_count += 1;
+            var name_owned: ?[]u8 = try self.allocator.dupe(u8, name);
+            errdefer if (name_owned) |value| self.allocator.free(value);
+            var type_owned: ?[]u8 = if (content_type.len == 0) null else try self.allocator.dupe(u8, content_type);
+            errdefer if (type_owned) |value| self.allocator.free(value);
+            descriptors[index] = .{
+                .suggested_name = name_owned.?,
+                .content_type = type_owned orelse "",
+            };
+            name_owned = null;
+            type_owned = null;
+            descriptor_count += 1;
+        }
+        if (!self.state.reserveBytes(bytes)) return error.BudgetExceeded;
+        var bytes_reserved = true;
+        errdefer if (bytes_reserved) self.state.releaseBytes(bytes);
+        const batch = Batch{
+            .allocator = self.allocator,
+            .receivers = receivers,
+            .descriptors = descriptors,
+            .bytes = bytes,
+        };
+        const id = self.batches.insert(batch) catch |err| {
+            var owned = batch;
+            owned.deinit();
+            return err;
+        };
+        self.retained_bytes += bytes;
+        bytes_reserved = false;
+        return id;
+    }
+
+    pub fn promiseCount(self: *Service, pasteboard: objc.Id) Error!usize {
+        var pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
+        const receiver_class = objc.class("NSFilePromiseReceiver") orelse return 0;
+        const objects = objc.send(objc.Id, pasteboard, "readObjectsForClasses:options:", .{
+            objc.arrayWithObject(receiver_class), @as(objc.Id, null),
+        });
+        const count = if (objects) |value| objc.send(usize, value, "count", .{}) else 0;
+        if (count > self.maximum_files) return error.BudgetExceeded;
+        return count;
+    }
+
+    pub fn canAccept(self: *const Service, count: usize) bool {
+        return count != 0 and count <= self.maximum_files and
+            self.batches.live_count < self.maximum_batches and
+            self.operations.live_count < self.maximum_operations and
+            self.state.reserved_bytes.load(.acquire) < self.maximum_bytes;
+    }
+
+    /// Checks the remaining budgets after `capturePasteboard` has already
+    /// retained the batch.  The captured batch itself occupies the one batch
+    /// slot, so requiring another free batch slot here would reject every
+    /// promise drop when the configured batch budget is one.
+    pub fn canAcceptCaptured(self: *const Service, count: usize) bool {
+        return count != 0 and count <= self.maximum_files and
+            self.operations.live_count < self.maximum_operations and
+            self.state.reserved_bytes.load(.acquire) < self.maximum_bytes;
+    }
+
+    pub fn ownsBatch(self: *const Service, id: handles.PromisedFileBatchId) bool {
+        const batch = self.batches.getConst(id) orelse return false;
+        return !batch.released;
+    }
+
+    fn describeBatch(raw: *anyopaque, id: handles.PromisedFileBatchId, allocator: std.mem.Allocator) Error!api.OwnedPromisedFileDescriptors {
+        const self = @as(*Service, @ptrCast(@alignCast(raw)));
+        const batch = self.batches.getConst(id) orelse return error.InvalidHandle;
+        if (batch.released) return error.InvalidHandle;
+        const values = try allocator.alloc(api.PromisedFileDescriptor, batch.descriptors.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (values[0..initialized]) |descriptor| {
+                allocator.free(@constCast(descriptor.suggested_name));
+                if (descriptor.content_type.len != 0) allocator.free(@constCast(descriptor.content_type));
+            }
+            allocator.free(values);
+        }
+        for (batch.descriptors, 0..) |descriptor, index| {
+            var name_owned: ?[]u8 = try allocator.dupe(u8, descriptor.suggested_name);
+            errdefer if (name_owned) |value| allocator.free(value);
+            var type_owned: ?[]u8 = if (descriptor.content_type.len == 0) null else try allocator.dupe(u8, descriptor.content_type);
+            errdefer if (type_owned) |value| allocator.free(value);
+            values[index] = .{
+                .suggested_name = name_owned.?,
+                .content_type = type_owned orelse "",
+            };
+            name_owned = null;
+            type_owned = null;
+            initialized += 1;
+        }
+        return .{ .allocator = allocator, .batch = id, .values = values };
+    }
+
+    fn beginReceive(raw: *anyopaque, id: handles.PromisedFileBatchId, destination: []const u8) Error!handles.PromisedFileOperationId {
+        const self = @as(*Service, @ptrCast(@alignCast(raw)));
+        var pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
+        if (self.operations.live_count >= self.maximum_operations) return error.BudgetExceeded;
+        const batch = self.batches.get(id) orelse return error.InvalidHandle;
+        if (batch.released or batch.started or batch.operation_refs != 0) return error.ResourceBusy;
+        if (destination.len > self.maximum_bytes or !validText(destination)) return error.InvalidConfiguration;
+        if (batch.descriptors.len == 0 or batch.descriptors.len > self.maximum_files) return error.BudgetExceeded;
+
+        var copied_destination: ?[]u8 = try self.allocator.dupe(u8, destination);
+        errdefer if (copied_destination) |value| self.allocator.free(value);
+        if (!self.state.reserveBytes(destination.len)) return error.BudgetExceeded;
+        var destination_reserved = true;
+        errdefer if (destination_reserved) self.state.releaseBytes(destination.len);
+        // The callback itself is marshaled to the main queue below.  Keep the
+        // receive operation on a private queue so cancellation can never
+        // cancel unrelated work submitted to NSOperationQueue.mainQueue.
+        const queue = createPrivateOperationQueue() orelse return error.PlatformFailure;
+        errdefer objc.release(queue);
+        const destination_url = fileUrl(destination) orelse return error.PlatformFailure;
+        const callback_count = batch.receivers.len;
+        const callbacks = try self.allocator.alloc(*CallbackContext, callback_count);
+        var callbacks_initialized: usize = 0;
+        errdefer {
+            for (callbacks[0..callbacks_initialized]) |callback| callback.release();
+            self.allocator.free(callbacks);
+        }
+        const readers = try self.allocator.alloc(?*anyopaque, callback_count);
+        @memset(readers, null);
+        errdefer self.allocator.free(readers);
+        const seen = try self.allocator.alloc(bool, callback_count);
+        @memset(seen, false);
+        errdefer self.allocator.free(seen);
+        const outputs = try self.allocator.alloc(api.PromisedFileOutput, callback_count);
+        for (outputs, 0..) |*output, index| output.* = .{ .descriptor_index = index };
+        errdefer self.allocator.free(outputs);
+        for (callbacks, 0..) |*callback, index| {
+            const value = try self.allocator.create(CallbackContext);
+            value.* = .{
+                .state = self.state,
+                .operation = handles.PromisedFileOperationId.invalid,
+                .descriptor_index = index,
+            };
+            self.state.retain();
+            callback.* = value;
+            callbacks_initialized += 1;
+        }
+
+        const operation = Operation{
+            .allocator = self.allocator,
+            .batch = id,
+            .destination = copied_destination.?,
+            .operation_queue = queue,
+            .callbacks = callbacks,
+            .readers = readers,
+            .seen = seen,
+            .outputs = outputs,
+            .expected_callbacks = callback_count,
+            .bytes = destination.len,
+        };
+        copied_destination = null;
+        destination_reserved = false;
+        const operation_id = self.operations.insert(operation) catch |err| {
+            var owned = operation;
+            owned.deinit(self.state);
+            return err;
+        };
+        const stored = self.operations.get(operation_id) orelse unreachable;
+        for (stored.callbacks) |callback| callback.operation = operation_id;
+        batch.started = true;
+        batch.operation_refs += 1;
+
+        var initiated: usize = 0;
+        errdefer if (initiated != callback_count) {
+            stored.cancelled = true;
+            stored.terminal = true;
+            stored.status = .failed;
+            cancelAndDrainQueue(stored.operation_queue);
+            stored.releaseNative();
+            batch.operation_refs -|= 1;
+            if (self.operations.remove(operation_id)) |value| {
+                var removed = value;
+                removed.deinit(self.state);
+            }
+        };
+        for (batch.receivers, 0..) |receiver, index| {
+            const reader = zigui_promise_make_reader(
+                stored.callbacks[index],
+                promiseReaderCallback,
+                retainCallbackContext,
+                releaseCallbackContext,
+            ) orelse {
+                return error.PlatformFailure;
+            };
+            stored.readers[index] = reader;
+            stored.native_count += 1;
+            zigui_promise_receive(receiver, destination_url, queue, reader);
+            initiated += 1;
+        }
+        return operation_id;
+    }
+
+    fn pollReceive(raw: *anyopaque, id: handles.PromisedFileOperationId, allocator: std.mem.Allocator) Error!api.PromisedFilePoll {
+        const self = @as(*Service, @ptrCast(@alignCast(raw)));
+        const operation = self.operations.get(id) orelse return error.InvalidHandle;
+        if (!operation.public_visible) return error.InvalidHandle;
+        if (!operation.terminal) return .pending;
+        const error_description = if (operation.status == .failed or operation.status == .partial)
+            try allocator.dupe(u8, fallback_error)
+        else
+            null;
+        errdefer if (error_description) |description| allocator.free(description);
+        const outputs = try allocator.alloc(api.PromisedFileOutput, operation.outputs.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (outputs[0..initialized]) |output| {
+                if (output.path) |path| allocator.free(@constCast(path));
+                if (output.error_description) |description| allocator.free(@constCast(description));
+            }
+            allocator.free(outputs);
+        }
+        for (operation.outputs, 0..) |output, index| {
+            outputs[index] = .{ .descriptor_index = output.descriptor_index };
+            initialized += 1;
+            if (output.path) |path| outputs[index].path = try allocator.dupe(u8, path);
+            if (output.error_description) |description| outputs[index].error_description = try allocator.dupe(u8, description);
+        }
+        operation.public_visible = false;
+        operation.poll_consumed = true;
+        return .{ .terminal = .{
+            .allocator = allocator,
+            .operation = id,
+            .status = operation.status,
+            .outputs = outputs,
+            .error_description = error_description,
+        } };
+    }
+
+    fn cancelReceive(raw: *anyopaque, id: handles.PromisedFileOperationId) Error!void {
+        const self = @as(*Service, @ptrCast(@alignCast(raw)));
+        const operation = self.operations.get(id) orelse return error.InvalidHandle;
+        if (!operation.public_visible) return error.InvalidHandle;
+        if (operation.terminal) return;
+        operation.cancelled = true;
+        operation.terminal = true;
+        operation.status = .canceled;
+        objc.send(void, operation.operation_queue, "cancelAllOperations", .{});
+        self.wake();
+    }
+
+    fn releaseBatch(raw: *anyopaque, id: handles.PromisedFileBatchId) Error!void {
+        const self = @as(*Service, @ptrCast(@alignCast(raw)));
+        const batch = self.batches.get(id) orelse return error.InvalidHandle;
+        if (batch.released) return error.InvalidHandle;
+        batch.released = true;
+        self.maybeDestroyBatch(id);
+    }
+
+    fn releaseOperation(raw: *anyopaque, id: handles.PromisedFileOperationId) Error!void {
+        const self = @as(*Service, @ptrCast(@alignCast(raw)));
+        const operation = self.operations.get(id) orelse return error.InvalidHandle;
+        if (!operation.poll_consumed) return error.ResourceBusy;
+        operation.release_requested = true;
+        self.maybeDestroyOperation(id);
+    }
+
+    fn deliver(self: *Service, callback: *CallbackContext, path: ?[]u8, description: ?[]u8) void {
+        const operation = self.operations.get(callback.operation) orelse {
+            if (path) |value| {
+                self.state.releaseBytes(value.len);
+                self.allocator.free(value);
+            }
+            if (description) |value| {
+                self.state.releaseBytes(value.len);
+                self.allocator.free(value);
+            }
+            return;
+        };
+        var path_owned = path;
+        var description_owned = description;
+        defer {
+            if (path_owned) |value| {
+                self.state.releaseBytes(value.len);
+                self.allocator.free(value);
+            }
+            if (description_owned) |value| {
+                self.state.releaseBytes(value.len);
+                self.allocator.free(value);
+            }
+        }
+        if (operation.seen[callback.descriptor_index]) return;
+        operation.seen[callback.descriptor_index] = true;
+        operation.callbacks_seen += 1;
+        if (operation.cancelled) return self.finishCallback(operation);
+        const output = &operation.outputs[callback.descriptor_index];
+        if (path_owned) |value| {
+            if (value.len != 0 and validText(value) and value.len <= self.maximum_bytes -| operation.bytes) {
+                output.path = value;
+                path_owned = null;
+                operation.bytes += value.len;
+                operation.successful_outputs += 1;
+                return self.finishCallback(operation);
+            }
+        }
+        if (description_owned) |value| {
+            if (value.len <= self.maximum_bytes -| operation.bytes) {
+                output.error_description = value;
+                description_owned = null;
+                operation.bytes += value.len;
+            }
+        }
+        if (output.error_description == null) {
+            if (fallback_error.len <= self.maximum_bytes -| operation.bytes and self.state.reserveBytes(fallback_error.len)) {
+                output.error_description = self.allocator.dupe(u8, fallback_error) catch null;
+                if (output.error_description == null) self.state.releaseBytes(fallback_error.len) else operation.bytes += fallback_error.len;
+            }
+        }
+        operation.failed_outputs += 1;
+        self.finishCallback(operation);
+    }
+
+    fn deliverFailure(self: *Service, callback: *CallbackContext) void {
+        const operation = self.operations.get(callback.operation) orelse return;
+        if (operation.seen[callback.descriptor_index]) return;
+        operation.seen[callback.descriptor_index] = true;
+        operation.callbacks_seen += 1;
+        if (operation.cancelled) return self.finishCallback(operation);
+        if (fallback_error.len <= self.maximum_bytes -| operation.bytes and self.state.reserveBytes(fallback_error.len)) {
+            operation.outputs[callback.descriptor_index].error_description = self.allocator.dupe(u8, fallback_error) catch null;
+            if (operation.outputs[callback.descriptor_index].error_description == null) self.state.releaseBytes(fallback_error.len) else operation.bytes += fallback_error.len;
+        }
+        operation.failed_outputs += 1;
+        self.finishCallback(operation);
+    }
+
+    fn finishCallback(self: *Service, operation: *Operation) void {
+        if (operation.callbacks_seen < operation.expected_callbacks) return;
+        if (operation.cancelled) operation.status = .canceled else if (operation.failed_outputs == 0)
+            operation.status = .completed
+        else if (operation.successful_outputs == 0)
+            operation.status = .failed
+        else
+            operation.status = .partial;
+        operation.terminal = true;
+        self.wake();
+        self.maybeDestroyOperationByPointer(operation);
+    }
+
+    fn maybeDestroyOperationByPointer(self: *Service, operation: *Operation) void {
+        if (!operation.poll_consumed or !operation.release_requested or operation.callbacks_seen < operation.expected_callbacks)
+            return;
+        const id = operationIdForPointer(self, operation) orelse return;
+        self.maybeDestroyOperation(id);
+    }
+
+    fn maybeDestroyOperation(self: *Service, id: handles.PromisedFileOperationId) void {
+        const operation = self.operations.get(id) orelse return;
+        if (!operation.release_requested or !operation.poll_consumed or operation.callbacks_seen < operation.expected_callbacks) return;
+        const value = self.operations.remove(id) orelse return;
+        var removed = value;
+        removed.deinit(self.state);
+        if (self.batches.get(removed.batch)) |batch| {
+            batch.operation_refs -|= 1;
+            self.maybeDestroyBatch(removed.batch);
+        }
+    }
+
+    fn maybeDestroyBatch(self: *Service, id: handles.PromisedFileBatchId) void {
+        const batch = self.batches.get(id) orelse return;
+        if (!batch.released or batch.operation_refs != 0) return;
+        const value = self.batches.remove(id) orelse return;
+        var removed = value;
+        self.retained_bytes -|= removed.bytes;
+        self.state.releaseBytes(removed.bytes);
+        removed.deinit();
+    }
+
+    fn operationIdForPointer(self: *Service, target: *Operation) ?handles.PromisedFileOperationId {
+        var iterator = self.operations.iterator();
+        while (iterator.next()) |entry| if (entry.value == target) return entry.id;
+        return null;
+    }
+
+    fn wake(self: *Service) void {
+        if (self.wake_fn) |callback| callback(self.wake_context);
+    }
+
+    fn drainMainQueue(self: *Service) void {
+        const run_loop = objc.send(objc.Id, objc.class("NSRunLoop"), "currentRunLoop", .{});
+        while (self.state.pending_main_callbacks.load(.acquire) != 0) {
+            var pool = objc.AutoreleasePool.init();
+            defer pool.deinit();
+            const deadline = objc.send(objc.Id, objc.class("NSDate"), "dateWithTimeIntervalSinceNow:", .{@as(f64, 0.01)});
+            _ = objc.send(bool, run_loop, "runMode:beforeDate:", .{ objc.nsString("kCFRunLoopDefaultMode"), deadline });
+        }
+    }
+};
+
+fn retainCallbackContext(raw: ?*anyopaque) callconv(.c) void {
+    const callback = @as(*CallbackContext, @ptrCast(@alignCast(raw orelse return)));
+    callback.retain();
+}
+
+fn releaseCallbackContext(raw: ?*anyopaque) callconv(.c) void {
+    const callback = @as(*CallbackContext, @ptrCast(@alignCast(raw orelse return)));
+    callback.release();
+}
+
+fn queueFailure(callback: *CallbackContext) void {
+    callback.retain();
+    _ = callback.state.pending_main_callbacks.fetchAdd(1, .acq_rel);
+    dispatch_async_f(&_dispatch_main_q, callback, deliverFailure);
+}
+
+fn promiseReaderCallback(raw: ?*anyopaque, url: objc.Id, error_object: objc.Id) callconv(.c) void {
+    const callback = @as(*CallbackContext, @ptrCast(@alignCast(raw orelse return)));
+    // The Objective-C bridge owns one reference for every copied reader
+    // block.  Retain once more while this callback is executing because a
+    // provider may release its copy concurrently with delivery.
+    callback.retain();
+    defer callback.release();
+    const state = callback.state;
+    if (state.context.load(.acquire) == 0) return;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const path_text = if (url) |value| objc.utf8(objc.send(objc.Id, value, "path", .{})) else "";
+    const error_text = if (error_object) |value| objc.utf8(objc.send(objc.Id, value, "localizedDescription", .{})) else "";
+    const path_len = if (path_text.len != 0 and validText(path_text) and path_text.len <= state.maximum_bytes) path_text.len else 0;
+    const description_len = if (error_text.len != 0 and validText(error_text) and error_text.len <= max_error_bytes) error_text.len else 0;
+    const reserved_bytes = std.math.add(usize, path_len, description_len) catch 0;
+    if (reserved_bytes == 0) {
+        queueFailure(callback);
+        return;
+    }
+    if (!state.reserveBytes(reserved_bytes)) {
+        queueFailure(callback);
+        return;
+    }
+    const path: ?[]u8 = if (path_len != 0) state.allocator.dupe(u8, path_text) catch {
+        state.releaseBytes(reserved_bytes);
+        queueFailure(callback);
+        return;
+    } else null;
+    const description: ?[]u8 = if (description_len != 0) state.allocator.dupe(u8, error_text) catch {
+        if (path) |value| state.allocator.free(value);
+        state.releaseBytes(reserved_bytes);
+        queueFailure(callback);
+        return;
+    } else null;
+    const payload = state.allocator.create(CallbackPayload) catch {
+        if (path) |value| state.allocator.free(value);
+        if (description) |value| state.allocator.free(value);
+        state.releaseBytes(reserved_bytes);
+        queueFailure(callback);
+        return;
+    };
+    payload.* = .{ .callback = callback, .path = path, .error_description = description, .reserved_bytes = reserved_bytes };
+    callback.retain();
+    _ = state.pending_main_callbacks.fetchAdd(1, .acq_rel);
+    dispatch_async_f(&_dispatch_main_q, payload, deliverPayload);
+}
+
+fn deliverPayload(raw: ?*anyopaque) callconv(.c) void {
+    const payload = @as(*CallbackPayload, @ptrCast(@alignCast(raw orelse return)));
+    const callback = payload.callback;
+    const state = callback.state;
+    const path = payload.path;
+    const description = payload.error_description;
+    const reserved_bytes = payload.reserved_bytes;
+    state.allocator.destroy(payload);
+    defer callback.release();
+    defer _ = state.pending_main_callbacks.fetchSub(1, .acq_rel);
+    const address = state.context.load(.acquire);
+    if (address == 0) {
+        if (path) |value| state.allocator.free(value);
+        if (description) |value| state.allocator.free(value);
+        state.releaseBytes(reserved_bytes);
+        return;
+    }
+    const service = @as(*Service, @ptrFromInt(address));
+    service.deliver(callback, path, description);
+}
+
+fn deliverFailure(raw: ?*anyopaque) callconv(.c) void {
+    const callback = @as(*CallbackContext, @ptrCast(@alignCast(raw orelse return)));
+    defer callback.release();
+    defer _ = callback.state.pending_main_callbacks.fetchSub(1, .acq_rel);
+    const address = callback.state.context.load(.acquire);
+    if (address == 0) return;
+    const service = @as(*Service, @ptrFromInt(address));
+    service.deliverFailure(callback);
+}
+
+fn validText(value: []const u8) bool {
+    return value.len != 0 and std.unicode.utf8ValidateSlice(value) and std.mem.indexOfScalar(u8, value, 0) == null;
+}
+
+fn cancelAndDrainQueue(queue: objc.Id) void {
+    objc.send(void, queue, "cancelAllOperations", .{});
+    // The reader block is retained by the native receive operation. Waiting
+    // for this private queue to finish is the provider-side callback barrier;
+    // only after it returns may callback contexts and reader blocks be freed.
+    objc.send(void, queue, "waitUntilAllOperationsAreFinished", .{});
+}
+
+fn createPrivateOperationQueue() ?objc.Id {
+    const queue = objc.send(objc.Id, objc.class("NSOperationQueue"), "new", .{}) orelse return null;
+    // Promise receivers perform provider work through this queue.  Keep the
+    // queue private and bounded so canceling one receive cannot affect
+    // unrelated AppKit/main-queue work.
+    objc.send(void, queue, "setMaxConcurrentOperationCount:", .{@as(isize, 1)});
+    return queue;
+}
+
+fn fileUrl(path: []const u8) objc.Id {
+    return objc.send(objc.Id, objc.class("NSURL"), "fileURLWithPath:", .{objc.nsString(path)});
+}
+
+test "promise service rejects empty and oversized receiver budgets" {
+    try std.testing.expect(!validText(""));
+    try std.testing.expect(!validText("bad\x00path"));
+    try std.testing.expect(validText("/tmp/promised"));
+}
+
+test "macOS promised receives do not share the global main operation queue" {
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const main_queue = objc.send(objc.Id, objc.class("NSOperationQueue"), "mainQueue", .{}) orelse
+        return error.PlatformFailure;
+    const receive_queue = createPrivateOperationQueue() orelse return error.PlatformFailure;
+    defer objc.release(receive_queue);
+    try std.testing.expect(receive_queue != main_queue);
+    try std.testing.expectEqual(@as(isize, 1), objc.send(isize, receive_queue, "maxConcurrentOperationCount", .{}));
+}
+
+const BridgeProbe = struct {
+    success_calls: usize = 0,
+    failure_calls: usize = 0,
+    references: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+};
+
+fn bridgeProbeCallback(raw: ?*anyopaque, _: objc.Id, error_object: objc.Id) callconv(.c) void {
+    const probe = @as(*BridgeProbe, @ptrCast(@alignCast(raw orelse return)));
+    if (error_object == null) probe.success_calls += 1 else probe.failure_calls += 1;
+}
+
+fn bridgeProbeRetain(raw: ?*anyopaque) callconv(.c) void {
+    const probe = @as(*BridgeProbe, @ptrCast(@alignCast(raw orelse return)));
+    _ = probe.references.fetchAdd(1, .monotonic);
+}
+
+fn bridgeProbeRelease(raw: ?*anyopaque) callconv(.c) void {
+    const probe = @as(*BridgeProbe, @ptrCast(@alignCast(raw orelse return)));
+    _ = probe.references.fetchSub(1, .acq_rel);
+}
+
+test "macOS promise reader uses the Objective-C block ABI for success and failure" {
+    var probe: BridgeProbe = .{};
+    const reader = zigui_promise_make_reader(
+        &probe,
+        bridgeProbeCallback,
+        bridgeProbeRetain,
+        bridgeProbeRelease,
+    ) orelse return error.PlatformFailure;
+    defer zigui_promise_release_reader(reader);
+    zigui_promise_test_invoke_reader(reader);
+    zigui_promise_test_invoke_failure(reader);
+    try std.testing.expectEqual(@as(usize, 1), probe.success_calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.failure_calls);
+}
+
+test "macOS promise reader retains callback context through block lifetime" {
+    var probe: BridgeProbe = .{};
+    const reader = zigui_promise_make_reader(
+        &probe,
+        bridgeProbeCallback,
+        bridgeProbeRetain,
+        bridgeProbeRelease,
+    ) orelse return error.PlatformFailure;
+    try std.testing.expectEqual(@as(usize, 2), probe.references.load(.acquire));
+    zigui_promise_release_reader(reader);
+    try std.testing.expectEqual(@as(usize, 1), probe.references.load(.acquire));
+}

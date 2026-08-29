@@ -1,14 +1,61 @@
 const std = @import("std");
+const config = @import("../config.zig");
 const Error = @import("../core/error.zig").Error;
 const api = @import("animation_api.zig");
 const gif = @import("gif.zig");
 const image = @import("image.zig");
 const png = @import("png.zig");
+const webp = if (config.compiled_platform == .macos) @import("webp.zig") else struct {};
 
 pub const Frame = api.Frame;
 pub const Looping = api.Looping;
 
-pub const Decoder = union(enum) {
+pub const Decoder = if (config.compiled_platform == .macos) union(enum) {
+    gif: gif.Decoder,
+    apng: png.AnimationDecoder,
+    webp: webp.Decoder,
+
+    pub fn init(allocator: std.mem.Allocator, bytes: []const u8, limits: image.Limits) Error!Decoder {
+        if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a")))
+            return .{ .gif = try gif.Decoder.init(allocator, bytes, limits) };
+        if (png.isAnimated(bytes)) return .{ .apng = try png.AnimationDecoder.init(allocator, bytes, limits) };
+        if (webp.isAnimated(bytes)) return .{ .webp = try webp.Decoder.init(allocator, bytes, limits) };
+        return error.InvalidImage;
+    }
+
+    pub fn deinit(self: *Decoder) void {
+        switch (self.*) {
+            .gif => |*value| value.deinit(),
+            .apng => |*value| value.deinit(),
+            .webp => |*value| value.deinit(),
+        }
+        self.* = undefined;
+    }
+
+    pub fn reset(self: *Decoder) void {
+        switch (self.*) {
+            .gif => |*value| value.reset(),
+            .apng => |*value| value.reset(),
+            .webp => |*value| value.reset(),
+        }
+    }
+
+    pub fn next(self: *Decoder) Error!?Frame {
+        return switch (self.*) {
+            .gif => |*value| try value.next(),
+            .apng => |*value| try value.next(),
+            .webp => |*value| try value.next(),
+        };
+    }
+
+    pub fn looping(self: *const Decoder) Looping {
+        return switch (self.*) {
+            .gif => |value| value.looping,
+            .apng => |value| value.looping,
+            .webp => |value| value.loopingValue(),
+        };
+    }
+} else union(enum) {
     gif: gif.Decoder,
     apng: png.AnimationDecoder,
 
@@ -16,6 +63,7 @@ pub const Decoder = union(enum) {
         if (bytes.len >= 6 and (std.mem.eql(u8, bytes[0..6], "GIF87a") or std.mem.eql(u8, bytes[0..6], "GIF89a")))
             return .{ .gif = try gif.Decoder.init(allocator, bytes, limits) };
         if (png.isAnimated(bytes)) return .{ .apng = try png.AnimationDecoder.init(allocator, bytes, limits) };
+        if (image.isWebp(bytes)) return error.Unsupported;
         return error.InvalidImage;
     }
 
@@ -49,7 +97,7 @@ pub const Decoder = union(enum) {
     }
 };
 
-pub const State = enum { playing, paused, finished };
+pub const State = enum { playing, paused, finished, failed };
 
 /// Clock-driven sequential player with bounded catch-up work. It owns the
 /// encoded source and keeps only the decoder's current compositing canvases.
@@ -59,6 +107,7 @@ pub const Player = struct {
     decoder: Decoder,
     current: ?Frame = null,
     state: State = .playing,
+    failure: ?Error = null,
     deadline_ns: u64 = 0,
     remaining_repetitions: u32 = 0,
     initialized_loop_count: bool = false,
@@ -112,6 +161,7 @@ pub const Player = struct {
         const first = (try self.decoder.next()) orelse return error.InvalidImage;
         self.current = first;
         self.state = .playing;
+        self.failure = null;
         self.deadline_ns = now_ns +| first.duration_ns;
         self.initialized_loop_count = false;
         self.refreshLoopCount();
@@ -131,7 +181,8 @@ pub const Player = struct {
                 self.deadline_ns = now_ns +| current.duration_ns;
                 break;
             }
-            if (try self.decoder.next()) |next_frame| {
+            const decoded_frame = self.decoder.next() catch |err| return self.failAsset(err, changed);
+            if (decoded_frame) |next_frame| {
                 self.current = next_frame;
                 self.deadline_ns +|= next_frame.duration_ns;
                 changed = true;
@@ -143,13 +194,28 @@ pub const Player = struct {
                 break;
             }
             self.decoder.reset();
-            const first = (try self.decoder.next()) orelse return error.InvalidImage;
+            const first = (self.decoder.next() catch |err| return self.failAsset(err, changed)) orelse {
+                self.state = .failed;
+                self.failure = error.InvalidImage;
+                return changed;
+            };
             self.current = first;
             self.deadline_ns +|= first.duration_ns;
             changed = true;
             decoded += 1;
         }
         return changed;
+    }
+
+    fn failAsset(self: *Player, err: Error, changed: bool) Error!bool {
+        switch (err) {
+            error.InvalidImage, error.BudgetExceeded, error.Unsupported => {
+                self.state = .failed;
+                self.failure = err;
+                return changed;
+            },
+            else => return err,
+        }
     }
 
     fn refreshLoopCount(self: *Player) void {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Error = @import("../core/error.zig").Error;
 const handles = @import("../core/handle.zig");
+const appearance = @import("../core/appearance.zig");
 const node = @import("node.zig");
 const store = @import("store.zig");
 const runtime = @import("../runtime/coordinator.zig");
@@ -8,6 +9,9 @@ const state = @import("../runtime/state.zig");
 
 pub const BuildContext = struct {
     allocator: std.mem.Allocator,
+    /// Resolved system appearance for the window being composed. ZigUI does
+    /// not prescribe a product palette; consumers map this value themselves.
+    appearance: appearance.Appearance = .system,
     coordinator: *runtime.Coordinator,
     components: *Store,
     component: handles.ComponentId,
@@ -49,6 +53,7 @@ pub const BuildContext = struct {
 pub const Descriptor = struct {
     context: *anyopaque,
     build_fn: *const fn (*anyopaque, *BuildContext) Error!node.Spec,
+    frame_fn: ?*const fn (*anyopaque, u64) Error!FrameUpdate = null,
     drop_fn: ?*const fn (*anyopaque) void = null,
 
     pub fn from(comptime T: type, value: *T) Descriptor {
@@ -62,6 +67,28 @@ pub const Descriptor = struct {
             }.build,
         };
     }
+
+    /// Creates a component with an explicit display-driven frame hook. The
+    /// hook runs before composition on frames already requested for its
+    /// window, and may request another native display frame. Application
+    /// easing and semantic state remain consumer-owned.
+    pub fn fromWithFrame(comptime T: type, value: *T) Descriptor {
+        if (!@hasDecl(T, "frame")) @compileError(@typeName(T) ++ " must declare frame");
+        var descriptor = from(T, value);
+        descriptor.frame_fn = struct {
+            fn frame(context: *anyopaque, now_ns: u64) Error!FrameUpdate {
+                const self: *T = @ptrCast(@alignCast(context));
+                return self.frame(now_ns);
+            }
+        }.frame;
+        return descriptor;
+    }
+};
+
+/// Result of one display-driven component frame hook.
+pub const FrameUpdate = struct {
+    dirty: ?@import("../layout/style.zig").Dirty = null,
+    request_next_frame: bool = false,
 };
 
 const Entry = struct {
@@ -81,6 +108,7 @@ pub const Store = struct {
 
     allocator: std.mem.Allocator,
     pool: Pool,
+    frame_components: std.ArrayList(handles.ComponentId) = .empty,
     maximum_components: usize,
 
     pub fn init(allocator: std.mem.Allocator) Store {
@@ -101,6 +129,7 @@ pub const Store = struct {
             if (entry.value.descriptor.drop_fn) |drop| drop(entry.value.descriptor.context);
             entry.value.children.deinit(self.allocator);
         }
+        self.frame_components.deinit(self.allocator);
         self.pool.deinit();
         self.* = undefined;
     }
@@ -111,7 +140,10 @@ pub const Store = struct {
         window: handles.WindowId,
     ) Error!handles.ComponentId {
         if (self.pool.live_count >= self.maximum_components) return error.BudgetExceeded;
-        return self.pool.insert(.{ .descriptor = descriptor, .window = window });
+        if (descriptor.frame_fn != null) try self.frame_components.ensureUnusedCapacity(self.allocator, 1);
+        const id = try self.pool.insert(.{ .descriptor = descriptor, .window = window });
+        if (descriptor.frame_fn != null) self.frame_components.appendAssumeCapacity(id);
+        return id;
     }
 
     pub fn createChild(
@@ -124,6 +156,7 @@ pub const Store = struct {
         const parent_entry = self.pool.get(parent) orelse return error.InvalidHandle;
         if (!parent_entry.window.eql(window)) return error.InvalidHandle;
         try parent_entry.children.ensureUnusedCapacity(self.allocator, 1);
+        if (descriptor.frame_fn != null) try self.frame_components.ensureUnusedCapacity(self.allocator, 1);
         const id = try self.pool.insert(.{
             .descriptor = descriptor,
             .window = window,
@@ -131,6 +164,7 @@ pub const Store = struct {
         });
         const refreshed_parent = self.pool.get(parent) orelse return error.InvalidHandle;
         refreshed_parent.children.appendAssumeCapacity(id);
+        if (descriptor.frame_fn != null) self.frame_components.appendAssumeCapacity(id);
         return id;
     }
 
@@ -150,6 +184,7 @@ pub const Store = struct {
         coordinator: *runtime.Coordinator,
     ) void {
         var entry = self.pool.remove(id) orelse return;
+        removeComponent(&self.frame_components, id);
         if (entry.parent.isValid()) if (self.pool.get(entry.parent)) |parent| {
             removeComponent(&parent.children, id);
         };
@@ -253,12 +288,48 @@ pub const Store = struct {
         return .{ .inner = self.pool.iterator() };
     }
 
+    /// Advances only explicitly registered frame-driven components in the
+    /// target window. The compact registry avoids scanning ordinary retained
+    /// components on every display frame.
+    pub fn updateFrame(
+        self: *Store,
+        window: handles.WindowId,
+        now_ns: u64,
+        coordinator: *runtime.Coordinator,
+    ) Error!bool {
+        var request_next = false;
+        for (self.frame_components.items) |id| {
+            const entry = self.pool.get(id) orelse continue;
+            if (!entry.registered or !entry.window.eql(window)) continue;
+            const callback = entry.descriptor.frame_fn orelse continue;
+            var frame_guard = try coordinator.phase_state.enterFrameCallback();
+            defer frame_guard.deinit();
+            const update = try callback(entry.descriptor.context, now_ns);
+            if (update.dirty) |dirty| {
+                if (dirty.any()) _ = coordinator.invalidations.markComponentDuringFrame(id, dirty);
+            }
+            request_next = request_next or update.request_next_frame;
+        }
+        return request_next;
+    }
+
     pub fn build(
         self: *Store,
         id: handles.ComponentId,
         nodes: *store.Store,
         coordinator: *runtime.Coordinator,
         scratch: std.mem.Allocator,
+    ) Error!handles.NodeId {
+        return self.buildWithAppearance(id, nodes, coordinator, scratch, .system);
+    }
+
+    pub fn buildWithAppearance(
+        self: *Store,
+        id: handles.ComponentId,
+        nodes: *store.Store,
+        coordinator: *runtime.Coordinator,
+        scratch: std.mem.Allocator,
+        appearance_value: appearance.Appearance,
     ) Error!handles.NodeId {
         const initial = self.pool.getConst(id) orelse return error.InvalidHandle;
         if (!initial.anchor.isValid()) return error.InvalidHandle;
@@ -267,6 +338,7 @@ pub const Store = struct {
         const window = initial.window;
         var context: BuildContext = .{
             .allocator = scratch,
+            .appearance = appearance_value,
             .coordinator = coordinator,
             .components = self,
             .component = id,

@@ -14,6 +14,25 @@ const Callback = @import("callback.zig").Callback;
 const Theme = @import("theme.zig").Theme;
 
 pub const TextField = struct {
+    /// Project-neutral visual overrides for the editable surface. A null
+    /// value keeps the corresponding Theme/default behavior, which means
+    /// existing TextFields remain byte-for-byte compatible until a consumer
+    /// opts into a value.
+    pub const VisualConfig = struct {
+        /// Insets between the field bounds and text, selection, and caret.
+        content_insets: ?geometry.Insets = null,
+        /// Surface and unfocused border colors. Focus still uses the theme's
+        /// accent/focus-ring treatment unless the widget itself changes it.
+        surface_color: ?geometry.Color = null,
+        border_color: ?geometry.Color = null,
+        radius: ?f32 = null,
+        text_color: ?geometry.Color = null,
+        placeholder_color: ?geometry.Color = null,
+        /// A positive logical line height. Null delegates to the text
+        /// backend's normal line height, preserving the previous behavior.
+        line_height: ?f32 = null,
+    };
+
     const DisplayText = struct {
         /// Logical UTF-8 after applying the active IME replacement.
         logical: []const u8,
@@ -55,6 +74,10 @@ pub const TextField = struct {
     font_size: f32 = 14,
     multiline: bool = false,
     password: bool = false,
+    /// Ordered family fallback list used for both measurement and painting.
+    /// The default preserves the widget's existing system-ui behavior.
+    font_families: []const []const u8 = &.{"system-ui"},
+    visual: VisualConfig = .{},
     disabled: bool = false,
     read_only: bool = false,
     maximum_bytes: usize = 1024 * 1024,
@@ -115,6 +138,42 @@ pub const TextField = struct {
         self.reveal_caret = true;
     }
 
+    /// Replaces the current selection as one undoable edit and selects a
+    /// UTF-8 range inside the inserted text. This is the project-neutral path
+    /// for formatting toolbars, autocomplete, and other external editing
+    /// controls that must preserve the field's normal history and callbacks.
+    pub fn replaceSelection(
+        self: *TextField,
+        replacement: []const u8,
+        selected_inserted: input.TextRange,
+        ctx: *input.Context,
+    ) Error!void {
+        if (self.disabled or self.read_only) return error.InvalidConfiguration;
+        try validateUtf8(replacement);
+        const selected = selected_inserted.normalized();
+        if (selected.end > replacement.len or
+            !utf8Boundary(replacement, selected.start) or
+            !utf8Boundary(replacement, selected.end))
+            return error.InvalidConfiguration;
+
+        const range = self.selection.normalized();
+        const previous_undo_count = self.undo_edits.items.len;
+        try self.replace(range.start, range.end, replacement);
+        self.selection = .{
+            .start = range.start + selected.start,
+            .end = range.start + selected.end,
+        };
+        if (self.undo_edits.items.len > previous_undo_count) {
+            self.undo_edits.items[self.undo_edits.items.len - 1].selection_after = self.selection;
+        }
+        self.marked_text.clearRetainingCapacity();
+        self.marked_selection = .{};
+        self.composition_active = false;
+        self.preferred_x = null;
+        self.reveal_caret = true;
+        try self.changed(ctx);
+    }
+
     pub fn clearHistory(self: *TextField) void {
         self.clearHistoryList(&self.undo_edits);
         self.clearHistoryList(&self.redo_edits);
@@ -124,10 +183,12 @@ pub const TextField = struct {
     pub fn build(self: *TextField, ctx: *component.BuildContext) Error!node.Spec {
         if (self.disabled) self.selecting_pointer = null;
         try self.validateState();
-        var action_buffer: [3]a11y.Action = undefined;
+        var action_buffer: [4]a11y.Action = undefined;
         var action_count: usize = 0;
         if (!self.disabled) {
             action_buffer[action_count] = .focus;
+            action_count += 1;
+            action_buffer[action_count] = .activate;
             action_count += 1;
             action_buffer[action_count] = .set_selection;
             action_count += 1;
@@ -142,24 +203,20 @@ pub const TextField = struct {
             .style = .{
                 .layout = .{
                     .min_height = .{ .points = self.theme.control_height },
-                    .padding = .{
-                        .left = .{ .points = 9 },
-                        .right = .{ .points = 9 },
-                        .top = .{ .points = 6 },
-                        .bottom = .{ .points = 6 },
-                    },
+                    .padding = self.contentPadding(),
                     .overflow_x = .hidden,
                     .overflow_y = if (self.multiline) .scroll else .hidden,
                 },
                 .paint = .{
-                    .background = .{ .solid = self.theme.surface },
+                    .background = .{ .solid = self.surfaceColor() },
                     .border = .{
                         .widths = geometry.Insets.all(if (self.focused) self.theme.focus_ring_width else 1),
-                        .color = if (self.focused) self.theme.accent else self.theme.border,
+                        .color = if (self.focused) self.theme.focus_ring else self.borderColor(),
                     },
-                    .radii = geometry.CornerRadii.all(self.theme.radius),
+                    .radii = geometry.CornerRadii.all(self.radius()),
                     .opacity = if (self.disabled) self.theme.disabled_opacity else 1,
                 },
+                .text = self.textStyle(false),
                 .interaction = .{
                     .focusable = true,
                     .cursor = if (self.disabled) .not_allowed else .text,
@@ -191,7 +248,7 @@ pub const TextField = struct {
         self.last_text_extent = try self.measureExtent(services, shown, style, constraints.maximum.width);
         return .{
             .width = measured.width,
-            .height = @max(measured.height, self.font_size * 1.35),
+            .height = @max(measured.height, self.minimumLineHeight()),
         };
     }
 
@@ -199,7 +256,7 @@ pub const TextField = struct {
         try self.validateState();
         const services = ctx.text orelse return error.TextUnavailable;
         self.text_services = services;
-        const content = bounds.inset(.{ .left = 9, .right = 9, .top = 6, .bottom = 6 });
+        const content = bounds.inset(self.contentInsets());
         self.last_content_bounds = content;
         const display = try self.displayText(ctx.scratch);
         const empty = display.logical.len == 0;
@@ -244,7 +301,7 @@ pub const TextField = struct {
                     local.size.width,
                     thickness,
                 ),
-                .color = self.theme.text,
+                .color = self.textColor(),
                 .thickness = thickness,
                 .wave_amplitude = 0,
                 .wave_period = 0,
@@ -262,7 +319,7 @@ pub const TextField = struct {
             caret.size.width = @max(1 / @max(1, ctx.scale_factor.value), 0.5);
             try ctx.quad(.{
                 .bounds = caret,
-                .background = self.theme.text,
+                .background = self.textColor(),
                 .border_color = .transparent,
                 .border_widths = .{},
                 .radii = .{},
@@ -294,6 +351,7 @@ pub const TextField = struct {
             .focus_in => {
                 self.focused = true;
                 self.reveal_caret = true;
+                try self.syncNative(ctx);
                 try ctx.setTextInputActive(true);
                 try self.syncNative(ctx);
                 try ctx.invalidate(.{});
@@ -524,6 +582,7 @@ pub const TextField = struct {
         switch (request.action) {
             .focus, .activate => {
                 dispatch.requestFocus(dispatch.current);
+                try self.syncNative(ctx);
                 try ctx.setTextInputActive(true);
             },
             .set_value => {
@@ -726,9 +785,9 @@ pub const TextField = struct {
         const preferred = self.preferred_x orelse caret.origin.x;
         self.preferred_x = preferred;
         const step = if (page)
-            @max(self.last_content_bounds.size.height, self.font_size * 1.35)
+            @max(self.last_content_bounds.size.height, self.minimumLineHeight())
         else
-            self.font_size * 1.35;
+            self.minimumLineHeight();
         const target_y = caret.origin.y + @as(f32, @floatFromInt(direction)) * step;
         const hit = try services.hitTest(
             display.shown,
@@ -750,10 +809,10 @@ pub const TextField = struct {
     fn syncNative(self: *TextField, ctx: *input.Context) Error!void {
         const local_candidate = self.currentCaretRect() catch |err| switch (err) {
             error.TextUnavailable => geometry.Rect.fromXYWH(
-                ctx.current_layout_bounds.origin.x + 9,
-                ctx.current_layout_bounds.origin.y + 6,
+                ctx.current_layout_bounds.origin.x + self.contentInsets().left,
+                ctx.current_layout_bounds.origin.y + self.contentInsets().top,
                 1,
-                self.font_size * 1.35,
+                self.minimumLineHeight(),
             ),
             else => return err,
         };
@@ -762,10 +821,50 @@ pub const TextField = struct {
 
     fn textStyle(self: *const TextField, placeholder_text: bool) compose_style.TextStyle {
         return .{
+            .font_families = self.font_families,
             .font_size = self.font_size,
-            .color = if (placeholder_text) self.theme.muted_text else self.theme.text,
+            .line_height = self.visual.line_height,
+            .color = if (placeholder_text) self.placeholderColor() else self.textColor(),
             .wrap = if (self.multiline) .word else .none,
         };
+    }
+
+    fn contentInsets(self: *const TextField) geometry.Insets {
+        return self.visual.content_insets orelse .{ .left = 9, .right = 9, .top = 6, .bottom = 6 };
+    }
+
+    fn contentPadding(self: *const TextField) layout.LengthEdges {
+        const insets = self.contentInsets();
+        return .{
+            .top = .{ .points = insets.top },
+            .right = .{ .points = insets.right },
+            .bottom = .{ .points = insets.bottom },
+            .left = .{ .points = insets.left },
+        };
+    }
+
+    fn surfaceColor(self: *const TextField) geometry.Color {
+        return self.visual.surface_color orelse self.theme.surface;
+    }
+
+    fn borderColor(self: *const TextField) geometry.Color {
+        return self.visual.border_color orelse self.theme.border;
+    }
+
+    fn radius(self: *const TextField) f32 {
+        return self.visual.radius orelse self.theme.radius;
+    }
+
+    fn textColor(self: *const TextField) geometry.Color {
+        return self.visual.text_color orelse self.theme.text;
+    }
+
+    fn placeholderColor(self: *const TextField) geometry.Color {
+        return self.visual.placeholder_color orelse self.theme.muted_text;
+    }
+
+    fn minimumLineHeight(self: *const TextField) f32 {
+        return self.visual.line_height orelse self.font_size * 1.35;
     }
 
     fn offsetAtPoint(self: *TextField, screen_point: geometry.Point) Error!usize {
@@ -920,6 +1019,7 @@ pub const TextField = struct {
     fn validateState(self: *const TextField) Error!void {
         if (!std.math.isFinite(self.font_size) or self.font_size <= 0 or self.font_size > 1_000_000)
             return error.InvalidConfiguration;
+        try self.validateVisualConfig();
         if (!finiteNonNegativePoint(self.scroll_offset) or !finiteNonNegativeSize(self.last_text_extent))
             return error.InvalidConfiguration;
         if (self.semantic_role != .text_field and self.semantic_role != .search_field)
@@ -950,6 +1050,22 @@ pub const TextField = struct {
         if (history_bytes != self.history_bytes) return error.InvalidConfiguration;
         if (history_bytes > self.maximum_history_bytes) return error.BudgetExceeded;
     }
+
+    fn validateVisualConfig(self: *const TextField) Error!void {
+        if (self.visual.content_insets) |insets| {
+            inline for (.{ insets.top, insets.right, insets.bottom, insets.left }) |amount| {
+                if (!std.math.isFinite(amount) or amount < 0) return error.InvalidConfiguration;
+            }
+        }
+        if (self.visual.surface_color) |color| if (!validColor(color)) return error.InvalidConfiguration;
+        if (self.visual.border_color) |color| if (!validColor(color)) return error.InvalidConfiguration;
+        if (self.visual.text_color) |color| if (!validColor(color)) return error.InvalidConfiguration;
+        if (self.visual.placeholder_color) |color| if (!validColor(color)) return error.InvalidConfiguration;
+        if (self.visual.radius) |configured_radius| if (!std.math.isFinite(configured_radius) or configured_radius < 0) return error.InvalidConfiguration;
+        if (self.visual.line_height) |line_height| if (!std.math.isFinite(line_height) or
+            line_height <= 0 or line_height > 1_000_000)
+            return error.InvalidConfiguration;
+    }
 };
 
 fn clampOffset(value: f32, extent: f32, viewport: f32) f32 {
@@ -965,6 +1081,11 @@ fn finiteNonNegativePoint(value: geometry.Point) bool {
 
 fn finiteNonNegativeSize(value: geometry.Size) bool {
     return std.math.isFinite(value.width) and std.math.isFinite(value.height) and value.width >= 0 and value.height >= 0;
+}
+
+fn validColor(value: geometry.Color) bool {
+    return std.math.isFinite(value.r) and std.math.isFinite(value.g) and std.math.isFinite(value.b) and
+        std.math.isFinite(value.a) and value.a >= 0 and value.a <= 1;
 }
 
 fn validateUtf8(bytes: []const u8) Error!void {

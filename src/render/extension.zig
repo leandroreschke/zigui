@@ -6,6 +6,26 @@ const handles = @import("../core/handle.zig");
 pub const DeviceGeneration = u32;
 pub const SubmissionEpoch = u64;
 
+pub const DepthFormat = enum(u32) {
+    depth32_float,
+};
+
+/// Framework-owned depth storage requested by an extension. The attachment is
+/// cleared before each extension encode and is borrowed only for that encode.
+pub const DepthRequest = struct {
+    format: DepthFormat = .depth32_float,
+    clear_depth: f32 = 1,
+};
+
+pub const Requirements = struct {
+    depth: ?DepthRequest = null,
+};
+
+pub const DepthAttachment = struct {
+    texture: usize,
+    format: DepthFormat,
+};
+
 pub const Backend = enum { null, metal, d3d11, vulkan };
 
 pub const Device = union(Backend) {
@@ -54,6 +74,7 @@ pub const Pass = union(Backend) {
         command_buffer: usize,
         render_encoder: usize,
         target_texture: usize,
+        depth: ?DepthAttachment = null,
         geometry: Geometry,
     },
     d3d11: struct {
@@ -84,6 +105,7 @@ pub const Descriptor = struct {
     context: *anyopaque,
     vtable: *const VTable,
     label: []const u8 = "",
+    requirements: Requirements = .{},
 
     pub const VTable = struct {
         prepare: *const fn (*anyopaque, Device, DeviceGeneration) Error!void,
@@ -139,12 +161,18 @@ pub const Registry = struct {
         if (descriptor.label.len > 4096 or !std.unicode.utf8ValidateSlice(descriptor.label) or
             std.mem.indexOfScalar(u8, descriptor.label, 0) != null)
             return error.InvalidConfiguration;
+        try validateRequirements(descriptor.requirements);
         if (self.entries.live_count +| self.retired.items.len >= self.maximum_entries) return error.BudgetExceeded;
         const label = try self.allocator.dupe(u8, descriptor.label);
         errdefer self.allocator.free(label);
         var owned_descriptor = descriptor;
         owned_descriptor.label = label;
         return self.entries.insert(.{ .descriptor = owned_descriptor });
+    }
+
+    pub fn requirements(self: *const Registry, id: handles.RenderExtensionId) Error!Requirements {
+        const entry = self.entries.getConst(id) orelse return error.InvalidHandle;
+        return entry.descriptor.requirements;
     }
 
     pub fn destroy(self: *Registry, id: handles.RenderExtensionId, release_after: SubmissionEpoch) Error!void {
@@ -205,6 +233,13 @@ pub const Registry = struct {
         entry.* = undefined;
     }
 };
+
+pub fn validateRequirements(requirements: Requirements) Error!void {
+    if (requirements.depth) |depth| {
+        if (!std.math.isFinite(depth.clear_depth) or depth.clear_depth < 0 or depth.clear_depth > 1)
+            return error.InvalidConfiguration;
+    }
+}
 
 pub fn decodeId(encoded: u64) handles.RenderExtensionId {
     return .{ .index = @truncate(encoded), .generation = @truncate(encoded >> 32) };

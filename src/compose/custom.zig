@@ -196,6 +196,12 @@ pub const PaintContext = struct {
         try self.emit(.pop_layer);
     }
 
+    /// Applies a screen-space backdrop filter before subsequent custom paint.
+    /// The effect is evaluated against the current retained render target.
+    pub fn backdropEffect(self: *PaintContext, value: scene_abi.BackdropEffect) Error!void {
+        try self.emit(.{ .backdrop_effect = value });
+    }
+
     pub fn quad(self: *PaintContext, value: scene_abi.Quad) Error!void {
         try self.emit(.{ .quad = value });
     }
@@ -246,7 +252,14 @@ pub const PaintContext = struct {
     /// Declares the committed window-space placement of a native media layer.
     /// ZigUI applies it after the frame commits, outside compose and layout.
     pub fn nativeMedia(self: *PaintContext, id: handles.NativeMediaId, bounds: geometry.Rect) Error!void {
-        try self.emit(.{ .native_media = .{ .id = id, .bounds = bounds } });
+        try self.nativeMediaWithVisibility(id, bounds, true);
+    }
+
+    /// Declares both the layout bounds and committed visibility of a native
+    /// media layer. Hidden placements remain scene-managed without requiring
+    /// consumer-owned offscreen geometry.
+    pub fn nativeMediaWithVisibility(self: *PaintContext, id: handles.NativeMediaId, bounds: geometry.Rect, visible: bool) Error!void {
+        try self.emit(.{ .native_media = .{ .id = id, .bounds = bounds, .visible = visible } });
     }
 };
 
@@ -259,6 +272,7 @@ pub const PaintCommand = union(enum) {
         transform: geometry.Affine2D,
     },
     pop_layer,
+    backdrop_effect: scene_abi.BackdropEffect,
     quad: scene_abi.Quad,
     gradient_quad: struct {
         value: scene_abi.Quad,
@@ -272,7 +286,7 @@ pub const PaintCommand = union(enum) {
     monochrome_sprite: scene_abi.Sprite,
     color_sprite: scene_abi.Sprite,
     external_surface: scene_abi.ExternalSurface,
-    native_media: struct { id: handles.NativeMediaId, bounds: geometry.Rect },
+    native_media: struct { id: handles.NativeMediaId, bounds: geometry.Rect, visible: bool },
     custom_pass: struct {
         extension: handles.RenderExtensionId,
         bounds: geometry.Rect,

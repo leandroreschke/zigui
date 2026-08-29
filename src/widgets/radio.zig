@@ -44,7 +44,7 @@ pub const Radio = struct {
             },
             .children = dot_children,
         };
-        children[1] = .{ .kind = .{ .text = self.label }, .style = .{ .text = .{ .font_size = self.theme.font_size, .color = self.theme.text } } };
+        children[1] = .{ .kind = .{ .text = self.label }, .style = .{ .text = .{ .font_families = self.theme.font_families, .font_size = self.theme.font_size, .color = self.theme.text } } };
         const handlers = try ctx.allocator.dupe(input.Handler, &.{.{ .context = self, .callback = handle }});
         const available_actions: []const a11y.Action = if (self.disabled) &.{} else &.{.activate};
         const actions = try ctx.allocator.dupe(a11y.Action, available_actions);

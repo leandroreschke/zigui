@@ -119,4 +119,8 @@ pub const MemoryBudgets = struct {
     accessibility_node_count: usize = 250_000,
     trace_event_count: usize = 262_144,
     worker_queue_capacity: usize = 4096,
+    /// Maximum live asynchronous offscreen submissions retained by a backend.
+    /// This is intentionally separate from worker and scene budgets because
+    /// each request owns a copied scene until its GPU command completes.
+    offscreen_request_count: usize = 64,
 };

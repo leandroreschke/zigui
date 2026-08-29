@@ -1140,6 +1140,7 @@ pub const Renderer = struct {
     }
 
     fn registerExtension(raw: *anyopaque, descriptor: extension.Descriptor) Error!handles.RenderExtensionId {
+        if (descriptor.requirements.depth != null) return error.Unsupported;
         const self = cast(raw);
         try self.collect();
         return self.extensions.register(descriptor);

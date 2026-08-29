@@ -1,4 +1,5 @@
 const std = @import("std");
+const config = @import("../config.zig");
 const Error = @import("../core/error.zig").Error;
 
 pub const PixelFormat = enum { rgba8 };
@@ -290,11 +291,21 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, limits: Limits) E
         try @import("gif.zig").decodeFirstFrame(allocator, bytes, limits)
     else if (bytes.len >= 2 and bytes[0] == 'B' and bytes[1] == 'M')
         try @import("bmp.zig").decode(allocator, bytes, limits)
+    else if (@import("avif.zig").isAvif(bytes)) if (config.compiled_platform == .macos)
+        try @import("avif.zig").decode(allocator, bytes, limits)
     else
-        return error.InvalidImage;
+        return error.Unsupported else if (isWebp(bytes)) if (config.compiled_platform == .macos)
+        try @import("webp.zig").decode(allocator, bytes, limits)
+    else
+        return error.Unsupported else return error.InvalidImage;
     errdefer result.deinit(allocator);
     try validateImage(result);
     return result;
+}
+
+pub fn isWebp(bytes: []const u8) bool {
+    return bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and
+        std.mem.eql(u8, bytes[8..12], "WEBP");
 }
 
 pub fn validateDimensions(width: u32, height: u32, limits: Limits) Error!usize {

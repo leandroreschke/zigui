@@ -107,6 +107,16 @@ pub const ImeEvent = union(enum) {
 pub const FileDrop = struct {
     paths: []const []const u8,
     position: geometry.Point,
+    /// Optional UTF-8 text payload for URL, URI-list, and plain-text drags.
+    /// It is retained independently of `paths`, so a mixed native drop keeps
+    /// both its file URLs and its text representation. Consumers process the
+    /// representations in this stable order: native paths, promised batch,
+    /// then text; no representation is silently discarded.
+    text: ?[]const u8 = null,
+    /// An opaque framework-owned batch of native promised files. The batch is
+    /// described and received through `platform.PromisedFiles`; no native
+    /// receiver or platform object crosses this event boundary.
+    promised_batch: ?handles.PromisedFileBatchId = null,
 };
 
 /// Platform-neutral representation of an action initiated by a native
@@ -186,12 +196,19 @@ pub fn validate(value: *const Event, limits: ValidationLimits) Error!void {
         },
         .file_drop_entered, .file_drop_updated, .file_drop_performed => |drop| {
             if (!finitePoint(drop.position)) return error.InvalidConfiguration;
+            if (drop.promised_batch) |batch| if (!batch.isValid()) return error.InvalidHandle;
             if (drop.paths.len > limits.maximum_file_paths) return error.BudgetExceeded;
             var total: usize = 0;
             for (drop.paths) |path| {
                 if (path.len == 0) return error.InvalidConfiguration;
                 try validatePayload(path, limits.maximum_payload_bytes);
                 total = std.math.add(usize, total, path.len) catch return error.BudgetExceeded;
+                if (total > limits.maximum_payload_bytes) return error.BudgetExceeded;
+            }
+            if (drop.text) |text| {
+                try validatePayload(text, limits.maximum_payload_bytes);
+                if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidUtf8;
+                total = std.math.add(usize, total, text.len) catch return error.BudgetExceeded;
                 if (total > limits.maximum_payload_bytes) return error.BudgetExceeded;
             }
         },
@@ -311,6 +328,10 @@ pub const Dispatch = struct {
     release_pointer_capture: bool = false,
     requested_focus: ?handles.NodeId = null,
     requested_autofocus_after_reconcile: bool = false,
+    /// A custom element may request a precise retained-tree invalidation while
+    /// handling an event. The router carries this transient request to App;
+    /// ordinary handlers retain the conservative handled-event behavior.
+    requested_dirty: ?layout.Dirty = null,
 
     pub fn stopPropagation(self: *Dispatch) void {
         self.propagation_stopped = true;
@@ -366,6 +387,14 @@ pub const Context = struct {
     world_to_local: geometry.Affine2D = .identity,
     native_text_input: ?NativeTextInput = null,
     native_clipboard: ?NativeClipboard = null,
+    /// Set by the event/action router while invoking a callback. A callback
+    /// that mounts a declarative `autofocus` node can request that identity to
+    /// receive focus after the next successful reconciliation.
+    autofocus_request: ?*bool = null,
+    /// Set only while the router invokes a custom element event callback.
+    /// Keeping this out of the coordinator prevents a narrow request from
+    /// being overwritten by the handled-event default before dispatch ends.
+    custom_event_dirty: ?*?layout.Dirty = null,
 
     pub fn localPoint(self: *const Context, point: geometry.Point) geometry.Point {
         return self.world_to_local.transformPoint(point);
@@ -388,11 +417,23 @@ pub const Context = struct {
     }
 
     pub fn invalidate(self: *Context, dirty: layout.Dirty) Error!void {
+        if (self.custom_event_dirty) |requested| {
+            if (requested.*) |*existing| existing.merge(dirty) else requested.* = dirty;
+            return;
+        }
         try self.coordinator.invalidateComponent(self.component, dirty);
     }
 
     pub fn requestFrame(self: *Context) Error!void {
         _ = self.coordinator.invalidations.markWindow(self.window);
+    }
+
+    /// Transfer focus to the next declarative autofocus node after a callback
+    /// changes the retained tree. This is intentionally a request rather than
+    /// an immediate node lookup because the destination may not exist until
+    /// the callback's invalidated component is composed.
+    pub fn requestAutofocusAfterReconcile(self: *Context) void {
+        if (self.autofocus_request) |request| request.* = true;
     }
 
     pub fn setTextInputActive(self: *Context, active: bool) Error!void {

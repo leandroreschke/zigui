@@ -70,11 +70,23 @@ pub const Shadows = struct {
     }
 };
 
+/// Applies a bounded screen-space filter to the backdrop immediately behind a
+/// node before the node's own paint is composited.
+pub const BackdropEffect = struct {
+    /// Gaussian-like blur radius in logical points. Zero disables blur while
+    /// retaining any requested saturation adjustment.
+    blur_radius: f32 = 0,
+    /// Saturation multiplier. Zero produces grayscale, one preserves the
+    /// backdrop, and values above one increase saturation.
+    saturation: f32 = 1,
+};
+
 pub const PaintStyle = struct {
     background: Brush = .none,
     border: BorderStyle = .{},
     radii: geometry.CornerRadii = .{},
     shadows: Shadows = .{},
+    backdrop_effect: ?BackdropEffect = null,
     opacity: f32 = 1,
     transform: geometry.Affine2D = .identity,
 };
