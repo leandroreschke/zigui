@@ -262,19 +262,12 @@ fn resolveWeak(types: []Class, sequence: []const usize, sos: Class, eos: Class) 
         if (types[logical] == .nsm) types[logical] = previous;
         previous = if (isIsolateInitiator(types[logical]) or types[logical] == .pdi) .on else types[logical];
     }
-    for (sequence, 0..) |logical, position| if (types[logical] == .en) {
-        var before = sos;
-        var scan = position;
-        while (scan > 0) {
-            scan -= 1;
-            const candidate = types[sequence[scan]];
-            if (candidate == .l or candidate == .r or candidate == .al) {
-                before = candidate;
-                break;
-            }
-        }
-        if (before == .al) types[logical] = .an;
-    };
+    var preceding_strong = sos;
+    for (sequence) |logical| {
+        if (types[logical] == .en and preceding_strong == .al) types[logical] = .an;
+        if (types[logical] == .l or types[logical] == .r or types[logical] == .al)
+            preceding_strong = types[logical];
+    }
     for (sequence) |logical| {
         if (types[logical] == .al) types[logical] = .r;
     }
@@ -304,19 +297,11 @@ fn resolveWeak(types: []Class, sequence: []const usize, sos: Class, eos: Class) 
     for (sequence) |logical| {
         if (types[logical] == .es or types[logical] == .et or types[logical] == .cs) types[logical] = .on;
     }
-    for (sequence, 0..) |logical, current_position| if (types[logical] == .en) {
-        var before = sos;
-        var scan = current_position;
-        while (scan > 0) {
-            scan -= 1;
-            const candidate = types[sequence[scan]];
-            if (candidate == .l or candidate == .r) {
-                before = candidate;
-                break;
-            }
-        }
-        if (before == .l) types[logical] = .l;
-    };
+    preceding_strong = sos;
+    for (sequence) |logical| {
+        if (types[logical] == .en and preceding_strong == .l) types[logical] = .l;
+        if (types[logical] == .l or types[logical] == .r) preceding_strong = types[logical];
+    }
 }
 
 const OpenBracket = struct { sequence_position: usize, scalar: u21, pair: u21 };

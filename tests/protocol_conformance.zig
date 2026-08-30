@@ -64,6 +64,25 @@ test "D-Bus readers reject hostile cursors without arithmetic traps" {
     try testing.expectError(error.PlatformFailure, out_of_range.u32());
 }
 
+test "D-Bus value skipping enforces aggregate nested-variant depth" {
+    var shallow = dbus.Writer.init(testing.allocator);
+    defer shallow.deinit();
+    for (0..4) |_| try shallow.variantHeader("v");
+    try shallow.variantHeader("u");
+    try shallow.u32(7);
+    var shallow_reader: dbus.Reader = .{ .bytes = shallow.bytes.items };
+    try dbus.skipValue(&shallow_reader, "v");
+    try testing.expectEqual(shallow.bytes.items.len, shallow_reader.offset);
+
+    var hostile = dbus.Writer.init(testing.allocator);
+    defer hostile.deinit();
+    for (0..34) |_| try hostile.variantHeader("v");
+    try hostile.variantHeader("u");
+    try hostile.u32(7);
+    var hostile_reader: dbus.Reader = .{ .bytes = hostile.bytes.items };
+    try testing.expectError(error.BudgetExceeded, dbus.skipValue(&hostile_reader, "v"));
+}
+
 test "X11 request construction is bounded before allocation" {
     var writer = x11.Writer.init(testing.allocator);
     defer writer.deinit();
@@ -99,4 +118,14 @@ test "X11 PresentPixmap request has the fixed Present 1.4 wire size" {
     try testing.expectEqual(@as(u8, 146), request[0]);
     try testing.expectEqual(@as(u8, 1), request[1]);
     try testing.expectEqual(@as(u16, 18), try x11.readU16(request, 2));
+}
+
+test "X11 property replies cannot exceed the requested long count" {
+    try testing.expectEqual(@as(usize, 16), try x11_protocol.propertyReplyByteLength(8, 16, 4));
+    try testing.expectEqual(@as(usize, 16), try x11_protocol.propertyReplyByteLength(16, 8, 4));
+    try testing.expectEqual(@as(usize, 16), try x11_protocol.propertyReplyByteLength(32, 4, 4));
+    try testing.expectError(error.BudgetExceeded, x11_protocol.propertyReplyByteLength(8, 17, 4));
+    try testing.expectError(error.BudgetExceeded, x11_protocol.propertyReplyByteLength(16, 9, 4));
+    try testing.expectError(error.BudgetExceeded, x11_protocol.propertyReplyByteLength(32, 5, 4));
+    try testing.expectError(error.PlatformFailure, x11_protocol.propertyReplyByteLength(24, 1, 1));
 }

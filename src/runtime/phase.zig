@@ -20,6 +20,9 @@ pub const Phase = enum {
 pub const State = struct {
     current: Phase = .idle,
     callback_depth: u32 = 0,
+    /// User callbacks entered from renderer/native boundaries that must not
+    /// mutate App-owned registries while those boundaries retain borrows.
+    mutation_block_depth: u32 = 0,
     transaction_depth: u32 = 0,
     frame_callback_depth: u32 = 0,
 
@@ -31,6 +34,14 @@ pub const State = struct {
     pub fn enterCallback(self: *State) Error!CallbackGuard {
         if (self.callback_depth != 0) return error.CallbackReentrancy;
         self.callback_depth += 1;
+        return .{ .state = self };
+    }
+
+    pub fn enterMutationBlockedCallback(self: *State) Error!MutationBlockedCallbackGuard {
+        if (self.callback_depth != 0 or self.mutation_block_depth != 0)
+            return error.CallbackReentrancy;
+        self.callback_depth += 1;
+        self.mutation_block_depth += 1;
         return .{ .state = self };
     }
 
@@ -71,6 +82,18 @@ pub const State = struct {
             if (!self.active) return;
             self.active = false;
             self.state.transaction_depth -= 1;
+        }
+    };
+
+    pub const MutationBlockedCallbackGuard = struct {
+        state: *State,
+        active: bool = true,
+
+        pub fn deinit(self: *MutationBlockedCallbackGuard) void {
+            if (!self.active) return;
+            self.active = false;
+            self.state.mutation_block_depth -= 1;
+            self.state.callback_depth -= 1;
         }
     };
 

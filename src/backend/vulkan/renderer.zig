@@ -962,6 +962,7 @@ pub const Renderer = struct {
 
     fn recover(raw: *anyopaque, policy: config.GpuPolicy) Error!void {
         const self = cast(raw);
+        if (self.extensions.callbacksActive()) return error.CallbackReentrancy;
         self.active = null;
         self.waitAllGpu() catch {};
 

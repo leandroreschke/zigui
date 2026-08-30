@@ -14,6 +14,7 @@ pub fn apply(
 ) Error!void {
     for (applications) |application| {
         const lookup_value = try layout.lookup(try font.table("GSUB".*), application.index);
+        try buffer.chargeLookupWork(lookup_value.subtable_count);
         if (try lookupIsReverse(lookup_value)) {
             var reverse_index = buffer.glyphs.items.len;
             while (reverse_index > 0) {
@@ -58,11 +59,13 @@ fn applyLookupAt(
     depth: u8,
     next_index: ?*usize,
 ) Error!bool {
+    try buffer.chargeLookupWork(1);
     if (depth >= 32) return error.InvalidFont;
     if (index >= buffer.glyphs.items.len) return false;
     if (layout.ignored(font, buffer.glyphs.items[index], lookup_value) or !application.applies(buffer.glyphs.items[index])) return false;
     var subtable_index: usize = 0;
     while (subtable_index < lookup_value.subtable_count) : (subtable_index += 1) {
+        try buffer.chargeLookupWork(1);
         const subtable = try lookup_value.subtable(subtable_index);
         if (try applySubtable(allocator, font, buffer, lookup_value, application, index, lookup_value.kind, subtable, depth, next_index)) return true;
     }
@@ -167,6 +170,7 @@ fn ligature(
     const ligature_count = try layout.u16(set, 0);
     var ligature_index: usize = 0;
     while (ligature_index < ligature_count) : (ligature_index += 1) {
+        try buffer.chargeLookupWork(1);
         const value = try layout.offsetSlice(set, try layout.u16(set, 2 + ligature_index * 2), 4);
         const component_count = try layout.u16(value, 2);
         if (component_count == 0 or component_count > maximum_context) return error.InvalidFont;
@@ -175,7 +179,7 @@ fn ligature(
         var matched: usize = 1;
         var cursor = index + 1;
         while (matched < component_count) : (matched += 1) {
-            const position = layout.nextIncluded(font, buffer, cursor, lookup_value) orelse break;
+            const position = (try layout.nextIncluded(font, buffer, cursor, lookup_value)) orelse break;
             if (!application.applies(buffer.glyphs.items[position])) break;
             if (buffer.glyphs.items[position].id != try layout.u16(value, 4 + (matched - 1) * 2)) break;
             positions[matched] = position;
@@ -257,7 +261,7 @@ fn reverse(
     var position = index;
     var item: usize = 0;
     while (item < backtrack_count) : (item += 1) {
-        position = layout.previousIncluded(font, buffer, position, lookup_value) orelse return false;
+        position = (try layout.previousIncluded(font, buffer, position, lookup_value)) orelse return false;
         if (try layout.coverageIndex(subtable, try layout.u16(subtable, cursor + item * 2), buffer.glyphs.items[position].id) == null) return false;
     }
     cursor += @as(usize, backtrack_count) * 2;
@@ -267,7 +271,7 @@ fn reverse(
     position = index + 1;
     item = 0;
     while (item < lookahead_count) : (item += 1) {
-        position = layout.nextIncluded(font, buffer, position, lookup_value) orelse return false;
+        position = (try layout.nextIncluded(font, buffer, position, lookup_value)) orelse return false;
         if (try layout.coverageIndex(subtable, try layout.u16(subtable, cursor + item * 2), buffer.glyphs.items[position].id) == null) return false;
         position += 1;
     }
@@ -336,6 +340,7 @@ fn simpleContext(
             const count = try layout.u16(set, 0);
             var rule_index: usize = 0;
             while (rule_index < count) : (rule_index += 1) {
+                try buffer.chargeLookupWork(1);
                 const rule = try layout.offsetSlice(set, try layout.u16(set, 2 + rule_index * 2), 4);
                 const glyph_count = try layout.u16(rule, 0);
                 const record_count = try layout.u16(rule, 2);
@@ -355,6 +360,7 @@ fn simpleContext(
             const count = try layout.u16(set, 0);
             var rule_index: usize = 0;
             while (rule_index < count) : (rule_index += 1) {
+                try buffer.chargeLookupWork(1);
                 const rule = try layout.offsetSlice(set, try layout.u16(set, 2 + rule_index * 2), 4);
                 const glyph_count = try layout.u16(rule, 0);
                 const record_count = try layout.u16(rule, 2);
@@ -400,6 +406,7 @@ fn chainContext(
             const count = try layout.u16(set, 0);
             var rule_index: usize = 0;
             while (rule_index < count) : (rule_index += 1) {
+                try buffer.chargeLookupWork(1);
                 const rule = try layout.offsetSlice(set, try layout.u16(set, 2 + rule_index * 2), 2);
                 const parsed = try parseChainRule(font, buffer, lookup_value, index, rule, .glyph, subtable, 0, 0, 0, &matched);
                 if (parsed) |record| return applyRecords(allocator, font, buffer, application, matched[0..record.input_count], rule, record.record_offset, record.record_count, depth, next_index);
@@ -418,6 +425,7 @@ fn chainContext(
             const count = try layout.u16(set, 0);
             var rule_index: usize = 0;
             while (rule_index < count) : (rule_index += 1) {
+                try buffer.chargeLookupWork(1);
                 const rule = try layout.offsetSlice(set, try layout.u16(set, 2 + rule_index * 2), 2);
                 const parsed = try parseChainRule(font, buffer, lookup_value, index, rule, .class, subtable, backtrack_class, input_class, lookahead_class, &matched);
                 if (parsed) |record| return applyRecords(allocator, font, buffer, application, matched[0..record.input_count], rule, record.record_offset, record.record_count, depth, next_index);
@@ -455,7 +463,7 @@ fn parseChainRule(
     var position = index;
     var item: usize = 0;
     while (item < backtrack_count) : (item += 1) {
-        position = layout.previousIncluded(font, buffer, position, lookup_value) orelse return null;
+        position = (try layout.previousIncluded(font, buffer, position, lookup_value)) orelse return null;
         const expected = try layout.u16(rule, cursor + item * 2);
         const actual = if (kind == .glyph) buffer.glyphs.items[position].id else try layout.classValue(class_base, backtrack_class, buffer.glyphs.items[position].id);
         if (actual != expected) return null;
@@ -468,7 +476,7 @@ fn parseChainRule(
     position = index + 1;
     item = 1;
     while (item < input_count) : (item += 1) {
-        position = layout.nextIncluded(font, buffer, position, lookup_value) orelse return null;
+        position = (try layout.nextIncluded(font, buffer, position, lookup_value)) orelse return null;
         const expected = try layout.u16(rule, cursor + (item - 1) * 2);
         const actual = if (kind == .glyph) buffer.glyphs.items[position].id else try layout.classValue(class_base, input_class, buffer.glyphs.items[position].id);
         if (actual != expected) return null;
@@ -480,7 +488,7 @@ fn parseChainRule(
     cursor += 2;
     item = 0;
     while (item < lookahead_count) : (item += 1) {
-        position = layout.nextIncluded(font, buffer, position, lookup_value) orelse return null;
+        position = (try layout.nextIncluded(font, buffer, position, lookup_value)) orelse return null;
         const expected = try layout.u16(rule, cursor + item * 2);
         const actual = if (kind == .glyph) buffer.glyphs.items[position].id else try layout.classValue(class_base, lookahead_class, buffer.glyphs.items[position].id);
         if (actual != expected) return null;
@@ -506,7 +514,7 @@ fn parseChainCoverage(
     var position = index;
     var item: usize = 0;
     while (item < backtrack_count) : (item += 1) {
-        position = layout.previousIncluded(font, buffer, position, lookup_value) orelse return null;
+        position = (try layout.previousIncluded(font, buffer, position, lookup_value)) orelse return null;
         if (try layout.coverageIndex(subtable, try layout.u16(subtable, cursor + item * 2), buffer.glyphs.items[position].id) == null) return null;
     }
     cursor += @as(usize, backtrack_count) * 2;
@@ -516,7 +524,7 @@ fn parseChainCoverage(
     position = index;
     item = 0;
     while (item < input_count) : (item += 1) {
-        position = if (item == 0) index else layout.nextIncluded(font, buffer, position + 1, lookup_value) orelse return null;
+        position = if (item == 0) index else (try layout.nextIncluded(font, buffer, position + 1, lookup_value)) orelse return null;
         if (try layout.coverageIndex(subtable, try layout.u16(subtable, cursor + item * 2), buffer.glyphs.items[position].id) == null) return null;
         matched[item] = position;
     }
@@ -526,7 +534,7 @@ fn parseChainCoverage(
     position = matched[input_count - 1] + 1;
     item = 0;
     while (item < lookahead_count) : (item += 1) {
-        position = layout.nextIncluded(font, buffer, position, lookup_value) orelse return null;
+        position = (try layout.nextIncluded(font, buffer, position, lookup_value)) orelse return null;
         if (try layout.coverageIndex(subtable, try layout.u16(subtable, cursor + item * 2), buffer.glyphs.items[position].id) == null) return null;
         position += 1;
     }
@@ -547,7 +555,7 @@ fn matchGlyphSequence(
     var position = index + 1;
     var item: usize = 0;
     while (item < count) : (item += 1) {
-        position = layout.nextIncluded(font, buffer, position, lookup_value) orelse return false;
+        position = (try layout.nextIncluded(font, buffer, position, lookup_value)) orelse return false;
         if (buffer.glyphs.items[position].id != try layout.u16(expected, item * 2)) return false;
         matched[item + 1] = position;
         position += 1;
@@ -569,7 +577,7 @@ fn matchClassSequence(
     var position = index + 1;
     var item: usize = 0;
     while (item < count) : (item += 1) {
-        position = layout.nextIncluded(font, buffer, position, lookup_value) orelse return false;
+        position = (try layout.nextIncluded(font, buffer, position, lookup_value)) orelse return false;
         if (try layout.classValue(class_base, class_offset, buffer.glyphs.items[position].id) != try layout.u16(expected, item * 2)) return false;
         matched[item + 1] = position;
         position += 1;
@@ -590,7 +598,7 @@ fn matchCoverageSequence(
     var position = index;
     var item: usize = 0;
     while (item < count) : (item += 1) {
-        if (item != 0) position = layout.nextIncluded(font, buffer, position + 1, lookup_value) orelse return false;
+        if (item != 0) position = (try layout.nextIncluded(font, buffer, position + 1, lookup_value)) orelse return false;
         if (try layout.coverageIndex(coverage_base, try layout.u16(offsets, item * 2), buffer.glyphs.items[position].id) == null) return false;
         matched[item] = position;
     }

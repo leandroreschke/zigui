@@ -156,9 +156,20 @@ pub const Client = struct {
     }
 
     pub fn waitReply(self: *Client, sequence: u16) Error!Packet {
+        return self.waitReplyLimited(sequence, maximum_packet_bytes);
+    }
+
+    /// Waits for one reply while enforcing a request-specific cap from the
+    /// 32-byte X11 header, before the declared body is read or duplicated.
+    pub fn waitReplyLimited(self: *Client, sequence: u16, maximum_reply_bytes: usize) Error!Packet {
         if (self.broken) return error.PlatformFailure;
+        if (maximum_reply_bytes < 32) return error.InvalidConfiguration;
         while (true) {
-            var packet = (try self.receivePacket(true)) orelse return error.PlatformFailure;
+            var packet = (self.receivePacketWithReplyLimit(true, @min(maximum_reply_bytes, maximum_packet_bytes)) catch |err| {
+                self.broken = true;
+                return err;
+            }) orelse
+                return error.PlatformFailure;
             if (packet.kind == .event) {
                 self.enqueuePending(packet) catch |err| {
                     self.broken = true;
@@ -214,6 +225,10 @@ pub const Client = struct {
     }
 
     fn receivePacket(self: *Client, wait: bool) Error!?Packet {
+        return self.receivePacketWithReplyLimit(wait, maximum_packet_bytes);
+    }
+
+    fn receivePacketWithReplyLimit(self: *Client, wait: bool, maximum_reply_bytes: usize) Error!?Packet {
         while (self.available() < 32) {
             if (!try self.fill(wait)) return null;
         }
@@ -226,6 +241,7 @@ pub const Client = struct {
         const extra = std.math.mul(usize, extra_words, 4) catch return error.BudgetExceeded;
         const length = std.math.add(usize, 32, extra) catch return error.BudgetExceeded;
         if (length > maximum_packet_bytes) return error.BudgetExceeded;
+        if (response_type == 1 and length > maximum_reply_bytes) return error.BudgetExceeded;
         while (self.available() < length) _ = try self.fill(true);
         const bytes = try self.allocator.dupe(u8, self.input.items[self.input_cursor..][0..length]);
         self.input_cursor += length;

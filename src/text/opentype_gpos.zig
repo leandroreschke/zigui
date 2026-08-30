@@ -25,6 +25,7 @@ pub fn apply(
     const table = try font.table("GPOS".*);
     for (applications) |application| {
         const lookup_value = try layout.lookup(table, application.index);
+        try buffer.chargeLookupWork(lookup_value.subtable_count);
         var index: usize = 0;
         while (index < buffer.glyphs.items.len) : (index += 1) {
             if (try applyLookupAt(allocator, font, buffer, lookup_value, application, direction, index, 0) and
@@ -45,11 +46,13 @@ fn applyLookupAt(
     index: usize,
     depth: u8,
 ) Error!bool {
+    try buffer.chargeLookupWork(1);
     if (depth >= 32) return error.InvalidFont;
     if (index >= buffer.glyphs.items.len) return false;
     if (layout.ignored(font, buffer.glyphs.items[index], lookup_value) or !application.applies(buffer.glyphs.items[index])) return false;
     var subtable_index: usize = 0;
     while (subtable_index < lookup_value.subtable_count) : (subtable_index += 1) {
+        try buffer.chargeLookupWork(1);
         const subtable = try lookup_value.subtable(subtable_index);
         if (try applySubtable(allocator, font, buffer, lookup_value, application, direction, index, lookup_value.kind, subtable, depth)) return true;
     }
@@ -113,7 +116,7 @@ fn pair(
 ) Error!bool {
     const format = try layout.u16(subtable, 0);
     if (try layout.coverageIndex(subtable, try layout.u16(subtable, 2), buffer.glyphs.items[index].id) == null or !application.applies(buffer.glyphs.items[index])) return false;
-    const second_index = layout.nextIncluded(font, buffer, index + 1, lookup_value) orelse return false;
+    const second_index = (try layout.nextIncluded(font, buffer, index + 1, lookup_value)) orelse return false;
     if (!application.applies(buffer.glyphs.items[second_index])) return false;
     const value_format1 = try layout.u16(subtable, 4);
     const value_format2 = try layout.u16(subtable, 6);
@@ -171,7 +174,7 @@ fn cursive(
 ) Error!bool {
     if (try layout.u16(subtable, 0) != 1 or !application.applies(buffer.glyphs.items[index])) return false;
     const current_coverage = try layout.coverageIndex(subtable, try layout.u16(subtable, 2), buffer.glyphs.items[index].id) orelse return false;
-    const previous_index = layout.previousIncluded(font, buffer, index, lookup_value) orelse return false;
+    const previous_index = (try layout.previousIncluded(font, buffer, index, lookup_value)) orelse return false;
     if (!application.applies(buffer.glyphs.items[previous_index])) return false;
     const previous_coverage = try layout.coverageIndex(subtable, try layout.u16(subtable, 2), buffer.glyphs.items[previous_index].id) orelse return false;
     const count = try layout.u16(subtable, 4);
@@ -202,9 +205,9 @@ fn markToBase(
 ) Error!bool {
     if (try layout.u16(subtable, 0) != 1 or !application.applies(buffer.glyphs.items[index])) return false;
     const mark_index = try layout.coverageIndex(subtable, try layout.u16(subtable, 2), buffer.glyphs.items[index].id) orelse return false;
-    var base_index = layout.previousIncluded(font, buffer, index, lookup_value) orelse return false;
+    var base_index = (try layout.previousIncluded(font, buffer, index, lookup_value)) orelse return false;
     while (base_index > 0 and try layout.coverageIndex(subtable, try layout.u16(subtable, 4), buffer.glyphs.items[base_index].id) == null)
-        base_index = layout.previousIncluded(font, buffer, base_index, lookup_value) orelse return false;
+        base_index = (try layout.previousIncluded(font, buffer, base_index, lookup_value)) orelse return false;
     const base_coverage = try layout.coverageIndex(subtable, try layout.u16(subtable, 4), buffer.glyphs.items[base_index].id) orelse return false;
     return attachMark(font, buffer, index, base_index, subtable, try layout.u16(subtable, 8), mark_index, try layout.u16(subtable, 10), base_coverage, try layout.u16(subtable, 6));
 }
@@ -219,9 +222,9 @@ fn markToLigature(
 ) Error!bool {
     if (try layout.u16(subtable, 0) != 1 or !application.applies(buffer.glyphs.items[index])) return false;
     const mark_index = try layout.coverageIndex(subtable, try layout.u16(subtable, 2), buffer.glyphs.items[index].id) orelse return false;
-    var ligature_index = layout.previousIncluded(font, buffer, index, lookup_value) orelse return false;
+    var ligature_index = (try layout.previousIncluded(font, buffer, index, lookup_value)) orelse return false;
     while (ligature_index > 0 and try layout.coverageIndex(subtable, try layout.u16(subtable, 4), buffer.glyphs.items[ligature_index].id) == null)
-        ligature_index = layout.previousIncluded(font, buffer, ligature_index, lookup_value) orelse return false;
+        ligature_index = (try layout.previousIncluded(font, buffer, ligature_index, lookup_value)) orelse return false;
     const ligature_coverage = try layout.coverageIndex(subtable, try layout.u16(subtable, 4), buffer.glyphs.items[ligature_index].id) orelse return false;
     const ligature_array = try layout.offsetSlice(subtable, try layout.u16(subtable, 10), 2);
     if (ligature_coverage >= try layout.u16(ligature_array, 0)) return error.InvalidFont;
@@ -242,7 +245,7 @@ fn markToMark(
 ) Error!bool {
     if (try layout.u16(subtable, 0) != 1 or !application.applies(buffer.glyphs.items[index])) return false;
     const mark1_index = try layout.coverageIndex(subtable, try layout.u16(subtable, 2), buffer.glyphs.items[index].id) orelse return false;
-    const mark2_position = layout.previousIncluded(font, buffer, index, lookup_value) orelse return false;
+    const mark2_position = (try layout.previousIncluded(font, buffer, index, lookup_value)) orelse return false;
     const mark2_index = try layout.coverageIndex(subtable, try layout.u16(subtable, 4), buffer.glyphs.items[mark2_position].id) orelse return false;
     return attachMark(font, buffer, index, mark2_position, subtable, try layout.u16(subtable, 8), mark1_index, try layout.u16(subtable, 10), mark2_index, try layout.u16(subtable, 6));
 }
@@ -318,7 +321,7 @@ fn context(
         var position = index;
         var item: usize = 0;
         while (item < backtrack_count) : (item += 1) {
-            position = layout.previousIncluded(font, buffer, position, lookup_value) orelse return false;
+            position = (try layout.previousIncluded(font, buffer, position, lookup_value)) orelse return false;
             if (try layout.coverageIndex(subtable, try layout.u16(subtable, cursor + item * 2), buffer.glyphs.items[position].id) == null) return false;
         }
         cursor += @as(usize, backtrack_count) * 2;
@@ -329,7 +332,7 @@ fn context(
     var position = index;
     var item: usize = 0;
     while (item < input_count) : (item += 1) {
-        if (item != 0) position = layout.nextIncluded(font, buffer, position + 1, lookup_value) orelse return false;
+        if (item != 0) position = (try layout.nextIncluded(font, buffer, position + 1, lookup_value)) orelse return false;
         if (try layout.coverageIndex(subtable, try layout.u16(subtable, cursor + item * 2), buffer.glyphs.items[position].id) == null) return false;
         matched[item] = position;
     }
@@ -341,7 +344,7 @@ fn context(
         position = matched[input_count - 1] + 1;
         item = 0;
         while (item < lookahead_count) : (item += 1) {
-            position = layout.nextIncluded(font, buffer, position, lookup_value) orelse return false;
+            position = (try layout.nextIncluded(font, buffer, position, lookup_value)) orelse return false;
             if (try layout.coverageIndex(subtable, try layout.u16(subtable, cursor + item * 2), buffer.glyphs.items[position].id) == null) return false;
             position += 1;
         }
@@ -379,6 +382,7 @@ fn contextClassOrGlyph(
         const rule_count = try layout.u16(set, 0);
         var rule_index: usize = 0;
         while (rule_index < rule_count) : (rule_index += 1) {
+            try buffer.chargeLookupWork(1);
             const rule = try layout.offsetSlice(set, try layout.u16(set, 2 + rule_index * 2), 4);
             const glyph_count = try layout.u16(rule, 0);
             const record_count = try layout.u16(rule, 2);
@@ -401,6 +405,7 @@ fn contextClassOrGlyph(
     const rule_count = try layout.u16(set, 0);
     var rule_index: usize = 0;
     while (rule_index < rule_count) : (rule_index += 1) {
+        try buffer.chargeLookupWork(1);
         const rule = try layout.offsetSlice(set, try layout.u16(set, 2 + rule_index * 2), 2);
         const parsed = try matchChainRule(font, buffer, lookup_value, index, rule, format == 2, subtable, backtrack_class, input_class, lookahead_class, &matched) orelse continue;
         return applyRecords(allocator, font, buffer, application, direction, matched[0..parsed.input_count], rule, parsed.record_offset, parsed.record_count, depth);
@@ -425,7 +430,7 @@ fn matchInput(
     var position = index + 1;
     var item: usize = 0;
     while (item < count) : (item += 1) {
-        position = layout.nextIncluded(font, buffer, position, lookup_value) orelse return false;
+        position = (try layout.nextIncluded(font, buffer, position, lookup_value)) orelse return false;
         const actual = if (classes) try layout.classValue(class_base, class_offset, buffer.glyphs.items[position].id) else buffer.glyphs.items[position].id;
         if (actual != try layout.u16(expected, item * 2)) return false;
         matched[item + 1] = position;
@@ -454,7 +459,7 @@ fn matchChainRule(
     var position = index;
     var item: usize = 0;
     while (item < backtrack_count) : (item += 1) {
-        position = layout.previousIncluded(font, buffer, position, lookup_value) orelse return null;
+        position = (try layout.previousIncluded(font, buffer, position, lookup_value)) orelse return null;
         const actual = if (classes) try layout.classValue(class_base, backtrack_class, buffer.glyphs.items[position].id) else buffer.glyphs.items[position].id;
         if (actual != try layout.u16(rule, cursor + item * 2)) return null;
     }
@@ -466,7 +471,7 @@ fn matchChainRule(
     position = index + 1;
     item = 1;
     while (item < input_count) : (item += 1) {
-        position = layout.nextIncluded(font, buffer, position, lookup_value) orelse return null;
+        position = (try layout.nextIncluded(font, buffer, position, lookup_value)) orelse return null;
         const actual = if (classes) try layout.classValue(class_base, input_class, buffer.glyphs.items[position].id) else buffer.glyphs.items[position].id;
         if (actual != try layout.u16(rule, cursor + (item - 1) * 2)) return null;
         matched[item] = position;
@@ -478,7 +483,7 @@ fn matchChainRule(
     if (lookahead_count > maximum_context) return error.InvalidFont;
     item = 0;
     while (item < lookahead_count) : (item += 1) {
-        position = layout.nextIncluded(font, buffer, position, lookup_value) orelse return null;
+        position = (try layout.nextIncluded(font, buffer, position, lookup_value)) orelse return null;
         const actual = if (classes) try layout.classValue(class_base, lookahead_class, buffer.glyphs.items[position].id) else buffer.glyphs.items[position].id;
         if (actual != try layout.u16(rule, cursor + item * 2)) return null;
         position += 1;

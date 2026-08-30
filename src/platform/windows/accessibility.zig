@@ -592,7 +592,7 @@ fn simpleRelease(object: *uia.Object) callconv(.winapi) u32 {
 }
 fn providerOptions(object: *uia.Object, output: *i32) callconv(.winapi) win.HRESULT {
     if (simpleParent(object).adapter == null) return uia.element_not_available;
-    output.* = uia.provider_server_side | uia.provider_owns_set_focus;
+    output.* = uia.provider_server_side | uia.provider_owns_set_focus | uia.provider_use_com_threading;
     return win.S_OK;
 }
 fn getPatternProvider(object: *uia.Object, pattern_id: i32, output: *?*uia.Object) callconv(.winapi) win.HRESULT {
@@ -901,10 +901,30 @@ fn valueRelease(object: *uia.Object) callconv(.winapi) u32 {
 fn valueSet(object: *uia.Object, wide: ?[*:0]const u16) callconv(.winapi) win.HRESULT {
     const self = valueParent(object);
     const adapter = self.adapter orelse return uia.element_not_available;
-    const units: []const u16 = if (wide) |value| value[0..std.mem.len(value)] else &.{};
+    const maximum_units = adapter.maximum_tree_bytes / @sizeOf(u16);
+    const units: []const u16 = if (wide) |value| boundedWide(value, maximum_units) orelse return win.E_INVALIDARG else &.{};
+    if (utf16Utf8Length(units, adapter.maximum_tree_bytes) == null) return win.E_INVALIDARG;
     const bytes = std.unicode.utf16LeToUtf8Alloc(self.allocator, units) catch return win.E_INVALIDARG;
     defer self.allocator.free(bytes);
     return adapter.emit(self, .set_value, bytes, null);
+}
+
+fn boundedWide(value: [*:0]const u16, maximum_units: usize) ?[]const u16 {
+    var length: usize = 0;
+    while (length <= maximum_units) : (length += 1) {
+        if (value[length] == 0) return value[0..length];
+    }
+    return null;
+}
+
+fn utf16Utf8Length(units: []const u16, maximum_bytes: usize) ?usize {
+    var iterator = std.unicode.Utf16LeIterator.init(units);
+    var bytes: usize = 0;
+    while ((iterator.nextCodepoint() catch return null)) |codepoint| {
+        bytes = std.math.add(usize, bytes, std.unicode.utf8CodepointSequenceLength(codepoint) catch return null) catch return null;
+        if (bytes > maximum_bytes) return null;
+    }
+    return bytes;
 }
 fn valueGet(object: *uia.Object, output: *uia.BStr) callconv(.winapi) win.HRESULT {
     const self = valueParent(object);

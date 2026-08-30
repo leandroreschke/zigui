@@ -52,6 +52,11 @@ rotating horizontal output.
   ANIM/ANMF animations are exposed as owned RGBA8 frames with validated canvas
   dimensions, frame delays, and loop counts. Other targets return
   `error.Unsupported` until a native or in-tree WebP provider is selected.
+- AVIF: on macOS builds, still images are decoded through ImageIO only after
+  their metadata dimensions pass ZigUI's decoded-pixel and working-memory
+  budgets; decoded dimensions are checked again before the owned premultiplied
+  Quartz pixels are normalized to straight RGBA8. Other targets return
+  `error.Unsupported`. AVIF animation is not part of the current contract.
 - BMP: uncompressed 24-bit and uncompressed/bitfield 32-bit DIB images,
   top-down rows, alpha masks, and supported embedded matrix/TRC color profiles.
 - QOI: RGB and RGBA streams in sRGB or linear color space.
@@ -59,6 +64,8 @@ rotating horizontal output.
 Decoded output is owned RGBA8 in a declared color space. Orientation is
 applied explicitly. Matrix/TRC ICC profiles are converted to linear sRGB;
 linked profiles and LUT-processing profiles return `error.Unsupported`.
+Native ImageIO output is normalized from premultiplied to straight RGBA before
+it enters the same texture contract.
 
 ## SVG
 

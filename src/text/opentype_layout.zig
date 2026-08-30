@@ -29,6 +29,8 @@ pub const indic_pstf: u16 = 1 << 5;
 pub const indic_init: u16 = 1 << 6;
 pub const indic_basic_form_mask: u16 = indic_rphf | indic_rkrf | indic_pref | indic_blwf | indic_half | indic_pstf;
 pub const maximum_buffer_glyphs = 1_000_000;
+pub const maximum_lookup_applications = 65_536;
+pub const maximum_lookup_work_units = 16_000_000;
 
 pub const Glyph = struct {
     id: u16,
@@ -49,6 +51,7 @@ pub const Glyph = struct {
 pub const Buffer = struct {
     glyphs: std.ArrayList(Glyph) = .empty,
     next_ligature_id: u32 = 1,
+    lookup_work_units: usize = 0,
 
     pub fn deinit(self: *Buffer, allocator: std.mem.Allocator) void {
         self.glyphs.deinit(allocator);
@@ -60,6 +63,11 @@ pub const Buffer = struct {
         const retained = self.glyphs.items.len - count;
         if (retained > maximum_buffer_glyphs or values.len > maximum_buffer_glyphs - retained) return error.BudgetExceeded;
         try self.glyphs.replaceRange(allocator, index, count, values);
+    }
+
+    pub fn chargeLookupWork(self: *Buffer, amount: usize) Error!void {
+        self.lookup_work_units = std.math.add(usize, self.lookup_work_units, amount) catch return error.BudgetExceeded;
+        if (self.lookup_work_units > maximum_lookup_work_units) return error.BudgetExceeded;
     }
 };
 
@@ -401,6 +409,7 @@ fn appendFeatureLookups(
         try offsetSlice(feature_list, try readU16(feature_list, record + 4), 4);
     const lookup_count = try readU16(feature, 2);
     if (4 + @as(usize, lookup_count) * 2 > feature.len) return error.InvalidFont;
+    if (output.items.len > maximum_lookup_applications -| @as(usize, lookup_count)) return error.BudgetExceeded;
     var index: usize = 0;
     while (index < lookup_count) : (index += 1) try output.append(allocator, .{
         .index = try readU16(feature, 4 + index * 2),
@@ -605,16 +614,20 @@ pub fn ignored(font: opentype.Font, glyph: Glyph, lookup_value: Lookup) bool {
     return false;
 }
 
-pub fn nextIncluded(font: opentype.Font, buffer: *const Buffer, start: usize, lookup_value: Lookup) ?usize {
+pub fn nextIncluded(font: opentype.Font, buffer: *Buffer, start: usize, lookup_value: Lookup) Error!?usize {
     var index = start;
-    while (index < buffer.glyphs.items.len) : (index += 1) if (!ignored(font, buffer.glyphs.items[index], lookup_value)) return index;
+    while (index < buffer.glyphs.items.len) : (index += 1) {
+        try buffer.chargeLookupWork(1);
+        if (!ignored(font, buffer.glyphs.items[index], lookup_value)) return index;
+    }
     return null;
 }
 
-pub fn previousIncluded(font: opentype.Font, buffer: *const Buffer, start: usize, lookup_value: Lookup) ?usize {
+pub fn previousIncluded(font: opentype.Font, buffer: *Buffer, start: usize, lookup_value: Lookup) Error!?usize {
     var index = start;
     while (index > 0) {
         index -= 1;
+        try buffer.chargeLookupWork(1);
         if (!ignored(font, buffer.glyphs.items[index], lookup_value)) return index;
     }
     return null;

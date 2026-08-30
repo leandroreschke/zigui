@@ -37,6 +37,7 @@ extern "c" fn CGWindowListCreateImage(bounds: types.Rect, list_option: u32, wind
 extern "c" fn CGImageGetWidth(image: objc.Id) usize;
 extern "c" fn CGImageGetHeight(image: objc.Id) usize;
 extern "c" fn CGImageRelease(image: objc.Id) void;
+extern "c" var CGRectNull: types.Rect;
 extern "c" var _dispatch_main_q: u8;
 extern "c" fn dispatch_async_f(queue: objc.Id, context: ?*anyopaque, work: *const fn (?*anyopaque) callconv(.c) void) void;
 extern "c" fn dispatch_time(when: u64, delta: i64) u64;
@@ -243,6 +244,9 @@ pub const Context = struct {
         maximum_retained_text_bytes: usize,
         maximum_native_media_players: usize,
         maximum_platform_objects: usize,
+        maximum_page_capture_result_bytes: usize,
+        maximum_page_capture_pixels: usize,
+        maximum_page_capture_requests: usize,
     ) Error!*Context {
         if (pthread_main_np() == 0) return error.ThreadAffinity;
         var pool = objc.AutoreleasePool.init();
@@ -300,10 +304,10 @@ pub const Context = struct {
         _ = self.promised_file_service.interface();
         self.page_capture_service = try page_capture.Service.init(
             allocator,
-            maximum_platform_objects,
+            maximum_page_capture_requests,
             maximum_retained_text_bytes,
-            maximum_event_payload_bytes,
-            @max(1, maximum_event_payload_bytes / 4),
+            maximum_page_capture_result_bytes,
+            maximum_page_capture_pixels,
             16_384,
             60 * std.time.ns_per_s,
             maximum_event_payload_bytes,
@@ -745,6 +749,9 @@ pub fn create(allocator: std.mem.Allocator, app_config: config.AppConfig) Error!
         app_config.memory.platform_retained_text_bytes,
         app_config.memory.media_source_count,
         app_config.memory.platform_object_count,
+        app_config.memory.encoded_image_bytes,
+        @max(1, app_config.memory.decoded_image_bytes / 4),
+        app_config.memory.offscreen_request_count,
     );
     errdefer context.deinit();
     if (app_config.pointer_event_coalescing == .disabled) {
@@ -788,7 +795,7 @@ pub fn create(allocator: std.mem.Allocator, app_config: config.AppConfig) Error!
             .context = context,
             .run_fn = run,
             .step_fn = step,
-            .wake_fn = wake,
+            .wake_fn = wakeEventLoop,
             .schedule_wake_fn = scheduleWake,
             .request_quit_fn = requestQuit,
             .clock = .{ .context = context, .now_fn = nowOpaque },
@@ -848,6 +855,7 @@ pub fn create(allocator: std.mem.Allocator, app_config: config.AppConfig) Error!
             .context = context,
             .open_files_fn = openFiles,
             .save_file_fn = saveFile,
+            .open_directory_fn = openDirectory,
             .limits = .{
                 .maximum_paths = app_config.memory.file_drop_path_count,
                 .maximum_path_bytes = app_config.memory.platform_event_payload_bytes,
@@ -1013,6 +1021,10 @@ fn wake(raw: ?*anyopaque) void {
     postWakeEvent(cast(raw orelse return));
 }
 
+fn wakeEventLoop(raw: *anyopaque) void {
+    wake(raw);
+}
+
 fn scheduleWake(raw: *anyopaque, deadline_ns: clock.Timestamp) Error!void {
     const self = cast(raw);
     const state = self.delayed_wake_state orelse return error.AppClosed;
@@ -1132,7 +1144,6 @@ fn createWindow(raw: *anyopaque, id: handles.WindowId, options: api.WindowOption
         .scale_factor = scale,
         .visible = options.visible,
     });
-    _ = flushPendingApplicationOpen(self, id);
     ns_window_owned = false;
     objc.release(view);
     view_owned = false;
@@ -1531,7 +1542,7 @@ fn captureWindow(
     const window_number = objc.send(isize, window.ns_window, "windowNumber", .{});
     if (window_number <= 0 or @as(u64, @intCast(window_number)) > std.math.maxInt(u32)) return error.InvalidHandle;
     const capture = CGWindowListCreateImage(
-        cgRectNull(),
+        CGRectNull,
         cg_window_list_option_including_window,
         @intCast(window_number),
         cg_window_image_bounds_ignore_framing | cg_window_image_nominal_resolution,
@@ -1602,13 +1613,6 @@ fn captureWindow(
         .width = @intCast(output_width),
         .height = @intCast(output_height),
         .scale_factor = window.scale_factor,
-    };
-}
-
-fn cgRectNull() types.Rect {
-    return .{
-        .origin = .{ .x = std.math.floatMax(f64), .y = std.math.floatMax(f64) },
-        .size = .{ .width = -1, .height = -1 },
     };
 }
 
@@ -2227,6 +2231,21 @@ fn openFiles(raw: *anyopaque, id: handles.WindowId, multiple: bool, allocator: s
     return .{ .allocator = allocator, .values = paths };
 }
 
+fn openDirectory(raw: *anyopaque, id: handles.WindowId, allocator: std.mem.Allocator) Error!?api.OwnedPath {
+    const self = cast(raw);
+    if (!self.windows.contains(id.encode())) return error.InvalidHandle;
+    var pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const panel = objc.send(objc.Id, objc.class("NSOpenPanel"), "openPanel", .{}) orelse return error.PlatformFailure;
+    objc.send(void, panel, "setAllowsMultipleSelection:", .{false});
+    objc.send(void, panel, "setCanChooseFiles:", .{false});
+    objc.send(void, panel, "setCanChooseDirectories:", .{true});
+    if (objc.send(isize, panel, "runModal", .{}) != 1) return null;
+    const url = objc.send(objc.Id, panel, "URL", .{});
+    const path = objc.send(objc.Id, url, "path", .{});
+    return .{ .allocator = allocator, .value = try allocator.dupe(u8, objc.utf8(path)) };
+}
+
 fn saveFile(raw: *anyopaque, id: handles.WindowId, suggested_name: []const u8, allocator: std.mem.Allocator) Error!?api.OwnedPath {
     const self = cast(raw);
     if (!self.windows.contains(id.encode())) return error.InvalidHandle;
@@ -2350,6 +2369,7 @@ fn retryPendingApplicationOpen(self: *Context) void {
     if (self.failure != null or self.quit) return;
     if (self.pending_open_paths.items.len == 0 and self.pending_open_text.items.len == 0) return;
     const window = firstWindow(self) orelse return;
+    if (self.event_cursor < self.events.items.len) return;
     _ = flushPendingApplicationOpen(self, window);
 }
 

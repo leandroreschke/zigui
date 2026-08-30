@@ -16,6 +16,11 @@ const static_webp = [_]u8{
 const animated_webp_base64 =
     "UklGRrQDAABXRUJQVlA4WAoAAAASAAAAHwAAHwAAQU5JTQYAAAD/////AABBTk1GyAEAAAAAAAAAAB8AAB8AAGQAAAFBTFBIcQAAAAEPMP8REcJtrW1r8nwH66BNlazAALaWu5VswCQWT8kIuoC7k4QZIvo/AegCukHDWKJbWxqerwizIsyzGVVV8rVkQ3uInrqIHllIA53A9/sfvyCNhB5paJsI+Yukaw+lUMiM9jD0rYWBzxL6baEdgUYEAFZQOCA2AQAAcAYAnQEqIAAgAD6RQpxKJaOioagIALASCWkACBUYgW7F+A8kAMRphpuhigFoZAsoZQPY5dH5edlO32+AAPm3WQ1+Uq4o16coq0sal1WP7YWnUgO8NY3zdLChFCIETQSQPdCePA3k2Ue4vvkk7pJErg5obEeuPZAny7LTT1uf6+ibKzi333Yxf7KnPBUerMZZ3j7ac6rknZg2WUac4Ml2Md/Isdz4C2e3ztFnNl56+z1TtGU115COf+XlWzcua3IArJMv530G6cMyqJa5Jho/qZaMdB04bX4Y837OimJSjzia5OcPPUhF6rk30J9VvRFmqw+a2aIjMO4Z/K8Rn3hWsN6oOSX/S1WmsMCPKxzqNJVrfw1CRYLPqIJ3iHpOkApeV8Py29pWSFdyBSO4gby0aIuxOAAAAEFOTUa4AQAAAAAAAAAAHwAAHwAAZAAAAUFMUEhyAAAAAQ8w/xERwm2tbWvyvidCBy1VsgKlw1ruVrIBk1g8JSPoAu5OZIaI/k8ANAKajqa+gmbu0HQ9JWBeAxa5rKIkC/VoU31Si12pCUs2ocH38wnjJdiMaEJT3QooXJmoP+PFYnZ8AEaeDTH0mMSgQ3QEoCkAVlA4ICYBAABQBgCdASogACAAPpE+mkkloyKhKAqosBIJaQAIGliBbu2ZWHDvXTgY+GFFLQ1l7BKPnGSYO9CO/wzjoADXBLXaDNOLli78KXYuETTIDe3M1k8/MwHLeYWCEwv5PNiySfuUW3nKyHBrnFQvYzbJGif45K1Y/7euZTXrcPfEOLxlFke7OxZa7lxRCI7t0e2PMsHrmWf/73DsP6pp9d2ek225rCj6qSkgCL+h8R7naSGH9z4AA6A2s+GeQpwPd1vw4cu648mVA3se4M4aSZbQnYp+5wSHA88R2IVeiKzPhUgbKOHpvQgV/Xeve3pjY83ZGQwA+bk+D8hzM+zqSSIgc6ZVwxmsCxgEqbMvjztg8N+TkOKcc0xFt+PV63Lnyi9p5zZepDSCgAA=";
 
+// AOMediaCodec/libavif's BSD-licensed 1x1 white conformance fixture, embedded
+// so the native ImageIO test has no network or writable-directory dependency.
+const white_avif_base64 =
+    "AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUEAAADybWV0YQAAAAAAAAAoaGRscgAAAAAAAAAAcGljdAAAAAAAAAAAAAAAAGxpYmF2aWYAAAAADnBpdG0AAAAAAAEAAAAeaWxvYwAAAABEAAABAAEAAAABAAABGgAAABcAAAAoaWluZgAAAAAAAQAAABppbmZlAgAAAAABAABhdjAxQ29sb3IAAAAAamlwcnAAAABLaXBjbwAAABRpc3BlAAAAAAAAAAEAAAABAAAAEHBpeGkAAAAAAwgICAAAAAxhdjFDgSAAAAAAABNjb2xybmNseAABAA0ABoAAAAAXaXBtYQAAAAAAAAABAAEEAQKDBAAAAB9tZGF0EgAKBzgABhAQ0GkyCh/wP///xAAAr3A=";
+
 fn decodeAnimatedFixture(allocator: std.mem.Allocator) ![]u8 {
     const decoder = std.base64.standard.Decoder;
     const size = try decoder.calcSizeForSlice(animated_webp_base64);
@@ -23,6 +28,30 @@ fn decodeAnimatedFixture(allocator: std.mem.Allocator) ![]u8 {
     errdefer allocator.free(bytes);
     try decoder.decode(bytes, animated_webp_base64);
     return bytes;
+}
+
+fn decodeAvifFixture(allocator: std.mem.Allocator) ![]u8 {
+    const decoder = std.base64.standard.Decoder;
+    const size = try decoder.calcSizeForSlice(white_avif_base64);
+    const bytes = try allocator.alloc(u8, size);
+    errdefer allocator.free(bytes);
+    try decoder.decode(bytes, white_avif_base64);
+    return bytes;
+}
+
+test "AVIF still image is native or explicitly unsupported" {
+    const bytes = try decodeAvifFixture(testing.allocator);
+    defer testing.allocator.free(bytes);
+    if (ui.config.compiled_platform != .macos) {
+        try testing.expectError(error.Unsupported, ui.image.decode(testing.allocator, bytes, .{}));
+        return;
+    }
+    var still = try ui.image.decode(testing.allocator, bytes, .{});
+    defer still.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), still.width);
+    try testing.expectEqual(@as(u32, 1), still.height);
+    try testing.expectEqual(@as(usize, 4), still.pixels.len);
+    try testing.expectEqual(@as(u8, 255), still.pixels[3]);
 }
 
 test "WebP image and animation contracts are native or explicitly unsupported" {

@@ -11,6 +11,7 @@ pub const Limits = struct {
     maximum_gradients: usize = 16_384,
     maximum_gradient_stops: usize = 131_072,
     maximum_dash_values: usize = 65_536,
+    maximum_dash_subdivisions: usize = 4_000_000,
     maximum_nesting: usize = 256,
 };
 
@@ -101,6 +102,8 @@ pub const Document = struct {
     view_box: geometry.Rect,
     shapes: []const Shape,
     gradients: []const Gradient,
+    gradient_index: std.StringHashMap(usize),
+    maximum_dash_subdivisions: usize,
 
     pub fn parse(backing_allocator: std.mem.Allocator, bytes: []const u8, limits: Limits) Error!Document {
         if (bytes.len == 0 or bytes.len > limits.maximum_bytes or !std.unicode.utf8ValidateSlice(bytes)) return error.InvalidSvg;
@@ -108,7 +111,13 @@ pub const Document = struct {
         errdefer arena.deinit();
         const allocator = arena.allocator();
         const source = try allocator.dupe(u8, bytes);
-        var parser: Parser = .{ .source = source, .allocator = allocator, .limits = limits };
+        var parser: Parser = .{
+            .source = source,
+            .allocator = allocator,
+            .limits = limits,
+            .definition_index = std.StringHashMap(usize).init(allocator),
+            .gradient_index = std.StringHashMap(usize).init(allocator),
+        };
         const parsed = try parser.parse();
         const resident_bytes = arena.queryCapacity();
         return .{
@@ -120,10 +129,13 @@ pub const Document = struct {
             .view_box = parsed.view_box,
             .shapes = parsed.shapes,
             .gradients = parsed.gradients,
+            .gradient_index = parsed.gradient_index,
+            .maximum_dash_subdivisions = limits.maximum_dash_subdivisions,
         };
     }
 
     pub fn deinit(self: *Document) void {
+        self.gradient_index.deinit();
         self.arena.deinit();
         self.* = undefined;
     }
@@ -142,6 +154,7 @@ pub const Document = struct {
         if (!finiteTransform(document_transform)) return error.InvalidSvg;
         var active_layers: []const OpacityLayer = &.{};
         var active_count: usize = 0;
+        var dash_work: usize = 0;
         defer while (active_count != 0) {
             builder.popLayer() catch {};
             active_count -= 1;
@@ -193,6 +206,8 @@ pub const Document = struct {
                     scale,
                     fallback,
                     material_id,
+                    &dash_work,
+                    self.maximum_dash_subdivisions,
                 );
             }
         }
@@ -288,8 +303,8 @@ pub const Document = struct {
     }
 
     fn findGradient(self: *const Document, id: []const u8) ?*const Gradient {
-        for (self.gradients) |*gradient| if (std.mem.eql(u8, gradient.id, id)) return gradient;
-        return null;
+        const index = self.gradient_index.get(id) orelse return null;
+        return &self.gradients[index];
     }
 };
 
@@ -299,6 +314,7 @@ const Parsed = struct {
     view_box: geometry.Rect,
     shapes: []const Shape,
     gradients: []const Gradient,
+    gradient_index: std.StringHashMap(usize),
 };
 
 const Element = struct {
@@ -362,6 +378,8 @@ const Parser = struct {
     root_seen: bool = false,
     next_opacity_scope: u32 = 1,
     next_opacity_instance: u32 = 1,
+    definition_index: std.StringHashMap(usize),
+    gradient_index: std.StringHashMap(usize),
 
     fn parse(self: *Parser) Error!Parsed {
         var output_items: std.ArrayList(OutputItem) = .empty;
@@ -457,6 +475,7 @@ const Parser = struct {
             .view_box = view_box,
             .shapes = shapes,
             .gradients = try gradients.toOwnedSlice(self.allocator),
+            .gradient_index = self.gradient_index,
         };
     }
 
@@ -502,9 +521,12 @@ const Parser = struct {
     fn finishDefinition(self: *Parser, definitions: *std.ArrayList(Definition), element: Element, prototype_end: usize) Error!void {
         if (element.definition_id.len == 0) return;
         if (prototype_end < element.prototype_start) return error.InvalidSvg;
-        for (definitions.items) |definition| if (std.mem.eql(u8, definition.id, element.definition_id)) return error.InvalidSvg;
+        const id = try self.allocator.dupe(u8, element.definition_id);
+        const indexed = try self.definition_index.getOrPut(id);
+        if (indexed.found_existing) return error.InvalidSvg;
+        indexed.value_ptr.* = definitions.items.len;
         try definitions.append(self.allocator, .{
-            .id = try self.allocator.dupe(u8, element.definition_id),
+            .id = id,
             .prototype_start = element.prototype_start,
             .prototype_count = prototype_end - element.prototype_start,
             .inverse_parent_transform = element.definition_parent_transform.inverse(),
@@ -564,12 +586,7 @@ const Parser = struct {
         instantiated_commands: *usize,
     ) Error!void {
         if (!use.state.rendered()) return;
-        var selected: ?usize = null;
-        for (definitions, 0..) |definition, index| if (std.mem.eql(u8, definition.id, use.href)) {
-            selected = index;
-            break;
-        };
-        const definition_index = selected orelse return error.InvalidSvg;
+        const definition_index = self.definition_index.get(use.href) orelse return error.InvalidSvg;
         for (ancestry.items) |ancestor| if (ancestor == definition_index) return error.InvalidSvg;
         if (ancestry.items.len >= self.limits.maximum_nesting) return error.BudgetExceeded;
         try ancestry.append(self.allocator, definition_index);
@@ -746,7 +763,11 @@ const Parser = struct {
             stop.offset = @max(previous_offset, stop.offset);
             previous_offset = stop.offset;
         }
-        for (gradients.items) |gradient| if (builder.id.len != 0 and std.mem.eql(u8, gradient.id, builder.id)) return error.InvalidSvg;
+        if (builder.id.len != 0) {
+            const indexed = try self.gradient_index.getOrPut(builder.id);
+            if (indexed.found_existing) return error.InvalidSvg;
+            indexed.value_ptr.* = gradients.items.len;
+        }
         try gradients.append(self.allocator, .{
             .id = builder.id,
             .href = builder.href,
@@ -774,12 +795,7 @@ const Parser = struct {
         states[index] = 1;
         var gradient = &gradients[index];
         if (gradient.href.len != 0) {
-            var reference_index: ?usize = null;
-            for (gradients, 0..) |candidate, candidate_index| if (std.mem.eql(u8, candidate.id, gradient.href)) {
-                reference_index = candidate_index;
-                break;
-            };
-            const selected = reference_index orelse return error.InvalidSvg;
+            const selected = self.gradient_index.get(gradient.href) orelse return error.InvalidSvg;
             try self.resolveGradient(gradients, states, selected, depth + 1);
             const reference = gradients[selected];
             if (reference.kind != gradient.kind) return error.InvalidSvg;
@@ -1755,6 +1771,8 @@ fn strokePath(
     scale: f32,
     color: geometry.Color,
     material: ?u32,
+    dash_work: *usize,
+    maximum_dash_subdivisions: usize,
 ) Error!void {
     if (!(width > 0) or !std.math.isFinite(width)) return;
     const allocator = builder.scene.allocator;
@@ -1766,7 +1784,7 @@ fn strokePath(
         const kind = std.enums.fromInt(scene_abi.PathCommand, command.kind) orelse return error.InvalidSvg;
         switch (kind) {
             .move_to => {
-                try flushStrokeContour(builder, points.items, closed, width / 2, cap, join, miter_limit, dash_array, dash_offset, scale, color, material);
+                try flushStrokeContour(builder, points.items, closed, width / 2, cap, join, miter_limit, dash_array, dash_offset, scale, color, material, dash_work, maximum_dash_subdivisions);
                 points.clearRetainingCapacity();
                 closed = false;
                 try appendDistinctPoint(&points, allocator, command.position);
@@ -1778,13 +1796,13 @@ fn strokePath(
             },
             .close => {
                 closed = true;
-                try flushStrokeContour(builder, points.items, true, width / 2, cap, join, miter_limit, dash_array, dash_offset, scale, color, material);
+                try flushStrokeContour(builder, points.items, true, width / 2, cap, join, miter_limit, dash_array, dash_offset, scale, color, material, dash_work, maximum_dash_subdivisions);
                 points.clearRetainingCapacity();
                 closed = false;
             },
         }
     }
-    try flushStrokeContour(builder, points.items, closed, width / 2, cap, join, miter_limit, dash_array, dash_offset, scale, color, material);
+    try flushStrokeContour(builder, points.items, closed, width / 2, cap, join, miter_limit, dash_array, dash_offset, scale, color, material, dash_work, maximum_dash_subdivisions);
 }
 
 fn flushStrokeContour(
@@ -1800,12 +1818,14 @@ fn flushStrokeContour(
     scale: f32,
     color: geometry.Color,
     material: ?u32,
+    dash_work: *usize,
+    maximum_dash_subdivisions: usize,
 ) Error!void {
     if (points.len < 2) return;
     if (dash_array.len == 0) {
         try strokeContour(builder, points, closed, half, cap, join, miter_limit, color, material);
     } else {
-        try strokeDashedContour(builder, points, closed, half, cap, join, miter_limit, dash_array, dash_offset, scale, color, material);
+        try strokeDashedContour(builder, points, closed, half, cap, join, miter_limit, dash_array, dash_offset, scale, color, material, dash_work, maximum_dash_subdivisions);
     }
 }
 
@@ -1965,6 +1985,8 @@ fn strokeDashedContour(
     scale: f32,
     color: geometry.Color,
     material: ?u32,
+    dash_work: *usize,
+    maximum_dash_subdivisions: usize,
 ) Error!void {
     const allocator = builder.scene.allocator;
     const pattern = try allocator.alloc(f32, dash_array.len);
@@ -1972,7 +1994,9 @@ fn strokeDashedContour(
     var total: f32 = 0;
     for (dash_array, 0..) |value, index| {
         pattern[index] = value * scale;
+        if (!std.math.isFinite(pattern[index]) or pattern[index] < 0) return error.BudgetExceeded;
         total += pattern[index];
+        if (!std.math.isFinite(total)) return error.BudgetExceeded;
     }
     if (!(total > 0)) return strokeContour(builder, raw_points, closed, half, cap, join, miter_limit, color, material);
 
@@ -1999,11 +2023,16 @@ fn strokeDashedContour(
         const end = points[if (segment_index + 1 == count) 0 else segment_index + 1];
         const delta = end.sub(cursor);
         const segment_length = lengthOf(delta);
+        if (!std.math.isFinite(segment_length)) return error.BudgetExceeded;
         if (segment_length <= 0.00001) continue;
         const tangent = scalePoint(delta, 1 / segment_length);
         var distance_left = segment_length;
         while (distance_left > 0.00001) {
+            dash_work.* = std.math.add(usize, dash_work.*, 1) catch return error.BudgetExceeded;
+            if (dash_work.* > maximum_dash_subdivisions) return error.BudgetExceeded;
             while (remaining <= 0.00001) {
+                dash_work.* = std.math.add(usize, dash_work.*, 1) catch return error.BudgetExceeded;
+                if (dash_work.* > maximum_dash_subdivisions) return error.BudgetExceeded;
                 if (drawing and dash.items.len > 1) try strokeContour(builder, dash.items, false, half, cap, join, miter_limit, color, material);
                 dash.clearRetainingCapacity();
                 pattern_index = (pattern_index + 1) % pattern.len;
@@ -2067,12 +2096,18 @@ fn appendDistinctPoint(output: *std.ArrayList(geometry.Point), allocator: std.me
 
 fn normalized(point: geometry.Point) ?geometry.Point {
     const length = lengthOf(point);
-    if (length <= 0.00001) return null;
+    if (!std.math.isFinite(length) or length <= 0.00001) return null;
     return scalePoint(point, 1 / length);
 }
 
 fn lengthOf(point: geometry.Point) f32 {
-    return @sqrt(point.x * point.x + point.y * point.y);
+    const x = @abs(point.x);
+    const y = @abs(point.y);
+    const maximum = @max(x, y);
+    if (maximum == 0) return 0;
+    const scaled_x = x / maximum;
+    const scaled_y = y / maximum;
+    return maximum * @sqrt(scaled_x * scaled_x + scaled_y * scaled_y);
 }
 
 fn scalePoint(point: geometry.Point, scale: f32) geometry.Point {

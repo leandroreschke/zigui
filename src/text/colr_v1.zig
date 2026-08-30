@@ -11,6 +11,7 @@ const maximum_raster_dimension = 8192;
 const maximum_raster_pixels = 1024 * 1024;
 const maximum_live_surface_pixels = maximum_raster_pixels * 8;
 const maximum_raster_segments = 1_048_576;
+const maximum_raster_work_units = 128 * 1024 * 1024;
 const maximum_text_size: f32 = 1_000_000;
 const maximum_scale_factor: f32 = 64;
 
@@ -189,6 +190,7 @@ const Graph = struct {
     canvas: Canvas = .{},
     nodes_seen: usize = 0,
     live_surface_pixels: usize = 0,
+    raster_work_units: usize = 0,
 
     fn surface(self: *Graph) Error!Surface {
         const count = std.math.mul(usize, self.canvas.width, self.canvas.height) catch return error.BudgetExceeded;
@@ -727,6 +729,10 @@ const Graph = struct {
         defer segments.deinit(self.allocator);
         try flattenOutline(self.allocator, outline, transform, &segments);
         const samples: usize = 4;
+        const work = std.math.mul(usize, mask_length, segments.items.len) catch return error.BudgetExceeded;
+        const sampled_work = std.math.mul(usize, work, samples * samples) catch return error.BudgetExceeded;
+        self.raster_work_units = std.math.add(usize, self.raster_work_units, sampled_work) catch return error.BudgetExceeded;
+        if (self.raster_work_units > maximum_raster_work_units) return error.BudgetExceeded;
         for (mask, 0..) |*coverage, index| {
             const x = index % self.canvas.width;
             const y = index / self.canvas.width;

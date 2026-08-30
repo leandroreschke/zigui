@@ -39,6 +39,9 @@ pub const variant_false: i16 = 0;
 pub const root_object_id: win.LPARAM = -25;
 pub const append_runtime_id: i32 = 3;
 pub const provider_server_side: i32 = 0x2;
+/// Request COM apartment threading so UI Automation invokes the server-side
+/// provider on the STA thread that owns ZigUI's mutable accessibility tree.
+pub const provider_use_com_threading: i32 = 0x20;
 pub const provider_owns_set_focus: i32 = 0x10;
 
 pub const navigate_parent: i32 = 0;

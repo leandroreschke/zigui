@@ -135,6 +135,7 @@ pub const Registry = struct {
     entries: Pool,
     retired: std.ArrayList(Retired) = .empty,
     maximum_entries: usize,
+    callback_depth: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Registry {
         return initWithLimit(allocator, 1_024);
@@ -158,6 +159,7 @@ pub const Registry = struct {
     }
 
     pub fn register(self: *Registry, descriptor: Descriptor) Error!handles.RenderExtensionId {
+        if (self.callback_depth != 0) return error.CallbackReentrancy;
         if (descriptor.label.len > 4096 or !std.unicode.utf8ValidateSlice(descriptor.label) or
             std.mem.indexOfScalar(u8, descriptor.label, 0) != null)
             return error.InvalidConfiguration;
@@ -175,7 +177,12 @@ pub const Registry = struct {
         return entry.descriptor.requirements;
     }
 
+    pub fn callbacksActive(self: *const Registry) bool {
+        return self.callback_depth != 0;
+    }
+
     pub fn destroy(self: *Registry, id: handles.RenderExtensionId, release_after: SubmissionEpoch) Error!void {
+        if (self.callback_depth != 0) return error.CallbackReentrancy;
         try self.retired.ensureUnusedCapacity(self.allocator, 1);
         const entry = self.entries.remove(id) orelse return error.InvalidHandle;
         self.retired.appendAssumeCapacity(.{
@@ -196,17 +203,27 @@ pub const Registry = struct {
     ) Error!void {
         const entry = self.entries.get(id) orelse return error.InvalidHandle;
         if (entry.prepared_generation != generation) {
+            self.callback_depth += 1;
+            defer self.callback_depth -= 1;
             try entry.descriptor.vtable.prepare(entry.descriptor.context, device, generation);
             entry.prepared_generation = generation;
         }
+        self.callback_depth += 1;
+        defer self.callback_depth -= 1;
         try entry.descriptor.vtable.encode(entry.descriptor.context, pass, payload, flags);
         entry.last_submission = @max(entry.last_submission, submission);
     }
 
     pub fn deviceLost(self: *Registry, new_generation: DeviceGeneration) void {
+        // A device-lost hook may attempt to recover the renderer recursively.
+        // The outer recovery owns the registry walk; a nested walk would
+        // revisit the same borrowed entry and corrupt its lifecycle state.
+        if (self.callback_depth != 0) return;
         var iterator = self.entries.iterator();
         while (iterator.next()) |entry| {
+            self.callback_depth += 1;
             entry.value.descriptor.vtable.device_lost(entry.value.descriptor.context, new_generation);
+            self.callback_depth -= 1;
             entry.value.prepared_generation = 0;
             entry.value.last_submission = 0;
         }
@@ -214,20 +231,25 @@ pub const Registry = struct {
     }
 
     pub fn collect(self: *Registry, completed: SubmissionEpoch) void {
-        var write: usize = 0;
-        for (self.retired.items) |entry| {
-            if (entry.release_after <= completed) {
-                var retired = entry.entry;
-                self.deinitEntry(&retired);
-            } else {
-                self.retired.items[write] = entry;
-                write += 1;
+        // Backend registration commonly collects completed retirements before
+        // entering `register`. A deinit callback can take that same path, so
+        // reject the nested collection and remove each item before invoking
+        // user code. This makes the callback one-shot even under reentrancy.
+        if (self.callback_depth != 0) return;
+        var index: usize = 0;
+        while (index < self.retired.items.len) {
+            if (self.retired.items[index].release_after > completed) {
+                index += 1;
+                continue;
             }
+            var retired = self.retired.orderedRemove(index).entry;
+            self.deinitEntry(&retired);
         }
-        self.retired.items.len = write;
     }
 
     fn deinitEntry(self: *Registry, entry: *Entry) void {
+        self.callback_depth += 1;
+        defer self.callback_depth -= 1;
         entry.descriptor.vtable.deinit(entry.descriptor.context);
         self.allocator.free(entry.descriptor.label);
         entry.* = undefined;

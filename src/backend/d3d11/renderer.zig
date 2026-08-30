@@ -1089,7 +1089,11 @@ pub const Renderer = struct {
 
     fn recover(raw: *anyopaque, policy: config.GpuPolicy) Error!void {
         const self = cast(raw);
-        try self.waitAll();
+        if (self.extensions.callbacksActive()) return error.CallbackReentrancy;
+        // A removed device can no longer complete its event queries. Recovery
+        // abandons that device generation instead of waiting on work that is
+        // guaranteed to report DeviceLost.
+        self.active = null;
         var replacement_device = try DeviceSet.create(policy);
         errdefer replacement_device.deinit();
         var replacement_pipelines = try Pipelines.create(replacement_device.device);

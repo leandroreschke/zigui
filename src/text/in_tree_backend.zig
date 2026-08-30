@@ -97,6 +97,8 @@ const CatalogEntry = struct {
     }
 };
 
+const FallbackMissKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
 pub const Backend = struct {
     const Pool = handles.SlotPool(FontEntry, handles.FontId);
 
@@ -114,6 +116,8 @@ pub const Backend = struct {
     catalog_bytes: usize = 0,
     maximum_catalog_entries: usize,
     maximum_catalog_bytes: usize,
+    fallback_misses: std.AutoHashMap(FallbackMissKey, void),
+    maximum_fallback_misses: usize,
 
     pub fn create(allocator: std.mem.Allocator) Error!api.Backend {
         return (try createInstance(
@@ -148,6 +152,8 @@ pub const Backend = struct {
             .maximum_font_instances = maximum_font_instances,
             .maximum_catalog_entries = maximum_catalog_entries,
             .maximum_catalog_bytes = maximum_catalog_bytes,
+            .fallback_misses = std.AutoHashMap(FallbackMissKey, void).init(allocator),
+            .maximum_fallback_misses = @min(maximum_catalog_entries *| 64, 262_144),
         };
         return self;
     }
@@ -577,6 +583,8 @@ pub const Backend = struct {
             const catalog = &self.catalog.items[catalog_index];
             if (isLastResortFamily(catalog.family)) continue;
             if (!coverageMayContainAll(&catalog.coverage, scalars)) continue;
+            const miss_key = fallbackMissKey(catalog_index, scalars);
+            if (self.fallback_misses.contains(miss_key)) continue;
             const id = self.loadCatalogForFallback(catalog_index, descriptor, scalars) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => continue,
@@ -600,7 +608,10 @@ pub const Backend = struct {
         if (index >= self.catalog.items.len) return error.InvalidHandle;
         const catalog = &self.catalog.items[index];
         if (catalog.face) |face| {
-            if (!try covers(face.font, scalars)) return null;
+            if (!try covers(face.font, scalars)) {
+                try self.rememberFallbackMiss(index, scalars);
+                return null;
+            }
             const id = try self.instanceForFace(face, descriptor);
             if (!catalog.loaded.isValid()) catalog.loaded = id;
             return id;
@@ -621,7 +632,10 @@ pub const Backend = struct {
             error.OutOfMemory => return err,
             else => return null,
         };
-        if (!try covers(candidate, scalars)) return null;
+        if (!try covers(candidate, scalars)) {
+            try self.rememberFallbackMiss(index, scalars);
+            return null;
+        }
 
         // addSource owns and cleans up the source on its own error path. Mark
         // the value transferred before the call so our defer cannot double
@@ -633,6 +647,11 @@ pub const Backend = struct {
         catalog.face = face;
         if (!catalog.loaded.isValid()) catalog.loaded = id;
         return id;
+    }
+
+    fn rememberFallbackMiss(self: *Backend, catalog_index: usize, scalars: []const ScalarRecord) Error!void {
+        if (self.fallback_misses.count() >= self.maximum_fallback_misses) return;
+        try self.fallback_misses.put(fallbackMissKey(catalog_index, scalars), {});
     }
 
     fn fontCovers(self: *Backend, id: handles.FontId, scalars: []const ScalarRecord) Error!bool {
@@ -672,6 +691,7 @@ pub const Backend = struct {
         self.faces.deinit(self.allocator);
         for (self.catalog.items) |*entry| entry.deinit(self.allocator);
         self.catalog.deinit(self.allocator);
+        self.fallback_misses.deinit();
         self.catalog_bytes = 0;
         self.* = undefined;
     }
@@ -707,6 +727,15 @@ pub const Backend = struct {
         allocator.destroy(self);
     }
 };
+
+fn fallbackMissKey(catalog_index: usize, scalars: []const ScalarRecord) FallbackMissKey {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(std.mem.asBytes(&catalog_index));
+    for (scalars) |scalar| hasher.update(std.mem.asBytes(&scalar.scalar));
+    var result: FallbackMissKey = undefined;
+    hasher.final(&result);
+    return result;
+}
 
 const ScalarRecord = struct {
     scalar: u21,

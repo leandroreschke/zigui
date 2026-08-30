@@ -279,9 +279,9 @@ fragment float4 external_surface_fragment(VertexOut in [[stage_in]], const devic
     float4 sampled = texture.sample(sample_filter, uv);
     if (item.color_space == 2) {
         const float3x3 p3_to_srgb = float3x3(
-            float3(1.224745, -0.224904, 0.0),
-            float3(-0.042058, 1.042081, 0.0),
-            float3(-0.019642, -0.078655, 1.098537));
+            float3(1.224745, -0.042058, -0.019642),
+            float3(-0.224904, 1.042081, -0.078655),
+            float3(0.0, 0.0, 1.098537));
         sampled.rgb = max(p3_to_srgb * sampled.rgb, 0.0);
     } else if (item.color_space == 4) {
         float3 powered = pow(max(sampled.rgb, 0.0), float3(1.0 / 78.84375));

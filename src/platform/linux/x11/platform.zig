@@ -156,6 +156,8 @@ const NativeWindow = struct {
     surrounding_text: ?[]u8 = null,
     selection: input.TextRange = .{ .start = 0, .end = 0 },
     pending_dead: ?u21 = null,
+    mode: api.WindowMode = .normal,
+    pending_mode: ?api.WindowMode = null,
 
     fn deinit(self: *NativeWindow) void {
         self.context.retained_text.release(self.context.allocator, &self.surrounding_text);
@@ -908,7 +910,13 @@ fn destroyWindow(raw: *anyopaque, id: handles.WindowId) void {
 fn showWindow(raw: *anyopaque, id: handles.WindowId, visible: bool) Error!void {
     const self = cast(raw);
     const native = self.windows.get(id.encode()) orelse return error.InvalidHandle;
-    if (native.visible == visible) return;
+    if (native.visible == visible) {
+        if (visible and native.mode == .minimized) {
+            try protocol.mapWindow(&self.client, &self.writer, native.xid);
+            try requestFrame(raw, id);
+        }
+        return;
+    }
     if (visible) {
         if (native.configured and !native.present_pending) try self.preparePendingSlots(1);
         try protocol.mapWindow(&self.client, &self.writer, native.xid);
@@ -972,13 +980,23 @@ fn commandWindow(raw: *anyopaque, id: handles.WindowId, command: api.WindowComma
         },
         .mode => |mode| switch (mode) {
             .normal => {
+                native.pending_mode = mode;
                 try sendWmState(self, native.xid, 0, self.atoms.net_wm_state_fullscreen, 0);
                 try sendWmState(self, native.xid, 0, self.atoms.net_wm_state_maximized_vert, self.atoms.net_wm_state_maximized_horz);
-                if (!native.visible) try showWindow(raw, id, true);
+                try showWindow(raw, id, true);
             },
-            .minimized => try sendIconify(self, native.xid),
-            .maximized => try sendWmState(self, native.xid, 1, self.atoms.net_wm_state_maximized_vert, self.atoms.net_wm_state_maximized_horz),
-            .fullscreen => try sendWmState(self, native.xid, 1, self.atoms.net_wm_state_fullscreen, 0),
+            .minimized => {
+                native.pending_mode = mode;
+                try sendIconify(self, native.xid);
+            },
+            .maximized => {
+                native.pending_mode = mode;
+                try sendWmState(self, native.xid, 1, self.atoms.net_wm_state_maximized_vert, self.atoms.net_wm_state_maximized_horz);
+            },
+            .fullscreen => {
+                native.pending_mode = mode;
+                try sendWmState(self, native.xid, 1, self.atoms.net_wm_state_fullscreen, 0);
+            },
         },
         .always_on_top => |enabled| try sendWmState(self, native.xid, if (enabled) 1 else 0, self.atoms.net_wm_state_above, 0),
     }
@@ -1308,6 +1326,14 @@ fn handlePacket(self: *Context, bytes: []const u8) Error!void {
         protocol.EventType.visibility_notify => {
             const native = self.xids.get(try wire.readU32(bytes, 4)) orelse return;
             self.queue(native.id, .{ .occluded = bytes[8] == 2 });
+        },
+        protocol.EventType.unmap_notify => {
+            const native = self.xids.get(try wire.readU32(bytes, 8)) orelse return;
+            if (native.pending_mode == .minimized) publishWindowMode(self, native, .minimized);
+        },
+        protocol.EventType.map_notify => {
+            const native = self.xids.get(try wire.readU32(bytes, 8)) orelse return;
+            if (native.pending_mode == .normal) publishWindowMode(self, native, .normal);
         },
         protocol.EventType.configure_notify => try handleConfigure(self, bytes),
         protocol.EventType.destroy_notify => {
@@ -1644,9 +1670,37 @@ fn handleSelectionRequest(self: *Context, bytes: []const u8) Error!void {
 }
 
 fn handlePropertyNotify(self: *Context, bytes: []const u8) Error!void {
-    if (bytes[16] != 1) return;
     const window = try wire.readU32(bytes, 4);
     const property = try wire.readU32(bytes, 8);
+    if (bytes[16] == 0 and property == self.atoms.net_wm_state) {
+        const native = self.xids.get(window) orelse return;
+        var value = try protocol.getProperty(
+            &self.client,
+            &self.writer,
+            self.allocator,
+            false,
+            window,
+            property,
+            4,
+            0,
+            1024,
+        );
+        defer value.deinit();
+        if (value.format != 32 or value.value.len % 4 != 0) return error.PlatformFailure;
+        var maximized_vertical = false;
+        var maximized_horizontal = false;
+        var fullscreen = false;
+        var offset: usize = 0;
+        while (offset < value.value.len) : (offset += 4) {
+            const atom = std.mem.readInt(u32, value.value[offset..][0..4], .little);
+            if (atom == self.atoms.net_wm_state_maximized_vert) maximized_vertical = true;
+            if (atom == self.atoms.net_wm_state_maximized_horz) maximized_horizontal = true;
+            if (atom == self.atoms.net_wm_state_fullscreen) fullscreen = true;
+        }
+        publishWindowMode(self, native, if (fullscreen) .fullscreen else if (maximized_vertical and maximized_horizontal) .maximized else .normal);
+        return;
+    }
+    if (bytes[16] != 1) return;
     const key = transferKey(window, property);
     const transfer = self.outgoing.getPtr(key) orelse return;
     const maximum_chunk = maximumPropertyChunk(&self.client);
@@ -1666,6 +1720,13 @@ fn handlePropertyNotify(self: *Context, bytes: []const u8) Error!void {
     if (count == 0) removeOutgoing(self, key);
 }
 
+fn publishWindowMode(self: *Context, native: *NativeWindow, mode: api.WindowMode) void {
+    native.pending_mode = null;
+    if (native.mode == mode) return;
+    native.mode = mode;
+    self.queue(native.id, .{ .mode_changed = mode });
+}
+
 fn receiveIncremental(self: *Context, allocator: std.mem.Allocator, property_atom: u32, maximum_bytes: usize) Error![]u8 {
     return receiveIncrementalOnWindow(self, allocator, self.selection_window, property_atom, maximum_bytes);
 }
@@ -1679,8 +1740,22 @@ fn receiveIncrementalOnWindow(
 ) Error![]u8 {
     var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
+    const deadline_ns = sys.monotonicNanoseconds() +| 30 * std.time.ns_per_s;
+    var chunks: usize = 0;
     while (true) {
-        var packet = (try self.client.nextEvent(true)) orelse continue;
+        if (sys.monotonicNanoseconds() >= deadline_ns or chunks >= 65_536)
+            return error.PlatformFailure;
+        var packet = (try self.client.nextEvent(false)) orelse {
+            var descriptors = [_]sys.linux.pollfd{.{ .fd = self.client.descriptor(), .events = sys.linux.POLL.IN, .revents = 0 }};
+            const now = sys.monotonicNanoseconds();
+            if (now >= deadline_ns) return error.PlatformFailure;
+            const remaining_ns = deadline_ns - now;
+            const timeout_ms: i32 = @intCast(@min((remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms, std.math.maxInt(i32)));
+            if (try sys.poll(&descriptors, timeout_ms) == 0) return error.PlatformFailure;
+            if (descriptors[0].revents & (sys.linux.POLL.ERR | sys.linux.POLL.HUP | sys.linux.POLL.NVAL) != 0)
+                return error.PlatformFailure;
+            continue;
+        };
         defer packet.deinit();
         if (packet.responseType() == protocol.EventType.property_notify and
             try wire.readU32(packet.bytes, 4) == window and
@@ -1701,6 +1776,7 @@ fn receiveIncrementalOnWindow(
             if (property.value.len == 0) return result.toOwnedSlice(allocator);
             if (property.value.len > maximum_bytes -| result.items.len) return error.BudgetExceeded;
             try result.appendSlice(allocator, property.value);
+            chunks += 1;
             continue;
         }
         try handlePacket(self, packet.bytes);

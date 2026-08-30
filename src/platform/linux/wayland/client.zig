@@ -65,6 +65,7 @@ pub const ObjectTable = struct {
     pub fn retire(self: *ObjectTable, id: u32) Error!void {
         const object = self.objects.getPtr(id) orelse return error.InvalidHandle;
         if (object.state == .retired) return error.ResourceBusy;
+        object.owner = 0;
         object.state = .retired;
     }
 
@@ -191,6 +192,10 @@ pub const Client = struct {
             self.connection.markBroken();
             return error.PlatformFailure;
         };
+        if (object.state == .retired) {
+            self.connection.markBroken();
+            return error.PlatformFailure;
+        }
         const fd_count = protocol.eventFdCount(object.interface, header.opcode) catch |err| {
             self.connection.markBroken();
             return err;

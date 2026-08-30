@@ -11,6 +11,7 @@ absent instead of installing a hidden fallback.
 | Renderer | Metal | D3D11 | Vulkan | Vulkan | CPU reference |
 | Text engine | in-tree | in-tree | in-tree | in-tree | in-tree when enabled |
 | WebP image/animation | bounded ImageIO provider | unsupported | unsupported | unsupported | unsupported |
+| AVIF still image | metadata-preflighted ImageIO provider | unsupported | unsupported | unsupported | unsupported |
 | Native IME | `NSTextInputClient` | IMM32 | text-input-v3 when advertised | XIM wire protocol | absent |
 | Accessibility | NSAccessibility | UI Automation | AT-SPI over in-tree D-Bus | AT-SPI over in-tree D-Bus | semantic tree only |
 | Clipboard text | NSPasteboard | Win32 clipboard | data-device when advertised | X selections | deterministic memory clipboard |

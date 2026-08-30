@@ -33,6 +33,7 @@ pub const Host = struct {
 
 const Element = struct {
     object: objc.Id,
+    value_utf8: []const u8 = &.{},
     actions: u32 = 0,
     seen_generation: u64 = 0,
     content_hash: u64 = 0,
@@ -56,6 +57,7 @@ const WindowState = struct {
         while (iterator.next()) |entry| {
             _ = objc.setIvar(?*Adapter, entry.value_ptr.object, "_ziguiAdapter", null);
             objc.release(entry.value_ptr.object);
+            if (entry.value_ptr.value_utf8.len != 0) self.elements.allocator.free(@constCast(entry.value_ptr.value_utf8));
         }
         self.elements.deinit();
         self.* = undefined;
@@ -179,6 +181,11 @@ pub const Adapter = struct {
             const is_new = element.seen_generation == 0;
             const previous_hash = element.content_hash;
             const previous_focus = element.focused;
+            if (!std.mem.eql(u8, element.value_utf8, node.value)) {
+                const next_value = if (node.value.len == 0) &.{} else try self.allocator.dupe(u8, node.value);
+                if (element.value_utf8.len != 0) self.allocator.free(@constCast(element.value_utf8));
+                element.value_utf8 = next_value;
+            }
             element.actions = actionMask(node.actions);
             element.seen_generation = tree.generation;
             element.content_hash = nodeHash(node);
@@ -202,8 +209,9 @@ pub const Adapter = struct {
             if (node.range_min) |number| objc.send(void, object, "setAccessibilityMinValue:", .{objc.send(objc.Id, objc.class("NSNumber"), "numberWithDouble:", .{number})});
             if (node.range_max) |number| objc.send(void, object, "setAccessibilityMaxValue:", .{objc.send(objc.Id, objc.class("NSNumber"), "numberWithDouble:", .{number})});
             if (node.selection) |selection| objc.send(void, object, "setAccessibilitySelectedTextRange:", .{types.Range{
-                .location = @min(selection.anchor, selection.focus),
-                .length = if (selection.anchor <= selection.focus) selection.focus - selection.anchor else selection.anchor - selection.focus,
+                .location = utf8OffsetToUtf16Units(node.value, @min(selection.anchor, selection.focus)),
+                .length = utf8OffsetToUtf16Units(node.value, @max(selection.anchor, selection.focus)) -|
+                    utf8OffsetToUtf16Units(node.value, @min(selection.anchor, selection.focus)),
             }});
             const parent = if (node.parent.isValid())
                 (state.elements.get(node.parent.encode()) orelse unreachable).object
@@ -227,6 +235,7 @@ pub const Adapter = struct {
             const removed = state.elements.fetchRemove(encoded) orelse continue;
             _ = objc.setIvar(?*Adapter, removed.value.object, "_ziguiAdapter", null);
             objc.release(removed.value.object);
+            if (removed.value.value_utf8.len != 0) self.allocator.free(@constCast(removed.value.value_utf8));
         }
 
         const parent = self.host.parent(tree.window);
@@ -419,7 +428,41 @@ fn setSelectedTextRange(object: objc.Id, _: objc.Sel, range: types.Range) callco
         objc.sendSuper(void, object, objc.class_getSuperclass(objc.object_getClass(object)), "setAccessibilitySelectedTextRange:", .{range});
         return;
     }
-    _ = self.action(object, .set_selection, null, .{ .anchor = range.location, .focus = range.location +| range.length });
+    const window = objc.getIvar(u64, object, "_ziguiWindow") orelse return;
+    const semantic = objc.getIvar(u64, object, "_ziguiSemantic") orelse return;
+    const state = self.windows.getPtr(window) orelse return;
+    const element = state.elements.getPtr(semantic) orelse return;
+    _ = self.action(object, .set_selection, null, .{
+        .anchor = utf16UnitsToUtf8Offset(element.value_utf8, range.location),
+        .focus = utf16UnitsToUtf8Offset(element.value_utf8, range.location +| range.length),
+    });
+}
+
+fn utf8OffsetToUtf16Units(value: []const u8, requested: usize) usize {
+    const limit = @min(requested, value.len);
+    var byte_index: usize = 0;
+    var units: usize = 0;
+    while (byte_index < limit) {
+        const sequence_length = std.unicode.utf8ByteSequenceLength(value[byte_index]) catch break;
+        if (byte_index + sequence_length > limit or byte_index + sequence_length > value.len) break;
+        const scalar = std.unicode.utf8Decode(value[byte_index..][0..sequence_length]) catch break;
+        units += if (scalar > 0xffff) 2 else 1;
+        byte_index += sequence_length;
+    }
+    return units;
+}
+
+fn utf16UnitsToUtf8Offset(value: []const u8, requested: usize) usize {
+    var iterator = std.unicode.Utf8Iterator{ .bytes = value, .i = 0 };
+    var units: usize = 0;
+    while (iterator.nextCodepointSlice()) |slice| {
+        const scalar = std.unicode.utf8Decode(slice) catch break;
+        const width: usize = if (scalar > 0xffff) 2 else 1;
+        if (units + width > requested) return slice.ptr - value.ptr;
+        units += width;
+        if (units == requested) return slice.ptr - value.ptr + slice.len;
+    }
+    return value.len;
 }
 
 fn actionMask(actions: []const api.Action) u32 {

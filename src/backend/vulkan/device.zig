@@ -304,7 +304,9 @@ fn selectExportFormat(
         dispatch.get_physical_device_format_properties_2(physical, candidate.vulkan, &properties);
         for (modifiers[0..list.modifier_count]) |modifier| {
             if (modifier.plane_count != 1) continue;
-            const required = abi.format_feature_color_attachment_bit;
+            const required = abi.format_feature_color_attachment_bit |
+                abi.format_feature_transfer_src_bit |
+                abi.format_feature_transfer_dst_bit;
             if (modifier.tiling_features & required != required) continue;
             const compositor = findCompositorFormat(compositor_formats, candidate.drm, modifier.modifier) orelse continue;
             const value: ExportFormat = .{

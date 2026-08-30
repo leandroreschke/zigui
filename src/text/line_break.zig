@@ -54,11 +54,17 @@ pub fn analyze(allocator: std.mem.Allocator, text: []const u8) Error!Analysis {
     const result = try allocator.alloc(Boundary, units.items.len + 1);
     errdefer allocator.free(result);
     result[0] = .{ .utf8_offset = 0, .opportunity = .prohibited };
+    var previous_non_space: usize = 0;
+    var regional_run: usize = if (units.items.len != 0 and units.items[0].class == .ri) 1 else 0;
     var index: usize = 1;
-    while (index < units.items.len) : (index += 1) result[index] = .{
-        .utf8_offset = units.items[index].start,
-        .opportunity = boundaryAt(units.items, index),
-    };
+    while (index < units.items.len) : (index += 1) {
+        if (units.items[index - 1].class != .sp) previous_non_space = index - 1;
+        result[index] = .{
+            .utf8_offset = units.items[index].start,
+            .opportunity = boundaryAt(units.items, index, previous_non_space, regional_run),
+        };
+        regional_run = if (units.items[index].class == .ri) regional_run + 1 else 0;
+    }
     result[units.items.len] = .{ .utf8_offset = text.len, .opportunity = .mandatory };
     return .{ .boundaries = result };
 }
@@ -69,7 +75,7 @@ pub fn between(previous: u21, current: u21) Opportunity {
         .{ .scalar = current, .start = 1, .end = 2, .raw = data.properties(current).line, .class = resolveAmbiguous(current, data.properties(current).line) },
     };
     resolveCombining(&units);
-    return boundaryAt(&units, 1);
+    return boundaryAt(&units, 1, 0, if (units[0].class == .ri) 1 else 0);
 }
 
 fn resolveAmbiguous(scalar: u21, value: data.LineClass) data.LineClass {
@@ -94,7 +100,7 @@ fn resolveCombining(units: []Unit) void {
     }
 }
 
-fn boundaryAt(units: []const Unit, index: usize) Opportunity {
+fn boundaryAt(units: []const Unit, index: usize, non_space_index: usize, regional_run: usize) Opportunity {
     const previous = units[index - 1];
     const current = units[index];
     const left = previous.class;
@@ -112,7 +118,6 @@ fn boundaryAt(units: []const Unit, index: usize) Opportunity {
     if (right == .gl and left != .sp and left != .ba and left != .hy) return .prohibited;
     if (isClosing(right)) return .prohibited;
 
-    const non_space_index = previousNonSpace(units, index);
     const non_space = units[non_space_index].class;
     if (non_space == .op) return .prohibited;
     if (non_space == .qu and right == .op) return .prohibited;
@@ -136,15 +141,9 @@ fn boundaryAt(units: []const Unit, index: usize) Opportunity {
     if (left == .is and isAlphabetic(right)) return .prohibited;
     if (nonEastAsianOpening(units[index].scalar, right) and (isAlphabetic(left) or left == .nu)) return .prohibited;
     if (nonEastAsianClosing(units[index - 1].scalar, left) and (isAlphabetic(right) or right == .nu)) return .prohibited;
-    if (left == .ri and right == .ri) return if (regionalCount(units, index) % 2 == 1) .prohibited else .allowed;
+    if (left == .ri and right == .ri) return if (regional_run % 2 == 1) .prohibited else .allowed;
     if (left == .eb and right == .em) return .prohibited;
     return .allowed;
-}
-
-fn previousNonSpace(units: []const Unit, boundary: usize) usize {
-    var index = boundary - 1;
-    while (index > 0 and units[index].class == .sp) index -= 1;
-    return index;
 }
 
 fn isHard(value: data.LineClass) bool {
@@ -198,15 +197,4 @@ fn nonEastAsianClosing(scalar: u21, class: data.LineClass) bool {
     if (class != .cp) return false;
     const width = data.properties(scalar).east_asian_width;
     return width != .f and width != .w and width != .h;
-}
-
-fn regionalCount(units: []const Unit, boundary: usize) usize {
-    var index = boundary;
-    var count: usize = 0;
-    while (index > 0) {
-        index -= 1;
-        if (units[index].class != .ri) break;
-        count += 1;
-    }
-    return count;
 }

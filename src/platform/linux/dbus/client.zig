@@ -239,12 +239,12 @@ pub const Client = struct {
         return self.nextWireMessage(wait);
     }
 
-    pub fn waitSignal(self: *Client, path: []const u8, interface: []const u8, member: []const u8) Error!Message {
+    pub fn waitSignal(self: *Client, sender: []const u8, path: []const u8, interface: []const u8, member: []const u8) Error!Message {
         if (self.broken) return error.PlatformFailure;
         var pending_index: usize = 0;
         while (pending_index < self.pending.items.len) : (pending_index += 1) {
             const message = &self.pending.items[pending_index];
-            if (message.kind == .signal and optionalEqual(message.fields.path, path) and
+            if (message.kind == .signal and optionalEqual(message.fields.sender, sender) and optionalEqual(message.fields.path, path) and
                 optionalEqual(message.fields.interface, interface) and optionalEqual(message.fields.member, member))
             {
                 const result = self.pending.orderedRemove(pending_index);
@@ -263,7 +263,7 @@ pub const Client = struct {
                 message.deinit();
                 continue;
             }
-            if (message.kind == .signal and optionalEqual(message.fields.path, path) and
+            if (message.kind == .signal and optionalEqual(message.fields.sender, sender) and optionalEqual(message.fields.path, path) and
                 optionalEqual(message.fields.interface, interface) and optionalEqual(message.fields.member, member)) return message;
             try self.enqueuePending(message);
         }

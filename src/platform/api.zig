@@ -507,6 +507,8 @@ pub const PromisedFileBatchId = handles.PromisedFileBatchId;
 pub const PromisedFileOperationId = handles.PromisedFileOperationId;
 
 pub const PromisedFileDescriptor = struct {
+    /// Before receiving, platforms may expose one provisional descriptor for
+    /// a native receiver whose exact multi-file output is not yet known.
     /// Provider-supplied display name. This is metadata, not a filesystem
     /// path, and is always UTF-8 owned by `OwnedPromisedFileDescriptors`.
     suggested_name: []const u8,
@@ -537,6 +539,9 @@ pub const PromisedFileTerminalStatus = enum {
 };
 
 pub const PromisedFileOutput = struct {
+    /// A legacy native receiver may advertise one descriptor and materialize
+    /// several files. In that case multiple outputs intentionally refer to
+    /// the same descriptor index.
     descriptor_index: usize,
     /// A materialized local path, owned by the completion value, or null when
     /// the provider reported an error for this descriptor.
@@ -659,8 +664,10 @@ pub const ClipboardContents = struct {
     paths: []const []const u8 = &.{},
     image: ?ClipboardImage = null,
     contains_promised_files: bool = false,
-    /// Number of native promised-file entries in this snapshot. When a
-    /// provider can retain them, `promised_batch` is non-null and owns the
+    /// Number of currently advertised promised-file entries in this snapshot.
+    /// A native receiver may later materialize multiple outputs when its
+    /// pre-receive metadata cannot expose exact cardinality. When a provider
+    /// can retain the receivers, `promised_batch` is non-null and owns the
     /// corresponding receive snapshot; otherwise this remains detection-only.
     promised_file_count: usize = 0,
     /// When non-null, the provider retained the native receivers and exposes
@@ -766,6 +773,10 @@ pub const Dialogs = struct {
     context: *anyopaque,
     open_files_fn: *const fn (*anyopaque, handles.WindowId, bool, std.mem.Allocator) Error!OwnedPaths,
     save_file_fn: *const fn (*anyopaque, handles.WindowId, []const u8, std.mem.Allocator) Error!?OwnedPath,
+    /// Optional single-directory picker. A missing callback reports
+    /// `MissingCapability`, allowing platforms to expose only the dialog
+    /// operations they can implement.
+    open_directory_fn: ?*const fn (*anyopaque, handles.WindowId, std.mem.Allocator) Error!?OwnedPath = null,
     limits: DialogLimits = .{},
 
     pub fn openFiles(self: Dialogs, window: handles.WindowId, multiple: bool, allocator: std.mem.Allocator) Error!OwnedPaths {
@@ -787,6 +798,19 @@ pub const Dialogs = struct {
         if (!validUtf8Text(suggested_name)) return error.InvalidUtf8;
         if (suggested_name.len > self.limits.maximum_suggested_name_bytes) return error.BudgetExceeded;
         var result = try self.save_file_fn(self.context, window, suggested_name, allocator);
+        if (result) |*path| {
+            validatePath(path.value, self.limits.maximum_path_bytes) catch |err| {
+                path.deinit();
+                return err;
+            };
+        }
+        return result;
+    }
+
+    pub fn openDirectory(self: Dialogs, window: handles.WindowId, allocator: std.mem.Allocator) Error!?OwnedPath {
+        if (!window.isValid()) return error.InvalidHandle;
+        const callback = self.open_directory_fn orelse return error.MissingCapability;
+        var result = try callback(self.context, window, allocator);
         if (result) |*path| {
             validatePath(path.value, self.limits.maximum_path_bytes) catch |err| {
                 path.deinit();

@@ -168,6 +168,14 @@ pub const Harness = struct {
     pub fn setPageCaptureOutcome(self: *Harness, outcome: FakePageCaptureOutcome) void {
         self.context.page_capture_outcome = outcome;
     }
+
+    /// Selects the deterministic directory result returned by the headless
+    /// directory picker. Null models user cancellation.
+    pub fn setDirectoryPickerResult(self: *Harness, path: ?[]const u8) Error!void {
+        const replacement = if (path) |value| try self.context.allocator.dupe(u8, value) else null;
+        if (self.context.directory_picker_path) |existing| self.context.allocator.free(existing);
+        self.context.directory_picker_path = replacement;
+    }
 };
 
 const Context = struct {
@@ -194,6 +202,7 @@ const Context = struct {
     promised_retained_bytes: usize = 0,
     pending_payload_bytes: usize = 0,
     clipboard_text: ?[]u8 = null,
+    directory_picker_path: ?[]u8 = null,
     quit: bool = false,
     failure: ?Error = null,
 
@@ -729,6 +738,17 @@ pub fn createWithMemory(
             .maximum_bytes = memory.clipboard_bytes,
             .maximum_paths = memory.file_drop_path_count,
         },
+        .dialogs = .{
+            .context = context,
+            .open_files_fn = unsupportedOpenFiles,
+            .save_file_fn = unsupportedSaveFile,
+            .open_directory_fn = openDirectory,
+            .limits = .{
+                .maximum_paths = memory.file_drop_path_count,
+                .maximum_path_bytes = memory.platform_event_payload_bytes,
+                .maximum_suggested_name_bytes = memory.platform_text_bytes,
+            },
+        },
         .promised_files = .{
             .context = context,
             .describe_batch_fn = describePromisedBatch,
@@ -921,6 +941,21 @@ fn nativeHandle(context: *anyopaque, id: handles.WindowId) ?api.NativeHandle {
     return .{ .kind = .headless, .value = @intCast(id.encode()) };
 }
 
+fn unsupportedOpenFiles(_: *anyopaque, _: handles.WindowId, _: bool, _: std.mem.Allocator) Error!api.OwnedPaths {
+    return error.MissingCapability;
+}
+
+fn unsupportedSaveFile(_: *anyopaque, _: handles.WindowId, _: []const u8, _: std.mem.Allocator) Error!?api.OwnedPath {
+    return error.MissingCapability;
+}
+
+fn openDirectory(raw: *anyopaque, id: handles.WindowId, allocator: std.mem.Allocator) Error!?api.OwnedPath {
+    const self = cast(raw);
+    if (!self.windows.contains(id.encode())) return error.InvalidHandle;
+    const path = self.directory_picker_path orelse return null;
+    return .{ .allocator = allocator, .value = try allocator.dupe(u8, path) };
+}
+
 fn readClipboard(context: *anyopaque, allocator: std.mem.Allocator) Error!?[]u8 {
     const value = cast(context).clipboard_text orelse return null;
     return try allocator.dupe(u8, value);
@@ -949,6 +984,7 @@ fn deinit(context: *anyopaque) void {
     for (self.events.items[self.event_cursor..]) |*queued| queued.deinit(self.allocator);
     self.events.deinit(self.allocator);
     if (self.clipboard_text) |value| self.allocator.free(value);
+    if (self.directory_picker_path) |value| self.allocator.free(value);
     while (self.page_capture_requests.live_count != 0) {
         var page_capture_iterator = self.page_capture_requests.iterator();
         const entry = page_capture_iterator.next() orelse break;

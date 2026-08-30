@@ -288,6 +288,7 @@ pub const App = struct {
     }
 
     pub fn destroy(self: *App) Error!void {
+        if (self.closing) return error.AppClosed;
         try self.coordinator.affinity.assertCurrent();
         if (self.running) return error.ResourceBusy;
         if (self.coordinator.phase_state.callback_depth != 0) return error.CallbackReentrancy;
@@ -315,6 +316,10 @@ pub const App = struct {
         } else if (self.bundle.text_backend) |backend| backend.deinit();
         self.surfaces.deinit();
         self.resources.deinit();
+        // Render-extension deinitializers are application callbacks. Run them
+        // while the coordinator and its affinity state are still alive; the
+        // closing flag makes every public App entry point reject reentrancy.
+        self.bundle.renderer.deinit();
         self.offscreen_requests.deinit();
         self.page_capture_requests.deinit();
         self.delayed_invalidations.deinit(self.allocator);
@@ -323,7 +328,6 @@ pub const App = struct {
         self.nodes.deinit();
         self.coordinator.deinit() catch {};
         if (self.bundle.accessibility) |adapter| adapter.deinit();
-        self.bundle.renderer.deinit();
         self.bundle.deinit();
         if (self.exclusive_app_slot) exclusive_app_active.store(0, .release);
     }
@@ -407,9 +411,11 @@ pub const App = struct {
     /// paint, encode, submit, present, and teardown hooks must remain pure with
     /// respect to App-owned registries and native services.
     fn assertMutationPhase(self: *App) Error!void {
-        try self.coordinator.affinity.assertCurrent();
         if (self.closing) return error.AppClosed;
+        try self.coordinator.affinity.assertCurrent();
         if (self.pending_error) |err| return err;
+        if (self.coordinator.phase_state.mutation_block_depth != 0)
+            return error.FramePhaseViolation;
         switch (self.coordinator.phase_state.current) {
             .idle, .dispatching, .updating => {},
             else => return error.FramePhaseViolation,
@@ -417,8 +423,8 @@ pub const App = struct {
     }
 
     fn assertQuiescentPhase(self: *App) Error!void {
-        try self.coordinator.affinity.assertCurrent();
         if (self.closing) return error.AppClosed;
+        try self.coordinator.affinity.assertCurrent();
         if (self.pending_error) |err| return err;
         if (self.coordinator.phase_state.current != .idle or
             self.coordinator.phase_state.callback_depth != 0 or
@@ -426,8 +432,13 @@ pub const App = struct {
             return error.FramePhaseViolation;
     }
 
-    pub fn hasWindow(self: *App, id: handles.WindowId) Error!bool {
+    fn assertReadPhase(self: *const App) Error!void {
+        if (self.closing) return error.AppClosed;
         try self.coordinator.affinity.assertCurrent();
+    }
+
+    pub fn hasWindow(self: *App, id: handles.WindowId) Error!bool {
+        try self.assertReadPhase();
         return self.windows.contains(id);
     }
 
@@ -478,7 +489,7 @@ pub const App = struct {
     /// Returns the last platform-confirmed mode for a window. A mode command
     /// remains pending until its native adapter publishes `mode_changed`.
     pub fn windowMode(self: *const App, id: handles.WindowId) Error!platform.WindowMode {
-        try self.coordinator.affinity.assertCurrent();
+        try self.assertReadPhase();
         const target = self.windows.getConst(id) orelse return error.InvalidHandle;
         return target.*.mode;
     }
@@ -556,9 +567,11 @@ pub const App = struct {
     /// owned CPU work to the worker host without allowing arbitrary service
     /// mutation from retained build/layout/paint callbacks.
     fn assertTaskSpawnPhase(self: *App) Error!void {
-        try self.coordinator.affinity.assertCurrent();
         if (self.closing) return error.AppClosed;
+        try self.coordinator.affinity.assertCurrent();
         if (self.pending_error) |err| return err;
+        if (self.coordinator.phase_state.mutation_block_depth != 0)
+            return error.FramePhaseViolation;
         switch (self.coordinator.phase_state.current) {
             .idle, .dispatching, .updating => {},
             .composing => if (self.coordinator.phase_state.frame_callback_depth == 0)
@@ -784,8 +797,7 @@ pub const App = struct {
         try service.setMuted(id, muted);
     }
     pub fn nativeMediaState(self: *App, id: handles.NativeMediaId) Error!platform.NativeMediaState {
-        try self.coordinator.affinity.assertCurrent();
-        if (self.closing) return error.AppClosed;
+        try self.assertReadPhase();
         if (self.pending_error) |err| return err;
         const service = self.bundle.native_media orelse return error.MissingCapability;
         return service.state(id);
@@ -842,6 +854,17 @@ pub const App = struct {
         return dialogs.saveFile(window_id, suggested_name, allocator);
     }
 
+    pub fn openDirectory(
+        self: *App,
+        window_id: handles.WindowId,
+        allocator: std.mem.Allocator,
+    ) Error!?platform.OwnedPath {
+        try self.assertMutationPhase();
+        if (!self.windows.contains(window_id)) return error.InvalidHandle;
+        const dialogs = self.bundle.dialogs orelse return error.MissingCapability;
+        return dialogs.openDirectory(window_id, allocator);
+    }
+
     fn validateMenuItems(self: *const App, items: []const platform.MenuItem) Error!void {
         var remaining = self.app_config.memory.menu_item_count;
         try validateMenuLevel(
@@ -854,7 +877,7 @@ pub const App = struct {
     }
 
     pub fn tracer(self: *App) Error!?*tracing.Recorder {
-        try self.coordinator.affinity.assertCurrent();
+        try self.assertReadPhase();
         if (comptime config.tracing_enabled)
             return if (self.trace) |*recorder| recorder else null
         else
@@ -865,7 +888,7 @@ pub const App = struct {
     /// Applications can sample this for overlays or export it through their
     /// own telemetry without enabling the detailed trace journal.
     pub fn metricsSnapshot(self: *const App) Error!metrics.Counters {
-        try self.coordinator.affinity.assertCurrent();
+        try self.assertReadPhase();
         return self.coordinator.counters;
     }
 
@@ -873,12 +896,12 @@ pub const App = struct {
     /// Custom animation systems should use this clock so headless replay can
     /// control time deterministically.
     pub fn clockNow(self: *const App) Error!u64 {
-        try self.coordinator.affinity.assertCurrent();
+        try self.assertReadPhase();
         return self.bundle.event_loop.clock.now();
     }
 
     pub fn rendererCapabilities(self: *const App) Error!render.Capabilities {
-        try self.coordinator.affinity.assertCurrent();
+        try self.assertReadPhase();
         return self.bundle.renderer.capabilities();
     }
 
@@ -892,6 +915,8 @@ pub const App = struct {
         allocator: std.mem.Allocator,
     ) Error!?render.Readback {
         try self.assertMutationPhase();
+        var callback = try self.coordinator.phase_state.enterMutationBlockedCallback();
+        defer callback.deinit();
         return self.bundle.renderer.renderOffscreen(target, view, allocator);
     }
 
@@ -903,7 +928,10 @@ pub const App = struct {
         if (self.offscreen_requests.count() >= self.app_config.memory.offscreen_request_count)
             return error.BudgetExceeded;
         try self.offscreen_requests.ensureUnusedCapacity(1);
+        var callback = try self.coordinator.phase_state.enterMutationBlockedCallback();
+        defer callback.deinit();
         const id = try self.bundle.renderer.beginOffscreen(target, view);
+        callback.deinit();
         self.offscreen_requests.putAssumeCapacity(id, {});
         return id;
     }
@@ -1001,9 +1029,11 @@ pub const App = struct {
     }
 
     fn assertAsyncPollPhase(self: *App) Error!void {
-        try self.coordinator.affinity.assertCurrent();
         if (self.closing) return error.AppClosed;
+        try self.coordinator.affinity.assertCurrent();
         if (self.pending_error) |err| return err;
+        if (self.coordinator.phase_state.mutation_block_depth != 0)
+            return error.FramePhaseViolation;
         switch (self.coordinator.phase_state.current) {
             .idle, .dispatching, .updating => {},
             .composing => if (self.coordinator.phase_state.frame_callback_depth == 0)
@@ -1028,7 +1058,7 @@ pub const App = struct {
     }
 
     pub fn deviceGeneration(self: *const App) Error!render.DeviceGeneration {
-        try self.coordinator.affinity.assertCurrent();
+        try self.assertReadPhase();
         return self.bundle.renderer.deviceGeneration();
     }
 
@@ -1081,7 +1111,7 @@ pub const App = struct {
     }
 
     pub fn svgIntrinsicSize(self: *App, id: handles.SvgId) Error!geometry.Size {
-        try self.coordinator.affinity.assertCurrent();
+        try self.assertReadPhase();
         if (comptime config.svg_enabled) {
             const manager = if (self.svgs) |*value| value else return error.MissingCapability;
             return manager.intrinsicSize(id) orelse error.InvalidHandle;
@@ -1097,7 +1127,7 @@ pub const App = struct {
     }
 
     pub fn animationTexture(self: *App, id: handles.AnimationId) Error!handles.TextureId {
-        try self.coordinator.affinity.assertCurrent();
+        try self.assertReadPhase();
         if (comptime config.images_enabled) {
             const manager = if (self.images) |*value| value else return error.MissingCapability;
             return manager.animationTexture(id) orelse error.InvalidHandle;
@@ -1105,7 +1135,7 @@ pub const App = struct {
     }
 
     pub fn animationStatus(self: *const App, id: handles.AnimationId) Error!image_manager.AnimationStatus {
-        try self.coordinator.affinity.assertCurrent();
+        try self.assertReadPhase();
         if (comptime config.images_enabled) {
             const manager = if (self.images) |*value| value else return error.MissingCapability;
             return manager.animationStatus(id) orelse error.InvalidHandle;
@@ -1189,7 +1219,7 @@ pub const App = struct {
     }
 
     pub fn mediaVisual(self: *App, id: handles.MediaId) Error!media_api.Visual {
-        try self.coordinator.affinity.assertCurrent();
+        try self.assertReadPhase();
         if (comptime config.media_enabled) {
             const manager = if (self.media) |*value| value else return error.MissingCapability;
             return manager.visual(id) orelse error.InvalidHandle;
@@ -1249,11 +1279,15 @@ pub const App = struct {
     /// extension has completed on the GPU.
     pub fn registerRenderExtension(self: *App, descriptor: render_extension.Descriptor) Error!handles.RenderExtensionId {
         try self.assertMutationPhase();
+        var callback = try self.coordinator.phase_state.enterMutationBlockedCallback();
+        defer callback.deinit();
         return self.bundle.renderer.registerExtension(descriptor);
     }
 
     pub fn destroyRenderExtension(self: *App, id: handles.RenderExtensionId) Error!void {
         try self.assertMutationPhase();
+        var callback = try self.coordinator.phase_state.enterMutationBlockedCallback();
+        defer callback.deinit();
         try self.bundle.renderer.destroyExtension(id, self.bundle.renderer.completedEpoch());
     }
 
@@ -1495,7 +1529,7 @@ pub const App = struct {
             .pointer_leave => try self.bundle.windows.setCursor(target.id, .default),
             else => {},
         }
-        if (result.focus_changed) {
+        if (result.focus_changed or result.window_dirty) {
             // Focus changes require the full retained-tree reconciliation so
             // focus order, hit targets, and accessibility geometry commit
             // together.
@@ -2076,7 +2110,10 @@ pub const App = struct {
         // mirror first as one lifecycle transaction. Otherwise a recovered
         // backend can accept new work while App's old IDs consume the budget.
         self.drainOffscreenRequests();
+        var callback = try self.coordinator.phase_state.enterMutationBlockedCallback();
+        defer callback.deinit();
         try self.bundle.renderer.recover(self.app_config.gpu);
+        callback.deinit();
         self.resources.deviceLost();
         self.surfaces.deviceLost();
         if (comptime config.media_enabled) if (self.media) |*manager| try manager.deviceLost(self.bundle.event_loop.clock.now());
@@ -2115,6 +2152,8 @@ pub const App = struct {
         if (target.close_callback_invoked) return;
         target.close_callback_invoked = true;
         if (self.app_config.window_close_callback) |callback| {
+            var callback_guard = try self.coordinator.phase_state.enterCallback();
+            defer callback_guard.deinit();
             callback.call(target.id) catch |err| {
                 target.close_callback_invoked = false;
                 return err;

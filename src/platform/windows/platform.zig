@@ -43,6 +43,7 @@ const OwnedMenuItem = union(enum) {
         command: u32,
         enabled: bool,
         checked: bool,
+        shortcut: ?api.MenuShortcut,
     },
     submenu: struct { label: []u8, items: []OwnedMenuItem },
     application: struct { items: []OwnedMenuItem },
@@ -85,6 +86,8 @@ const NativeWindow = struct {
     ready: bool = false,
     destroying: bool = false,
     fullscreen: bool = false,
+    always_on_top: bool = false,
+    mode: api.WindowMode = .normal,
     windowed_style: isize = 0,
     windowed_ex_style: isize = 0,
     windowed_placement: win.WINDOWPLACEMENT = .{},
@@ -118,6 +121,7 @@ pub const Context = struct {
     application_items: []OwnedMenuItem = &.{},
     menu_actions: std.AutoHashMap(u32, api.MenuInvocation),
     next_menu_command: u32 = 0x1000,
+    accelerators: win.HACCEL = null,
     accessibility: ?*windows_a11y.Adapter = null,
 
     fn init(
@@ -190,6 +194,7 @@ pub const Context = struct {
         for (self.events.items[self.event_cursor..]) |*pending| pending.deinit(self.allocator);
         self.events.deinit(self.allocator);
         deinitOwnedMenuItems(self.allocator, self.application_items);
+        if (self.accelerators != null) _ = win.DestroyAcceleratorTable(self.accelerators);
         self.menu_actions.deinit();
         self.windows.deinit();
         if (self.class_registered) _ = win.UnregisterClassW(class_name, self.instance);
@@ -513,8 +518,12 @@ fn step(raw: *anyopaque, sink: api.EventSink, wait_for_event: bool) Error!bool {
         }
     } else if (win.PeekMessageW(&message, null, 0, 0, win.PM_REMOVE) == 0) return false;
     if (message.message != win.WM_ZIGUI_WAKE) {
-        _ = win.TranslateMessage(&message);
-        _ = win.DispatchMessageW(&message);
+        const translated = self.accelerators != null and message.hwnd != null and
+            win.TranslateAcceleratorW(message.hwnd, self.accelerators, &message) != 0;
+        if (!translated) {
+            _ = win.TranslateMessage(&message);
+            _ = win.DispatchMessageW(&message);
+        }
     }
     if (self.pop()) |pending_value| {
         var pending = pending_value;
@@ -560,6 +569,7 @@ fn createWindow(raw: *anyopaque, id: handles.WindowId, options: api.WindowOption
         .minimum_size = options.minimum_size,
         .maximum_size = options.maximum_size,
         .visible = options.visible,
+        .always_on_top = options.always_on_top,
     };
     var style: win.DWORD = if (options.decorated) win.WS_CAPTION | win.WS_SYSMENU | win.WS_MINIMIZEBOX else win.WS_POPUP;
     if (options.resizable) style |= win.WS_THICKFRAME | win.WS_MAXIMIZEBOX;
@@ -726,6 +736,7 @@ fn commandWindow(raw: *anyopaque, id: handles.WindowId, command: api.WindowComma
         .always_on_top => |enabled| {
             const insert_after = if (enabled) win.HWND_TOPMOST else win.HWND_NOTOPMOST;
             if (win.SetWindowPos(native.hwnd, insert_after, 0, 0, 0, 0, win.SWP_NOMOVE | win.SWP_NOSIZE | win.SWP_NOACTIVATE) == 0) return error.PlatformFailure;
+            native.always_on_top = enabled;
         },
     }
 }
@@ -741,6 +752,8 @@ fn enterFullscreen(native: *NativeWindow) Error!void {
     if (win.GetMonitorInfoW(monitor, &info) == 0) return error.PlatformFailure;
     const decoration_mask: isize = @intCast(win.WS_CAPTION | win.WS_SYSMENU | win.WS_THICKFRAME | win.WS_MINIMIZEBOX | win.WS_MAXIMIZEBOX);
     _ = win.SetWindowLongPtrW(native.hwnd, win.GWL_STYLE, native.windowed_style & ~decoration_mask);
+    native.fullscreen = true;
+    errdefer native.fullscreen = false;
     if (win.SetWindowPos(
         native.hwnd,
         null,
@@ -750,17 +763,18 @@ fn enterFullscreen(native: *NativeWindow) Error!void {
         info.monitor.bottom - info.monitor.top,
         win.SWP_NOZORDER | win.SWP_FRAMECHANGED,
     ) == 0) return error.PlatformFailure;
-    native.fullscreen = true;
 }
 
 fn leaveFullscreen(native: *NativeWindow) Error!void {
     if (!native.fullscreen) return;
+    native.fullscreen = false;
+    errdefer native.fullscreen = true;
     _ = win.SetWindowLongPtrW(native.hwnd, win.GWL_STYLE, native.windowed_style);
     _ = win.SetWindowLongPtrW(native.hwnd, win.GWL_EXSTYLE, native.windowed_ex_style);
     if (win.SetWindowPlacement(native.hwnd, &native.windowed_placement) == 0) return error.PlatformFailure;
-    if (win.SetWindowPos(native.hwnd, null, 0, 0, 0, 0, win.SWP_NOMOVE | win.SWP_NOSIZE | win.SWP_NOZORDER | win.SWP_NOACTIVATE | win.SWP_FRAMECHANGED) == 0)
+    const insert_after = if (native.always_on_top) win.HWND_TOPMOST else win.HWND_NOTOPMOST;
+    if (win.SetWindowPos(native.hwnd, insert_after, 0, 0, 0, 0, win.SWP_NOMOVE | win.SWP_NOSIZE | win.SWP_NOACTIVATE | win.SWP_FRAMECHANGED) == 0)
         return error.PlatformFailure;
-    native.fullscreen = false;
 }
 
 const DisplayCollector = struct {
@@ -953,6 +967,10 @@ fn setApplicationMenu(raw: *anyopaque, items: []const api.MenuItem) Error!void {
     var next: u32 = 0x1000;
     const owned = try cloneMenuItems(self.allocator, items, &actions, &next);
     errdefer deinitOwnedMenuItems(self.allocator, owned);
+    const accelerators = try buildAcceleratorTable(self.allocator, owned);
+    errdefer {
+        if (accelerators != null) _ = win.DestroyAcceleratorTable(accelerators);
+    }
 
     const Replacement = struct { window: *NativeWindow, menu: win.HMENU };
     var replacements: std.ArrayList(Replacement) = .empty;
@@ -984,10 +1002,12 @@ fn setApplicationMenu(raw: *anyopaque, items: []const api.MenuItem) Error!void {
     }
 
     deinitOwnedMenuItems(self.allocator, self.application_items);
+    if (self.accelerators != null) _ = win.DestroyAcceleratorTable(self.accelerators);
     self.menu_actions.deinit();
     self.menu_actions = actions;
     self.application_items = owned;
     self.next_menu_command = next;
+    self.accelerators = accelerators;
 }
 
 fn cloneMenuItems(
@@ -1019,6 +1039,7 @@ fn cloneMenuItems(
                     .command = command,
                     .enabled = definition.enabled,
                     .checked = definition.checked,
+                    .shortcut = definition.shortcut,
                 } };
             },
             .submenu => |submenu| submenu_result: {
@@ -1050,7 +1071,9 @@ fn buildOwnedMenu(allocator: std.mem.Allocator, items: []const OwnedMenuItem, po
     for (items) |item| switch (item) {
         .separator => if (win.AppendMenuW(menu, win.MF_SEPARATOR, 0, null) == 0) return error.PlatformFailure,
         .action => |definition| {
-            const label = try std.unicode.utf8ToUtf16LeAllocZ(allocator, definition.label);
+            const display_label = try windowsMenuLabel(allocator, definition.label, definition.shortcut);
+            defer allocator.free(display_label);
+            const label = try std.unicode.utf8ToUtf16LeAllocZ(allocator, display_label);
             defer allocator.free(label);
             var flags = win.MF_STRING;
             if (!definition.enabled) flags |= win.MF_GRAYED;
@@ -1078,6 +1101,113 @@ fn buildOwnedMenu(allocator: std.mem.Allocator, items: []const OwnedMenuItem, po
         .system_action => return error.Unsupported,
     };
     return menu;
+}
+
+fn buildAcceleratorTable(allocator: std.mem.Allocator, items: []const OwnedMenuItem) Error!win.HACCEL {
+    var entries: std.ArrayList(win.ACCEL) = .empty;
+    defer entries.deinit(allocator);
+    try appendAccelerators(allocator, &entries, items);
+    if (entries.items.len == 0) return null;
+    if (entries.items.len > std.math.maxInt(i32)) return error.BudgetExceeded;
+    return win.CreateAcceleratorTableW(entries.items.ptr, @intCast(entries.items.len)) orelse error.PlatformFailure;
+}
+
+fn appendAccelerators(allocator: std.mem.Allocator, entries: *std.ArrayList(win.ACCEL), items: []const OwnedMenuItem) Error!void {
+    for (items) |item| switch (item) {
+        .action => |definition| if (definition.shortcut) |shortcut| {
+            var flags: u8 = win.FVIRTKEY | win.FNOINVERT;
+            if (shortcut.modifiers.shift) flags |= win.FSHIFT;
+            if (shortcut.modifiers.control) flags |= win.FCONTROL;
+            if (shortcut.modifiers.alt) flags |= win.FALT;
+            if (shortcut.modifiers.command or shortcut.modifiers.caps_lock or shortcut.modifiers.num_lock or shortcut.modifiers.function)
+                return error.Unsupported;
+            try entries.append(allocator, .{
+                .fVirt = flags,
+                .key = try windowsVirtualKey(shortcut.key),
+                .cmd = @intCast(definition.command),
+            });
+        },
+        .submenu => |submenu| try appendAccelerators(allocator, entries, submenu.items),
+        .application => |application| try appendAccelerators(allocator, entries, application.items),
+        else => {},
+    };
+}
+
+fn windowsVirtualKey(key: input.Key) Error!u16 {
+    return switch (key) {
+        .character => |scalar| if (scalar >= 'a' and scalar <= 'z')
+            @intCast(scalar - ('a' - 'A'))
+        else if (scalar >= 'A' and scalar <= 'Z' or scalar >= '0' and scalar <= '9')
+            @intCast(scalar)
+        else
+            error.Unsupported,
+        .enter => win.VK_RETURN,
+        .escape => win.VK_ESCAPE,
+        .tab => win.VK_TAB,
+        .backspace => win.VK_BACK,
+        .delete => win.VK_DELETE,
+        .insert => win.VK_INSERT,
+        .home => win.VK_HOME,
+        .end => win.VK_END,
+        .page_up => win.VK_PRIOR,
+        .page_down => win.VK_NEXT,
+        .arrow_left => win.VK_LEFT,
+        .arrow_right => win.VK_RIGHT,
+        .arrow_up => win.VK_UP,
+        .arrow_down => win.VK_DOWN,
+        .space => win.VK_SPACE,
+        .function => |number| if (number >= 1 and number <= 24) @intCast(win.VK_F1 + number - 1) else error.Unsupported,
+        .native => |value| if (value <= std.math.maxInt(u16)) @intCast(value) else error.Unsupported,
+    };
+}
+
+fn windowsMenuLabel(allocator: std.mem.Allocator, label: []const u8, shortcut: ?api.MenuShortcut) Error![]u8 {
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    try result.appendSlice(allocator, label);
+    const definition = shortcut orelse return result.toOwnedSlice(allocator);
+    _ = try windowsVirtualKey(definition.key);
+    if (definition.modifiers.command or definition.modifiers.caps_lock or definition.modifiers.num_lock or definition.modifiers.function)
+        return error.Unsupported;
+    try result.append(allocator, '\t');
+    if (definition.modifiers.control) try result.appendSlice(allocator, "Ctrl+");
+    if (definition.modifiers.alt) try result.appendSlice(allocator, "Alt+");
+    if (definition.modifiers.shift) try result.appendSlice(allocator, "Shift+");
+    try appendWindowsKeyName(allocator, &result, definition.key);
+    return result.toOwnedSlice(allocator);
+}
+
+fn appendWindowsKeyName(allocator: std.mem.Allocator, result: *std.ArrayList(u8), key: input.Key) Error!void {
+    switch (key) {
+        .character => |scalar| {
+            var buffer: [4]u8 = undefined;
+            const length = std.unicode.utf8Encode(if (scalar >= 'a' and scalar <= 'z') scalar - ('a' - 'A') else scalar, &buffer) catch return error.Unsupported;
+            try result.appendSlice(allocator, buffer[0..length]);
+        },
+        .enter => try result.appendSlice(allocator, "Enter"),
+        .escape => try result.appendSlice(allocator, "Esc"),
+        .tab => try result.appendSlice(allocator, "Tab"),
+        .backspace => try result.appendSlice(allocator, "Backspace"),
+        .delete => try result.appendSlice(allocator, "Del"),
+        .insert => try result.appendSlice(allocator, "Ins"),
+        .home => try result.appendSlice(allocator, "Home"),
+        .end => try result.appendSlice(allocator, "End"),
+        .page_up => try result.appendSlice(allocator, "PgUp"),
+        .page_down => try result.appendSlice(allocator, "PgDn"),
+        .arrow_left => try result.appendSlice(allocator, "Left"),
+        .arrow_right => try result.appendSlice(allocator, "Right"),
+        .arrow_up => try result.appendSlice(allocator, "Up"),
+        .arrow_down => try result.appendSlice(allocator, "Down"),
+        .space => try result.appendSlice(allocator, "Space"),
+        .function => |number| {
+            var buffer: [8]u8 = undefined;
+            try result.appendSlice(allocator, std.fmt.bufPrint(&buffer, "F{d}", .{number}) catch unreachable);
+        },
+        .native => |value| {
+            var buffer: [16]u8 = undefined;
+            try result.appendSlice(allocator, std.fmt.bufPrint(&buffer, "0x{X}", .{value}) catch unreachable);
+        },
+    }
 }
 
 fn detachAndDestroyMenu(window: *NativeWindow) void {
@@ -1285,6 +1415,17 @@ fn windowProcedure(hwnd: win.HWND, message: win.UINT, wparam: win.WPARAM, lparam
         win.WM_SIZE => {
             window.logical_size = clientLogicalSize(hwnd, window.scale_factor);
             self.queue(window.id, .{ .resized = window.logical_size });
+            const mode: api.WindowMode = if (window.fullscreen)
+                .fullscreen
+            else switch (wparam) {
+                1 => .minimized,
+                2 => .maximized,
+                else => .normal,
+            };
+            if (mode != window.mode) {
+                window.mode = mode;
+                self.queue(window.id, .{ .mode_changed = mode });
+            }
             return 0;
         },
         win.WM_MOVE => {
@@ -1564,13 +1705,18 @@ fn utf16OffsetToUtf8(units: []const u16, offset: usize) usize {
 fn handleDrop(window: *NativeWindow, drop: win.HDROP) void {
     defer win.DragFinish(drop);
     const count = win.DragQueryFileW(drop, std.math.maxInt(u32), null, 0);
+    if (count > window.context.maximum_file_drop_paths) return window.context.fail(error.BudgetExceeded);
     var paths: std.ArrayList([]const u8) = .empty;
     defer {
         for (paths.items) |path| window.context.allocator.free(@constCast(path));
         paths.deinit(window.context.allocator);
     }
+    var maximum_utf8_bytes: usize = 0;
     for (0..count) |index| {
         const length = win.DragQueryFileW(drop, @intCast(index), null, 0);
+        const worst_case = std.math.mul(usize, length, 3) catch return window.context.fail(error.BudgetExceeded);
+        maximum_utf8_bytes = std.math.add(usize, maximum_utf8_bytes, worst_case) catch return window.context.fail(error.BudgetExceeded);
+        if (maximum_utf8_bytes > window.context.maximum_event_payload_bytes) return window.context.fail(error.BudgetExceeded);
         const wide = window.context.allocator.alloc(u16, @as(usize, length) + 1) catch |err| return window.context.fail(err);
         defer window.context.allocator.free(wide);
         if (win.DragQueryFileW(drop, @intCast(index), wide.ptr, @intCast(wide.len)) == 0) continue;

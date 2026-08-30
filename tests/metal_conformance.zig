@@ -143,9 +143,13 @@ test "Metal asynchronous offscreen readback retains scene until completion" {
     scene.deinit();
 
     var result = try renderer.pollOffscreen(id, std.testing.allocator);
-    var attempts: usize = 0;
-    while (result == .pending and attempts < 100) : (attempts += 1)
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    while (result == .pending and
+        started.durationTo(std.Io.Clock.awake.now(std.testing.io)).nanoseconds < 2 * std.time.ns_per_s)
+    {
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
         result = try renderer.pollOffscreen(id, std.testing.allocator);
+    }
     switch (result) {
         .ready => |readback| {
             var owned = readback;

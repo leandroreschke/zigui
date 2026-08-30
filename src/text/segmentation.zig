@@ -106,19 +106,35 @@ fn isGraphemeControl(value: data.GraphemeClass) bool {
 pub const WordIterator = struct {
     bytes: []const u8,
     cursor: usize = 0,
+    regional_run: usize = 0,
 
     pub fn next(self: *WordIterator) Error!?Segment {
         if (self.cursor >= self.bytes.len) return null;
         const start = self.cursor;
-        var position = (try decodeForward(self.bytes, start)).end;
-        while (position < self.bytes.len and !(try isWordBoundary(self.bytes, position)))
-            position = (try decodeForward(self.bytes, position)).end;
+        const first = try decodeForward(self.bytes, start);
+        self.acceptWordScalar(first.scalar);
+        var position = first.end;
+        while (position < self.bytes.len and !(try isWordBoundaryWithRegionalRun(self.bytes, position, self.regional_run))) {
+            const decoded = try decodeForward(self.bytes, position);
+            self.acceptWordScalar(decoded.scalar);
+            position = decoded.end;
+        }
         self.cursor = position;
         return .{ .start = start, .end = position };
+    }
+
+    fn acceptWordScalar(self: *WordIterator, scalar: u21) void {
+        const word = data.properties(scalar).word;
+        if (isWordIgnored(word)) return;
+        self.regional_run = if (word == .regional_indicator) self.regional_run + 1 else 0;
     }
 };
 
 pub fn isWordBoundary(bytes: []const u8, position: usize) Error!bool {
+    return isWordBoundaryWithRegionalRun(bytes, position, null);
+}
+
+fn isWordBoundaryWithRegionalRun(bytes: []const u8, position: usize, regional_run: ?usize) Error!bool {
     if (position == 0 or position == bytes.len) return true;
     if (position > bytes.len) return error.InvalidUtf8;
     const immediate_left = try decodeBackward(bytes, position);
@@ -151,7 +167,8 @@ pub fn isWordBoundary(bytes: []const u8, position: usize) Error!bool {
     if (before_left != null and data.properties(before_left.?.scalar).word == .hebrew_letter and l == .double_quote and r == .hebrew_letter) return false;
     if (l == .numeric and isMidNumeric(r) and after_right != null and data.properties(after_right.?.scalar).word == .numeric) return false;
     if (before_left != null and data.properties(before_left.?.scalar).word == .numeric and isMidNumeric(l) and r == .numeric) return false;
-    if (l == .regional_indicator and r == .regional_indicator) return try regionalCountBefore(bytes, right.start) % 2 == 0;
+    if (l == .regional_indicator and r == .regional_indicator)
+        return (regional_run orelse try regionalCountBefore(bytes, right.start)) % 2 == 0;
     return true;
 }
 
@@ -213,19 +230,35 @@ fn regionalCountBefore(bytes: []const u8, position: usize) Error!usize {
 pub const SentenceIterator = struct {
     bytes: []const u8,
     cursor: usize = 0,
+    preceding_terminal: ?data.SentenceClass = null,
 
     pub fn next(self: *SentenceIterator) Error!?Segment {
         if (self.cursor >= self.bytes.len) return null;
         const start = self.cursor;
-        var position = (try decodeForward(self.bytes, start)).end;
-        while (position < self.bytes.len and !(try isSentenceBoundary(self.bytes, position)))
-            position = (try decodeForward(self.bytes, position)).end;
+        const first = try decodeForward(self.bytes, start);
+        self.acceptSentenceScalar(first.scalar);
+        var position = first.end;
+        while (position < self.bytes.len and !(try isSentenceBoundaryWithTerminal(self.bytes, position, self.preceding_terminal))) {
+            const decoded = try decodeForward(self.bytes, position);
+            self.acceptSentenceScalar(decoded.scalar);
+            position = decoded.end;
+        }
         self.cursor = position;
         return .{ .start = start, .end = position };
+    }
+
+    fn acceptSentenceScalar(self: *SentenceIterator, scalar: u21) void {
+        const sentence = data.properties(scalar).sentence;
+        if (isSentenceIgnored(sentence) or sentence == .close or sentence == .sp) return;
+        self.preceding_terminal = sentence;
     }
 };
 
 pub fn isSentenceBoundary(bytes: []const u8, position: usize) Error!bool {
+    return isSentenceBoundaryWithTerminal(bytes, position, null);
+}
+
+fn isSentenceBoundaryWithTerminal(bytes: []const u8, position: usize, preceding_terminal: ?data.SentenceClass) Error!bool {
     if (position == 0 or position == bytes.len) return true;
     if (position > bytes.len) return error.InvalidUtf8;
     const immediate_left = try decodeBackward(bytes, position);
@@ -250,11 +283,17 @@ pub fn isSentenceBoundary(bytes: []const u8, position: usize) Error!bool {
         }
     }
 
-    var terminal = left;
     var terminal_class = l;
-    while (terminal_class == .close or terminal_class == .sp) {
-        terminal = (try previousSentenceSignificant(bytes, terminal.start)) orelse return false;
-        terminal_class = data.properties(terminal.scalar).sentence;
+    if (terminal_class == .close or terminal_class == .sp) {
+        if (preceding_terminal) |known| {
+            terminal_class = known;
+        } else {
+            var terminal = left;
+            while (terminal_class == .close or terminal_class == .sp) {
+                terminal = (try previousSentenceSignificant(bytes, terminal.start)) orelse return false;
+                terminal_class = data.properties(terminal.scalar).sentence;
+            }
+        }
     }
     if (terminal_class == .aterm and r == .lower) return false;
     if ((terminal_class == .aterm or terminal_class == .sterm) and

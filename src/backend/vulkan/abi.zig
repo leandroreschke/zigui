@@ -260,6 +260,8 @@ pub const index_type_uint32: i32 = 1;
 pub const format_feature_sampled_image_bit: Flags = 0x00000001;
 pub const format_feature_color_attachment_bit: Flags = 0x00000080;
 pub const format_feature_color_attachment_blend_bit: Flags = 0x00000100;
+pub const format_feature_transfer_src_bit: Flags = 0x00004000;
+pub const format_feature_transfer_dst_bit: Flags = 0x00008000;
 
 pub const Offset2D = extern struct { x: i32 = 0, y: i32 = 0 };
 pub const Offset3D = extern struct { x: i32 = 0, y: i32 = 0, z: i32 = 0 };

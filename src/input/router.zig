@@ -16,6 +16,10 @@ pub const Result = struct {
     default_prevented: bool = false,
     target: handles.NodeId = .invalid,
     focus_changed: bool = false,
+    /// Multiple callbacks can invalidate different component boundaries
+    /// during one synthesized transition; those requests must widen to the
+    /// window rather than losing all but one component.
+    window_dirty: bool = false,
     /// Explicit phase work requested by a handled custom element event.
     /// App applies this to the owning component after dispatch completes.
     narrow_dirty: ?layout.Dirty = null,
@@ -150,9 +154,9 @@ pub const Router = struct {
             if (!self.pointer_capture.contains(pointer_id) and self.pointer_capture.count() < self.limits.maximum_pointer_captures)
                 try self.pointer_capture.ensureUnusedCapacity(1);
         }
-        if (forced_target == null) try self.updateHover(nodes, coordinator, value, scratch);
         const target = forced_target orelse self.resolveTarget(nodes, value);
         var result: Result = .{ .target = target };
+        if (forced_target == null) try self.updateHover(nodes, coordinator, value, scratch, &result);
         if (!target.isValid()) return result;
 
         switch (value.*) {
@@ -240,12 +244,9 @@ pub const Router = struct {
         }
         result.handled = result.handled or state.handled;
         result.default_prevented = state.default_prevented;
-        if (state.requested_dirty) |dirty| {
-            result.narrow_dirty = dirty;
-            result.narrow_component = nodes.getConst(target).?.component;
-        }
+        mergeRequestedDirty(nodes, target, &state, &result);
         if (!focus_before.eql(self.focus_manager.focused)) {
-            try self.sendFocusTransition(nodes, coordinator, focus_before, self.focus_manager.focused);
+            try self.sendFocusTransition(nodes, coordinator, focus_before, self.focus_manager.focused, &result);
             result.focus_changed = true;
         }
         return result;
@@ -386,6 +387,7 @@ pub const Router = struct {
         coordinator: *coordinator_mod.Coordinator,
         value: *const event.Event,
         scratch: std.mem.Allocator,
+        result: *Result,
     ) Error!void {
         const pointer = switch (value.*) {
             .pointer_down, .pointer_up, .pointer_move, .pointer_enter, .pointer_leave, .pointer_cancel => |pointer_value| pointer_value,
@@ -417,6 +419,7 @@ pub const Router = struct {
             };
             try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &dispatch_state, &synthetic, .bubble, null);
             try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &dispatch_state, &synthetic, null);
+            mergeRequestedDirty(nodes, node_id, &dispatch_state, result);
         }
         var enter_index = common;
         while (enter_index < next_path.len) : (enter_index += 1) {
@@ -430,6 +433,7 @@ pub const Router = struct {
             };
             try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &dispatch_state, &synthetic, .bubble, null);
             try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, node_id, &dispatch_state, &synthetic, null);
+            mergeRequestedDirty(nodes, node_id, &dispatch_state, result);
         }
         self.hover_path.clearRetainingCapacity();
         self.hover_path.appendSliceAssumeCapacity(next_path);
@@ -441,6 +445,7 @@ pub const Router = struct {
         coordinator: *coordinator_mod.Coordinator,
         previous: handles.NodeId,
         next: handles.NodeId,
+        result: *Result,
     ) Error!void {
         if (!previous.eql(next)) if (self.native_text_input) |bridge|
             try bridge.setActive(self.window, false);
@@ -449,12 +454,14 @@ pub const Router = struct {
             var state: event.Dispatch = .{ .window = self.window, .target = previous, .current = previous, .phase = .target };
             try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, previous, &state, &value, .bubble, null);
             try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, previous, &state, &value, null);
+            mergeRequestedDirty(nodes, previous, &state, result);
         }
         if (next.isValid()) {
             const value: event.Event = .focus_in;
             var state: event.Dispatch = .{ .window = self.window, .target = next, .current = next, .phase = .target };
             try callHandlers(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, next, &state, &value, .bubble, null);
             try callCustom(nodes, self.hits, coordinator, self.window, self.native_text_input, self.native_clipboard, next, &state, &value, null);
+            mergeRequestedDirty(nodes, next, &state, result);
         }
     }
 
@@ -485,6 +492,32 @@ pub const Router = struct {
         return record.semantics.role == .text_field or record.semantics.role == .search_field;
     }
 };
+
+fn mergeRequestedDirty(
+    nodes: *const compose_store.Store,
+    node_id: handles.NodeId,
+    state: *const event.Dispatch,
+    result: *Result,
+) void {
+    const dirty = state.requested_dirty orelse return;
+    const component = if (nodes.getConst(node_id)) |record| record.component else return;
+    result.handled = true;
+    if (result.window_dirty) return;
+    if (result.narrow_component) |existing_component| {
+        if (!existing_component.eql(component)) {
+            result.window_dirty = true;
+            result.narrow_component = null;
+            result.narrow_dirty = null;
+            return;
+        }
+        if (result.narrow_dirty) |*existing_dirty| existing_dirty.merge(dirty);
+        return;
+    }
+    if (result.narrow_dirty == null) {
+        result.narrow_component = component;
+        result.narrow_dirty = dirty;
+    }
+}
 
 fn callHandlers(
     nodes: *const compose_store.Store,

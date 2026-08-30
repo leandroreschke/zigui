@@ -1184,7 +1184,15 @@ pub const Renderer = struct {
 
     fn recover(context: *anyopaque, policy: config.GpuPolicy) Error!void {
         const self = cast(context);
-        while (self.in_flight.items.len != 0) try self.waitOldest();
+        if (self.extensions.callbacksActive()) return error.CallbackReentrancy;
+        // Failed command buffers belong to the lost device generation. Drop
+        // the framework's references and rebuild immediately; waiting for a
+        // successful completion would make recovery itself return DeviceLost.
+        while (self.in_flight.items.len != 0) {
+            const abandoned = self.in_flight.orderedRemove(0);
+            self.frame_resources[abandoned.slot].busy_epoch = 0;
+            release(abandoned.command_buffer);
+        }
         drainOffscreen(self);
         const next_device = MTLCreateSystemDefaultDevice() orelse return error.NoGpuDevice;
         errdefer release(next_device);

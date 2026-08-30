@@ -106,15 +106,16 @@ pub const Portal = struct {
 
     fn performRequest(self: *Portal, member: []const u8, token: []const u8, body: []const u8) Error![][]const u8 {
         if (!self.response_match_installed) {
-            try self.bus.addMatch("type='signal',interface='org.freedesktop.portal.Request',member='Response'");
+            try self.bus.addMatch("type='signal',sender='org.freedesktop.portal.Desktop',interface='org.freedesktop.portal.Request',member='Response'");
             self.response_match_installed = true;
         }
         var reply = try self.bus.call(destination, desktop_path, file_chooser, member, "ssa{sv}", body);
         defer reply.deinit();
         var reply_reader = reply.bodyReader();
         const request_path = try reply_reader.objectPath();
+        const response_sender = reply.fields.sender orelse return error.PlatformFailure;
         _ = token;
-        var response = try self.bus.waitSignal(request_path, request_interface, "Response");
+        var response = try self.bus.waitSignal(response_sender, request_path, request_interface, "Response");
         defer response.deinit();
         var reader = response.bodyReader();
         const result = try reader.u32();

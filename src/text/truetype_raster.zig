@@ -12,6 +12,7 @@ const Segment = struct {
 const maximum_raster_dimension = 8192;
 const maximum_raster_pixels = 4 * 1024 * 1024;
 const maximum_raster_segments = 1_048_576;
+const maximum_raster_work_units = 128 * 1024 * 1024;
 const maximum_text_size: f32 = 1_000_000;
 const maximum_scale_factor: f32 = 64;
 
@@ -69,11 +70,14 @@ pub fn rasterize(
     const height: usize = @intFromFloat(@max(0, height_value));
     const length = std.math.mul(usize, width, height) catch return error.BudgetExceeded;
     if (length > maximum_raster_pixels) return error.BudgetExceeded;
+    const samples: usize = 4;
+    const work = std.math.mul(usize, length, segments.items.len) catch return error.BudgetExceeded;
+    const sampled_work = std.math.mul(usize, work, samples * samples) catch return error.BudgetExceeded;
+    if (sampled_work > maximum_raster_work_units) return error.BudgetExceeded;
     const pixels = try allocator.alloc(u8, length);
     errdefer allocator.free(pixels);
     @memset(pixels, 0);
 
-    const samples: usize = 4;
     var y: usize = 0;
     while (y < height) : (y += 1) {
         var x: usize = 0;

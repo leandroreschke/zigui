@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("../../../config.zig");
 const Error = @import("../../../core/error.zig").Error;
 const clock = @import("../../../core/clock.zig");
@@ -185,6 +186,8 @@ const NativeWindow = struct {
     surrounding_text: ?[]u8 = null,
     selection: input.TextRange = .{ .start = 0, .end = 0 },
     cursor: api.Cursor = .default,
+    mode: api.WindowMode = .normal,
+    requested_mode: ?api.WindowMode = null,
 
     fn deinit(self: *NativeWindow) void {
         self.context.retained_text.release(self.context.allocator, &self.portal_handle);
@@ -1119,12 +1122,22 @@ fn commandWindow(raw: *anyopaque, id: handles.WindowId, command: api.WindowComma
         .always_on_top => return error.Unsupported,
         .mode => |mode| switch (mode) {
             .normal => {
+                native.requested_mode = mode;
                 try protocol.xdgToplevelSetMaximized(&self.client.connection, native.toplevel, false);
                 try protocol.xdgToplevelUnsetFullscreen(&self.client.connection, native.toplevel);
             },
-            .minimized => try protocol.xdgToplevelSetMinimized(&self.client.connection, native.toplevel),
-            .maximized => try protocol.xdgToplevelSetMaximized(&self.client.connection, native.toplevel, true),
-            .fullscreen => try protocol.xdgToplevelSetFullscreen(&self.client.connection, native.toplevel, null),
+            .minimized => {
+                native.requested_mode = mode;
+                try protocol.xdgToplevelSetMinimized(&self.client.connection, native.toplevel);
+            },
+            .maximized => {
+                native.requested_mode = mode;
+                try protocol.xdgToplevelSetMaximized(&self.client.connection, native.toplevel, true);
+            },
+            .fullscreen => {
+                native.requested_mode = mode;
+                try protocol.xdgToplevelSetFullscreen(&self.client.connection, native.toplevel, null);
+            },
         },
     }
     try protocol.surfaceCommit(&self.client.connection, native.surface);
@@ -1875,9 +1888,33 @@ fn handleToplevel(self: *Context, object: client_mod.Object, opcode: u16, reader
         0 => {
             const width = try reader.int();
             const height = try reader.int();
-            _ = try reader.array();
+            const states = try reader.array();
+            if (states.len % 4 != 0) return error.PlatformFailure;
             if (object.owner == 0) return;
             const native: *NativeWindow = @ptrFromInt(object.owner);
+            var maximized = false;
+            var fullscreen = false;
+            var offset: usize = 0;
+            while (offset < states.len) : (offset += 4) switch (std.mem.readInt(u32, states[offset..][0..4], builtin.cpu.arch.endian())) {
+                1 => maximized = true,
+                2 => fullscreen = true,
+                else => {},
+            };
+            const resolved: api.WindowMode = if (fullscreen)
+                .fullscreen
+            else if (maximized)
+                .maximized
+            else
+                .normal;
+            if (resolved != native.mode) {
+                native.mode = resolved;
+                self.queue(native.id, .{ .mode_changed = resolved });
+            }
+            // xdg-shell exposes no minimized configure state. Never turn the
+            // local minimize request into a false compositor confirmation;
+            // the first ordinary configure resolves that request as normal.
+            if (native.requested_mode == resolved or native.requested_mode == .minimized)
+                native.requested_mode = null;
             native.pending_size = .{
                 .width = if (width > 0) @floatFromInt(width) else native.logical_size.width,
                 .height = if (height > 0) @floatFromInt(height) else native.logical_size.height,
@@ -2015,7 +2052,8 @@ fn handleDataSource(self: *Context, object_id: u32, opcode: u16, reader: *wire.R
             _ = try reader.string();
             const descriptor = try reader.fd();
             defer sys.close(descriptor);
-            try sys.writeAll(descriptor, source.text);
+            try sys.setNonBlocking(descriptor);
+            try sys.writeAllUntil(descriptor, source.text, sys.monotonicNanoseconds() +| 5 * std.time.ns_per_s);
         },
         2 => destroyClipboardSource(self, object_id),
         3, 4 => {},

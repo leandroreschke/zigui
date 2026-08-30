@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Platform = enum {
     auto,
@@ -49,7 +50,13 @@ pub fn build(b: *std.Build) void {
 
     const platform = resolvePlatform(requested_platform, target.result.os.tag);
     const renderer = resolveRenderer(requested_renderer, platform);
+    validateTarget(platform, target.result.os.tag);
     validateCombination(platform, renderer);
+    const compile_only = b.option(bool, "compile-only", "Compile test and stress artifacts without executing them") orelse false;
+    // `Query.isNative` includes CPU, OS, ABI, version/dynamic-linker, object
+    // format, and feature overrides. OS/architecture equality alone can still
+    // describe a binary the build host must not execute.
+    const can_run_target = !compile_only and target.query.isNative();
 
     const enable_text = b.option(bool, "text", "Compile native text shaping and rasterization") orelse true;
     const enable_accessibility = b.option(bool, "a11y", "Compile native accessibility adapters") orelse true;
@@ -88,7 +95,11 @@ pub fn build(b: *std.Build) void {
     });
     linkPlatform(b, zigui, platform, enable_media, enable_images);
     if (platform == .macos and macos_sdk_path.len != 0) addMacOsSdkPaths(b, zigui, macos_sdk_path);
-    if (platform == .macos and renderer == .metal) addMetalLibrary(b, zigui, metal_toolchain);
+    const selected_metal_library = if (platform == .macos and renderer == .metal)
+        compileMetalLibrary(b, metal_toolchain)
+    else
+        null;
+    if (selected_metal_library) |library| zigui.addAnonymousImport("zigui_metal_library", .{ .root_source_file = library });
     if (renderer == .d3d11) zigui.addAnonymousImport("zigui_hlsl_source", .{
         .root_source_file = b.path("shaders/d3d11/zigui.hlsl"),
     });
@@ -154,7 +165,7 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{ .root_module = zigui });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run the complete ZigUI test suite");
-    test_step.dependOn(&run_unit_tests.step);
+    dependOnTest(test_step, unit_tests, run_unit_tests, can_run_target);
     if (target.result.os.tag == .macos and platform == .macos and renderer == .metal) {
         const metal_conformance = b.addTest(.{
             .root_module = b.createModule(.{
@@ -164,7 +175,8 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "zigui", .module = zigui }},
             }),
         });
-        test_step.dependOn(&b.addRunArtifact(metal_conformance).step);
+        const run_metal_conformance = b.addRunArtifact(metal_conformance);
+        dependOnTest(test_step, metal_conformance, run_metal_conformance, can_run_target);
     }
     if (target.result.os.tag == .windows and platform == .windows and renderer == .d3d11) {
         const windows_native = b.addTest(.{
@@ -175,7 +187,8 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "zigui", .module = zigui }},
             }),
         });
-        test_step.dependOn(&b.addRunArtifact(windows_native).step);
+        const run_windows_native = b.addRunArtifact(windows_native);
+        dependOnTest(test_step, windows_native, run_windows_native, can_run_target);
     }
 
     // Conformance always uses the deterministic headless/null pair regardless
@@ -211,7 +224,8 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zigui", .module = conformance_zigui }},
         }),
     });
-    test_step.dependOn(&b.addRunArtifact(conformance).step);
+    const run_conformance = b.addRunArtifact(conformance);
+    dependOnTest(test_step, conformance, run_conformance, can_run_target);
 
     // WebP is a platform capability rather than a hidden application
     // fallback. Keep the cross-target Unsupported contract in the regular
@@ -226,7 +240,8 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "zigui", .module = conformance_zigui }},
             }),
         });
-        test_step.dependOn(&b.addRunArtifact(webp_headless).step);
+        const run_webp_headless = b.addRunArtifact(webp_headless);
+        dependOnTest(test_step, webp_headless, run_webp_headless, can_run_target);
         if (target.result.os.tag == .macos and platform == .macos and renderer == .metal) {
             const webp_native = b.addTest(.{
                 .root_module = b.createModule(.{
@@ -236,7 +251,8 @@ pub fn build(b: *std.Build) void {
                     .imports = &.{.{ .name = "zigui", .module = zigui }},
                 }),
             });
-            test_step.dependOn(&b.addRunArtifact(webp_native).step);
+            const run_webp_native = b.addRunArtifact(webp_native);
+            dependOnTest(test_step, webp_native, run_webp_native, can_run_target);
         }
     }
 
@@ -250,7 +266,8 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zigui", .module = conformance_zigui }},
         }),
     });
-    test_step.dependOn(&b.addRunArtifact(protocol_conformance).step);
+    const run_protocol_conformance = b.addRunArtifact(protocol_conformance);
+    dependOnTest(test_step, protocol_conformance, run_protocol_conformance, can_run_target);
 
     // Shader conformance is host-runnable. Vulkan modules are generated by
     // the same in-tree writer used by Linux, while the native Metal/HLSL
@@ -264,7 +281,25 @@ pub fn build(b: *std.Build) void {
     shader_test_root.addAnonymousImport("zigui_metal_source", .{ .root_source_file = b.path("shaders/metal/zigui.metal") });
     shader_test_root.addAnonymousImport("zigui_hlsl_source", .{ .root_source_file = b.path("shaders/d3d11/zigui.hlsl") });
     const shader_conformance = b.addTest(.{ .root_module = shader_test_root });
-    test_step.dependOn(&b.addRunArtifact(shader_conformance).step);
+    const run_shader_conformance = b.addRunArtifact(shader_conformance);
+    dependOnTest(test_step, shader_conformance, run_shader_conformance, can_run_target);
+
+    const shader_sdk_checks = b.step("shader-sdk-checks", "Compile native shaders with the host platform SDK");
+    switch (builtin.os.tag) {
+        .macos => {
+            const library = selected_metal_library orelse compileMetalLibrary(b, metal_toolchain);
+            library.addStepDependencies(shader_sdk_checks);
+        },
+        .windows => if (can_run_target)
+            shader_sdk_checks.dependOn(&run_shader_conformance.step)
+        else
+            shader_sdk_checks.dependOn(&b.addFail(
+                "Windows shader SDK checks require a native host target; omit -Dtarget or use the host-native target",
+            ).step),
+        else => shader_sdk_checks.dependOn(&b.addFail(
+            "native shader SDK checks require a macOS Metal host or Windows D3DCompiler host",
+        ).step),
+    }
 
     const stress_check = b.addExecutable(.{
         .name = "zigui-stress-check",
@@ -276,7 +311,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const stress_step = b.step("stress", "Run 10,000 deterministic retained and paint-only frames");
-    stress_step.dependOn(&b.addRunArtifact(stress_check).step);
+    if (can_run_target)
+        stress_step.dependOn(&b.addRunArtifact(stress_check).step)
+    else
+        stress_step.dependOn(&stress_check.step);
+}
+
+fn dependOnTest(step: *std.Build.Step, artifact: *std.Build.Step.Compile, run: *std.Build.Step.Run, can_run: bool) void {
+    step.dependOn(if (can_run) &run.step else &artifact.step);
 }
 
 fn addMacOsSdkPaths(b: *std.Build, module: *std.Build.Module, sdk_path: []const u8) void {
@@ -285,7 +327,7 @@ fn addMacOsSdkPaths(b: *std.Build, module: *std.Build.Module, sdk_path: []const 
     module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System", "Library", "Frameworks" }) });
 }
 
-fn addMetalLibrary(b: *std.Build, module: *std.Build.Module, toolchain: ?[]const u8) void {
+fn compileMetalLibrary(b: *std.Build, toolchain: ?[]const u8) std.Build.LazyPath {
     const compile = if (toolchain) |root|
         b.addSystemCommand(&.{ b.pathJoin(&.{ root, "usr", "bin", "metal" }), "-fmodules-cache-path=.zig-cache/metal-module-cache", "-c" })
     else
@@ -300,8 +342,7 @@ fn addMetalLibrary(b: *std.Build, module: *std.Build.Module, toolchain: ?[]const
         b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metallib" });
     link.addFileArg(air);
     link.addArg("-o");
-    const library = link.addOutputFileArg("zigui.metallib");
-    module.addAnonymousImport("zigui_metal_library", .{ .root_source_file = library });
+    return link.addOutputFileArg("zigui.metallib");
 }
 
 fn resolvePlatform(requested: Platform, os: std.Target.Os.Tag) Platform {
@@ -336,6 +377,17 @@ fn validateCombination(platform: Platform, renderer: Renderer) void {
     if (!valid) @panic("invalid ZigUI platform and renderer combination");
 }
 
+fn validateTarget(platform: Platform, os: std.Target.Os.Tag) void {
+    const valid = switch (platform) {
+        .auto => false,
+        .headless => true,
+        .macos => os == .macos,
+        .windows => os == .windows,
+        .linux_wayland, .linux_x11 => os == .linux,
+    };
+    if (!valid) @panic("ZigUI platform does not match the selected target operating system");
+}
+
 fn linkPlatform(
     b: *std.Build,
     module: *std.Build.Module,
@@ -354,9 +406,9 @@ fn linkPlatform(
             module.linkFramework("CoreVideo", .{});
             module.linkFramework("Foundation", .{});
             module.linkFramework("LinkPresentation", .{});
-            // ImageIO is used only by the optional macOS WebP image provider.
-            // Other targets keep the in-tree image contract and report
-            // `Unsupported` for WebP rather than linking a hidden codec.
+            // ImageIO is used only by the documented optional macOS WebP and
+            // AVIF providers. Other targets report `Unsupported` rather than
+            // linking a hidden codec.
             if (enable_images) module.linkFramework("ImageIO", .{});
             module.linkFramework("Metal", .{});
             module.linkFramework("PDFKit", .{});

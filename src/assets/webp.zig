@@ -345,6 +345,7 @@ fn renderFrame(
         .origin = .{ .x = 0, .y = 0 },
         .size = .{ .width = @floatFromInt(width), .height = @floatFromInt(height) },
     }, image_value);
+    image.unpremultiplyRgba8(pixels, width, height, stride);
     return .{ .pixels = pixels, .width = @intCast(width), .height = @intCast(height) };
 }
 

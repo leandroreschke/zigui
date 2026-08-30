@@ -31,6 +31,13 @@ extern "c" fn zigui_promise_receive(
     operation_queue: objc.Id,
     reader: ?*anyopaque,
 ) void;
+extern "c" fn zigui_promise_queue_finished(
+    operation_queue: objc.Id,
+    context: ?*anyopaque,
+    callback: *const fn (?*anyopaque) callconv(.c) void,
+    retain_context: *const fn (?*anyopaque) callconv(.c) void,
+    release_context: *const fn (?*anyopaque) callconv(.c) void,
+) bool;
 extern "c" fn zigui_promise_test_invoke_reader(reader: ?*anyopaque) void;
 extern "c" fn zigui_promise_test_invoke_failure(reader: ?*anyopaque) void;
 
@@ -77,10 +84,30 @@ const BridgeState = struct {
     }
 };
 
+const OperationIngress = struct {
+    claimed_callbacks: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    budget_exceeded: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    maximum_files: usize,
+
+    fn claim(self: *OperationIngress) bool {
+        var current = self.claimed_callbacks.load(.acquire);
+        while (current < self.maximum_files) {
+            if (self.claimed_callbacks.cmpxchgWeak(current, current + 1, .acq_rel, .acquire) == null)
+                return true;
+            current = self.claimed_callbacks.load(.acquire);
+        }
+        self.budget_exceeded.store(true, .release);
+        return false;
+    }
+};
+
 const CallbackContext = struct {
     state: *BridgeState,
+    ingress: *OperationIngress,
     operation: handles.PromisedFileOperationId,
-    descriptor_index: usize,
+    descriptor_start: usize,
+    descriptor_count: usize,
+    delivered_outputs: usize = 0,
     references: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
 
     fn retain(self: *CallbackContext) void {
@@ -93,6 +120,13 @@ const CallbackContext = struct {
             state.allocator.destroy(self);
             state.release();
         }
+    }
+
+    fn claimDescriptor(self: *CallbackContext) usize {
+        std.debug.assert(self.descriptor_count != 0);
+        const offset = self.delivered_outputs;
+        self.delivered_outputs += 1;
+        return self.descriptor_start + @min(offset, self.descriptor_count - 1);
     }
 };
 
@@ -107,6 +141,8 @@ const Batch = struct {
     allocator: std.mem.Allocator,
     receivers: []objc.Id,
     descriptors: []api.PromisedFileDescriptor,
+    descriptor_starts: []usize,
+    descriptor_counts: []usize,
     bytes: usize,
     released: bool = false,
     operation_refs: usize = 0,
@@ -120,6 +156,8 @@ const Batch = struct {
             if (descriptor.content_type.len != 0) self.allocator.free(@constCast(descriptor.content_type));
         }
         self.allocator.free(self.descriptors);
+        self.allocator.free(self.descriptor_starts);
+        self.allocator.free(self.descriptor_counts);
         self.* = undefined;
     }
 };
@@ -129,13 +167,11 @@ const Operation = struct {
     batch: handles.PromisedFileBatchId,
     destination: []u8,
     operation_queue: objc.Id,
+    ingress: *OperationIngress,
     callbacks: []*CallbackContext,
     readers: []?*anyopaque,
-    seen: []bool,
     outputs: []api.PromisedFileOutput,
-    expected_callbacks: usize,
-    native_count: usize = 0,
-    callbacks_seen: usize = 0,
+    output_count: usize = 0,
     successful_outputs: usize = 0,
     failed_outputs: usize = 0,
     bytes: usize = 0,
@@ -145,6 +181,7 @@ const Operation = struct {
     poll_consumed: bool = false,
     release_requested: bool = false,
     cancelled: bool = false,
+    native_finished: bool = false,
     native_released: bool = false,
 
     fn deinit(self: *Operation, state: *BridgeState) void {
@@ -152,14 +189,14 @@ const Operation = struct {
             for (self.readers) |reader| if (reader) |value| zigui_promise_release_reader(value);
         }
         for (self.callbacks) |callback| callback.release();
-        for (self.outputs) |output| {
+        for (self.outputs[0..self.output_count]) |output| {
             if (output.path) |path| self.allocator.free(@constCast(path));
             if (output.error_description) |description| self.allocator.free(@constCast(description));
         }
         self.allocator.free(self.outputs);
-        self.allocator.free(self.seen);
         self.allocator.free(self.readers);
         self.allocator.free(self.callbacks);
+        self.allocator.destroy(self.ingress);
         objc.release(self.operation_queue);
         self.allocator.free(self.destination);
         state.releaseBytes(self.bytes);
@@ -289,49 +326,78 @@ pub const Service = struct {
         const objects = objc.send(objc.Id, pasteboard, "readObjectsForClasses:options:", .{
             objc.arrayWithObject(receiver_class), @as(objc.Id, null),
         }) orelse return null;
-        const count = objc.send(usize, objects, "count", .{});
-        if (count == 0) return null;
-        if (count > self.maximum_files or self.batches.live_count >= self.maximum_batches)
+        const receiver_total = objc.send(usize, objects, "count", .{});
+        if (receiver_total == 0) return null;
+        if (receiver_total > self.maximum_files or self.batches.live_count >= self.maximum_batches)
             return error.BudgetExceeded;
         if (self.state.reserved_bytes.load(.acquire) >= self.maximum_bytes) return error.BudgetExceeded;
 
-        const receivers = try self.allocator.alloc(objc.Id, count);
+        var descriptor_total: usize = 0;
+        for (0..receiver_total) |index| {
+            const receiver = objc.send(objc.Id, objects, "objectAtIndex:", .{index}) orelse return error.PlatformFailure;
+            const names = objc.send(objc.Id, receiver, "fileNames", .{});
+            const name_count = if (names) |value| objc.send(usize, value, "count", .{}) else 0;
+            descriptor_total = std.math.add(usize, descriptor_total, advertisedReceiverCount(name_count)) catch return error.BudgetExceeded;
+            if (descriptor_total > self.maximum_files) return error.BudgetExceeded;
+        }
+
+        const receivers = try self.allocator.alloc(objc.Id, receiver_total);
         var receiver_count: usize = 0;
         errdefer {
             for (receivers[0..receiver_count]) |receiver| objc.release(receiver);
             self.allocator.free(receivers);
         }
-        const descriptors = try self.allocator.alloc(api.PromisedFileDescriptor, count);
-        var descriptor_count: usize = 0;
+        const descriptors = try self.allocator.alloc(api.PromisedFileDescriptor, descriptor_total);
+        var descriptors_initialized: usize = 0;
         errdefer {
-            for (descriptors[0..descriptor_count]) |descriptor| {
+            for (descriptors[0..descriptors_initialized]) |descriptor| {
                 self.allocator.free(@constCast(descriptor.suggested_name));
                 if (descriptor.content_type.len != 0) self.allocator.free(@constCast(descriptor.content_type));
             }
             self.allocator.free(descriptors);
         }
+        const descriptor_starts = try self.allocator.alloc(usize, receiver_total);
+        errdefer self.allocator.free(descriptor_starts);
+        const descriptor_counts = try self.allocator.alloc(usize, receiver_total);
+        errdefer self.allocator.free(descriptor_counts);
         var bytes: usize = 0;
-        for (0..count) |index| {
+        for (0..receiver_total) |index| {
             const receiver = objc.send(objc.Id, objects, "objectAtIndex:", .{index}) orelse return error.PlatformFailure;
-            const name = objc.utf8(objc.send(objc.Id, receiver, "fileName", .{}));
-            if (name.len == 0 or !validText(name)) return error.PlatformFailure;
-            const content_type = objc.utf8(objc.send(objc.Id, receiver, "fileType", .{}));
-            bytes = std.math.add(usize, bytes, name.len) catch return error.BudgetExceeded;
-            bytes = std.math.add(usize, bytes, content_type.len) catch return error.BudgetExceeded;
-            if (bytes > self.maximum_bytes -| self.retained_bytes) return error.BudgetExceeded;
+            const names = objc.send(objc.Id, receiver, "fileNames", .{});
+            const types = objc.send(objc.Id, receiver, "fileTypes", .{});
+            const name_count = if (names) |value| objc.send(usize, value, "count", .{}) else 0;
+            const type_count = if (types) |value| objc.send(usize, value, "count", .{}) else 0;
+            const receiver_descriptor_count = advertisedReceiverCount(name_count);
+            descriptor_starts[index] = descriptors_initialized;
+            descriptor_counts[index] = receiver_descriptor_count;
             receivers[index] = objc.retain(receiver);
             receiver_count += 1;
-            var name_owned: ?[]u8 = try self.allocator.dupe(u8, name);
-            errdefer if (name_owned) |value| self.allocator.free(value);
-            var type_owned: ?[]u8 = if (content_type.len == 0) null else try self.allocator.dupe(u8, content_type);
-            errdefer if (type_owned) |value| self.allocator.free(value);
-            descriptors[index] = .{
-                .suggested_name = name_owned.?,
-                .content_type = type_owned orelse "",
-            };
-            name_owned = null;
-            type_owned = null;
-            descriptor_count += 1;
+            for (0..receiver_descriptor_count) |file_index| {
+                const descriptor_index = descriptor_starts[index] + file_index;
+                const name = if (name_count != 0)
+                    objc.utf8(objc.send(objc.Id, names, "objectAtIndex:", .{@min(file_index, name_count - 1)}))
+                else
+                    "Promised File";
+                if (!validText(name)) return error.PlatformFailure;
+                const content_type = if (type_count != 0)
+                    objc.utf8(objc.send(objc.Id, types, "objectAtIndex:", .{@min(file_index, type_count - 1)}))
+                else
+                    "";
+                bytes = std.math.add(usize, bytes, name.len) catch return error.BudgetExceeded;
+                bytes = std.math.add(usize, bytes, content_type.len) catch return error.BudgetExceeded;
+                if (bytes > self.maximum_bytes -| self.retained_bytes) return error.BudgetExceeded;
+                var name_owned: ?[]u8 = try self.allocator.dupe(u8, name);
+                errdefer if (name_owned) |value| self.allocator.free(value);
+                var type_owned: ?[]u8 = if (content_type.len == 0) null else try self.allocator.dupe(u8, content_type);
+                errdefer if (type_owned) |value| self.allocator.free(value);
+                descriptors[descriptor_index] = .{
+                    .suggested_name = name_owned.?,
+                    .content_type = type_owned orelse "",
+                };
+                name_owned = null;
+                type_owned = null;
+                descriptors_initialized += 1;
+            }
         }
         if (!self.state.reserveBytes(bytes)) return error.BudgetExceeded;
         var bytes_reserved = true;
@@ -340,6 +406,8 @@ pub const Service = struct {
             .allocator = self.allocator,
             .receivers = receivers,
             .descriptors = descriptors,
+            .descriptor_starts = descriptor_starts,
+            .descriptor_counts = descriptor_counts,
             .bytes = bytes,
         };
         const id = self.batches.insert(batch) catch |err| {
@@ -359,9 +427,19 @@ pub const Service = struct {
         const objects = objc.send(objc.Id, pasteboard, "readObjectsForClasses:options:", .{
             objc.arrayWithObject(receiver_class), @as(objc.Id, null),
         });
-        const count = if (objects) |value| objc.send(usize, value, "count", .{}) else 0;
-        if (count > self.maximum_files) return error.BudgetExceeded;
-        return count;
+        const receivers = if (objects) |value| value else return 0;
+        const receiver_count = objc.send(usize, receivers, "count", .{});
+        var descriptor_count: usize = 0;
+        for (0..receiver_count) |index| {
+            const receiver = objc.send(objc.Id, receivers, "objectAtIndex:", .{index}) orelse
+                return error.PlatformFailure;
+            const names = objc.send(objc.Id, receiver, "fileNames", .{});
+            const name_count = if (names) |value| objc.send(usize, value, "count", .{}) else 0;
+            descriptor_count = std.math.add(usize, descriptor_count, advertisedReceiverCount(name_count)) catch
+                return error.BudgetExceeded;
+            if (descriptor_count > self.maximum_files) return error.BudgetExceeded;
+        }
+        return descriptor_count;
     }
 
     pub fn canAccept(self: *const Service, count: usize) bool {
@@ -427,37 +505,44 @@ pub const Service = struct {
 
         var copied_destination: ?[]u8 = try self.allocator.dupe(u8, destination);
         errdefer if (copied_destination) |value| self.allocator.free(value);
-        if (!self.state.reserveBytes(destination.len)) return error.BudgetExceeded;
-        var destination_reserved = true;
-        errdefer if (destination_reserved) self.state.releaseBytes(destination.len);
+        const output_storage_bytes = std.math.mul(usize, self.maximum_files, @sizeOf(api.PromisedFileOutput)) catch
+            return error.BudgetExceeded;
+        const operation_base_bytes = std.math.add(usize, destination.len, output_storage_bytes) catch
+            return error.BudgetExceeded;
+        if (!self.state.reserveBytes(operation_base_bytes)) return error.BudgetExceeded;
+        var operation_bytes_reserved = true;
+        errdefer if (operation_bytes_reserved) self.state.releaseBytes(operation_base_bytes);
         // The callback itself is marshaled to the main queue below.  Keep the
         // receive operation on a private queue so cancellation can never
         // cancel unrelated work submitted to NSOperationQueue.mainQueue.
         const queue = createPrivateOperationQueue() orelse return error.PlatformFailure;
-        errdefer objc.release(queue);
+        objc.send(void, queue, "setSuspended:", .{true});
+        var operation_inserted = false;
+        errdefer if (!operation_inserted) objc.release(queue);
         const destination_url = fileUrl(destination) orelse return error.PlatformFailure;
         const callback_count = batch.receivers.len;
+        const ingress = try self.allocator.create(OperationIngress);
+        ingress.* = .{ .maximum_files = self.maximum_files };
+        errdefer if (!operation_inserted) self.allocator.destroy(ingress);
         const callbacks = try self.allocator.alloc(*CallbackContext, callback_count);
         var callbacks_initialized: usize = 0;
-        errdefer {
+        errdefer if (!operation_inserted) {
             for (callbacks[0..callbacks_initialized]) |callback| callback.release();
             self.allocator.free(callbacks);
-        }
+        };
         const readers = try self.allocator.alloc(?*anyopaque, callback_count);
         @memset(readers, null);
-        errdefer self.allocator.free(readers);
-        const seen = try self.allocator.alloc(bool, callback_count);
-        @memset(seen, false);
-        errdefer self.allocator.free(seen);
-        const outputs = try self.allocator.alloc(api.PromisedFileOutput, callback_count);
-        for (outputs, 0..) |*output, index| output.* = .{ .descriptor_index = index };
-        errdefer self.allocator.free(outputs);
+        errdefer if (!operation_inserted) self.allocator.free(readers);
+        const outputs = try self.allocator.alloc(api.PromisedFileOutput, self.maximum_files);
+        errdefer if (!operation_inserted) self.allocator.free(outputs);
         for (callbacks, 0..) |*callback, index| {
             const value = try self.allocator.create(CallbackContext);
             value.* = .{
                 .state = self.state,
+                .ingress = ingress,
                 .operation = handles.PromisedFileOperationId.invalid,
-                .descriptor_index = index,
+                .descriptor_start = batch.descriptor_starts[index],
+                .descriptor_count = batch.descriptor_counts[index],
             };
             self.state.retain();
             callback.* = value;
@@ -469,30 +554,32 @@ pub const Service = struct {
             .batch = id,
             .destination = copied_destination.?,
             .operation_queue = queue,
+            .ingress = ingress,
             .callbacks = callbacks,
             .readers = readers,
-            .seen = seen,
             .outputs = outputs,
-            .expected_callbacks = callback_count,
-            .bytes = destination.len,
+            .bytes = operation_base_bytes,
         };
         copied_destination = null;
-        destination_reserved = false;
+        operation_bytes_reserved = false;
         const operation_id = self.operations.insert(operation) catch |err| {
+            operation_inserted = true;
             var owned = operation;
             owned.deinit(self.state);
             return err;
         };
+        operation_inserted = true;
         const stored = self.operations.get(operation_id) orelse unreachable;
         for (stored.callbacks) |callback| callback.operation = operation_id;
         batch.started = true;
         batch.operation_refs += 1;
 
-        var initiated: usize = 0;
-        errdefer if (initiated != callback_count) {
+        var begin_completed = false;
+        errdefer if (!begin_completed) {
             stored.cancelled = true;
             stored.terminal = true;
             stored.status = .failed;
+            objc.send(void, stored.operation_queue, "setSuspended:", .{false});
             cancelAndDrainQueue(stored.operation_queue);
             stored.releaseNative();
             batch.operation_refs -|= 1;
@@ -511,10 +598,21 @@ pub const Service = struct {
                 return error.PlatformFailure;
             };
             stored.readers[index] = reader;
-            stored.native_count += 1;
             zigui_promise_receive(receiver, destination_url, queue, reader);
-            initiated += 1;
         }
+        // File-name and type metadata cannot reliably predict how many files
+        // a receiver will materialize. Completion is therefore defined by a
+        // barrier placed after AppKit's serial receive operations, while each
+        // reader callback claims from the shared bounded ingress dynamically.
+        if (!zigui_promise_queue_finished(
+            stored.operation_queue,
+            stored.callbacks[0],
+            promiseQueueFinished,
+            retainCallbackContext,
+            releaseCallbackContext,
+        )) return error.PlatformFailure;
+        objc.send(void, stored.operation_queue, "setSuspended:", .{false});
+        begin_completed = true;
         return operation_id;
     }
 
@@ -528,7 +626,7 @@ pub const Service = struct {
         else
             null;
         errdefer if (error_description) |description| allocator.free(description);
-        const outputs = try allocator.alloc(api.PromisedFileOutput, operation.outputs.len);
+        const outputs = try allocator.alloc(api.PromisedFileOutput, operation.output_count);
         var initialized: usize = 0;
         errdefer {
             for (outputs[0..initialized]) |output| {
@@ -537,7 +635,7 @@ pub const Service = struct {
             }
             allocator.free(outputs);
         }
-        for (operation.outputs, 0..) |output, index| {
+        for (operation.outputs[0..operation.output_count], 0..) |output, index| {
             outputs[index] = .{ .descriptor_index = output.descriptor_index };
             initialized += 1;
             if (output.path) |path| outputs[index].path = try allocator.dupe(u8, path);
@@ -563,6 +661,16 @@ pub const Service = struct {
         operation.terminal = true;
         operation.status = .canceled;
         objc.send(void, operation.operation_queue, "cancelAllOperations", .{});
+        // Cancellation may suppress the original completion operation. Queue
+        // a fresh serial drain marker after canceling so release still waits
+        // for every in-flight reader callback without blocking the UI thread.
+        if (!zigui_promise_queue_finished(
+            operation.operation_queue,
+            operation.callbacks[0],
+            promiseQueueFinished,
+            retainCallbackContext,
+            releaseCallbackContext,
+        )) return error.PlatformFailure;
         self.wake();
     }
 
@@ -606,18 +714,22 @@ pub const Service = struct {
                 self.allocator.free(value);
             }
         }
-        if (operation.seen[callback.descriptor_index]) return;
-        operation.seen[callback.descriptor_index] = true;
-        operation.callbacks_seen += 1;
-        if (operation.cancelled) return self.finishCallback(operation);
-        const output = &operation.outputs[callback.descriptor_index];
+        if (operation.cancelled or operation.native_finished) return;
+        if (operation.output_count >= operation.outputs.len) {
+            operation.ingress.budget_exceeded.store(true, .release);
+            return;
+        }
+        const output_index = operation.output_count;
+        operation.output_count += 1;
+        const output = &operation.outputs[output_index];
+        output.* = .{ .descriptor_index = callback.claimDescriptor() };
         if (path_owned) |value| {
             if (value.len != 0 and validText(value) and value.len <= self.maximum_bytes -| operation.bytes) {
                 output.path = value;
                 path_owned = null;
                 operation.bytes += value.len;
                 operation.successful_outputs += 1;
-                return self.finishCallback(operation);
+                return;
             }
         }
         if (description_owned) |value| {
@@ -634,26 +746,14 @@ pub const Service = struct {
             }
         }
         operation.failed_outputs += 1;
-        self.finishCallback(operation);
     }
 
-    fn deliverFailure(self: *Service, callback: *CallbackContext) void {
-        const operation = self.operations.get(callback.operation) orelse return;
-        if (operation.seen[callback.descriptor_index]) return;
-        operation.seen[callback.descriptor_index] = true;
-        operation.callbacks_seen += 1;
-        if (operation.cancelled) return self.finishCallback(operation);
-        if (fallback_error.len <= self.maximum_bytes -| operation.bytes and self.state.reserveBytes(fallback_error.len)) {
-            operation.outputs[callback.descriptor_index].error_description = self.allocator.dupe(u8, fallback_error) catch null;
-            if (operation.outputs[callback.descriptor_index].error_description == null) self.state.releaseBytes(fallback_error.len) else operation.bytes += fallback_error.len;
-        }
-        operation.failed_outputs += 1;
-        self.finishCallback(operation);
-    }
-
-    fn finishCallback(self: *Service, operation: *Operation) void {
-        if (operation.callbacks_seen < operation.expected_callbacks) return;
-        if (operation.cancelled) operation.status = .canceled else if (operation.failed_outputs == 0)
+    fn nativeFinished(self: *Service, operation_id: handles.PromisedFileOperationId) void {
+        const operation = self.operations.get(operation_id) orelse return;
+        if (operation.native_finished) return;
+        operation.native_finished = true;
+        const budget_exceeded = operation.ingress.budget_exceeded.load(.acquire);
+        if (operation.cancelled) operation.status = .canceled else if (!budget_exceeded and operation.output_count != 0 and operation.failed_outputs == 0)
             operation.status = .completed
         else if (operation.successful_outputs == 0)
             operation.status = .failed
@@ -665,7 +765,7 @@ pub const Service = struct {
     }
 
     fn maybeDestroyOperationByPointer(self: *Service, operation: *Operation) void {
-        if (!operation.poll_consumed or !operation.release_requested or operation.callbacks_seen < operation.expected_callbacks)
+        if (!operation.poll_consumed or !operation.release_requested or !operation.native_finished)
             return;
         const id = operationIdForPointer(self, operation) orelse return;
         self.maybeDestroyOperation(id);
@@ -673,7 +773,7 @@ pub const Service = struct {
 
     fn maybeDestroyOperation(self: *Service, id: handles.PromisedFileOperationId) void {
         const operation = self.operations.get(id) orelse return;
-        if (!operation.release_requested or !operation.poll_consumed or operation.callbacks_seen < operation.expected_callbacks) return;
+        if (!operation.release_requested or !operation.poll_consumed or !operation.native_finished) return;
         const value = self.operations.remove(id) orelse return;
         var removed = value;
         removed.deinit(self.state);
@@ -739,6 +839,10 @@ fn promiseReaderCallback(raw: ?*anyopaque, url: objc.Id, error_object: objc.Id) 
     defer callback.release();
     const state = callback.state;
     if (state.context.load(.acquire) == 0) return;
+    // Claim before copying any provider-controlled path or error text. Excess
+    // callbacks are rejected at the native ingress and reported when the
+    // serial completion barrier reaches the main queue.
+    if (!callback.ingress.claim()) return;
     var pool = objc.AutoreleasePool.init();
     defer pool.deinit();
     const path_text = if (url) |value| objc.utf8(objc.send(objc.Id, value, "path", .{})) else "";
@@ -772,7 +876,12 @@ fn promiseReaderCallback(raw: ?*anyopaque, url: objc.Id, error_object: objc.Id) 
         queueFailure(callback);
         return;
     };
-    payload.* = .{ .callback = callback, .path = path, .error_description = description, .reserved_bytes = reserved_bytes };
+    payload.* = .{
+        .callback = callback,
+        .path = path,
+        .error_description = description,
+        .reserved_bytes = reserved_bytes,
+    };
     callback.retain();
     _ = state.pending_main_callbacks.fetchAdd(1, .acq_rel);
     dispatch_async_f(&_dispatch_main_q, payload, deliverPayload);
@@ -806,7 +915,28 @@ fn deliverFailure(raw: ?*anyopaque) callconv(.c) void {
     const address = callback.state.context.load(.acquire);
     if (address == 0) return;
     const service = @as(*Service, @ptrFromInt(address));
-    service.deliverFailure(callback);
+    service.deliver(callback, null, null);
+}
+
+fn promiseQueueFinished(raw: ?*anyopaque) callconv(.c) void {
+    const callback = @as(*CallbackContext, @ptrCast(@alignCast(raw orelse return)));
+    callback.retain();
+    _ = callback.state.pending_main_callbacks.fetchAdd(1, .acq_rel);
+    dispatch_async_f(&_dispatch_main_q, callback, deliverQueueFinished);
+}
+
+fn deliverQueueFinished(raw: ?*anyopaque) callconv(.c) void {
+    const callback = @as(*CallbackContext, @ptrCast(@alignCast(raw orelse return)));
+    defer callback.release();
+    defer _ = callback.state.pending_main_callbacks.fetchSub(1, .acq_rel);
+    const address = callback.state.context.load(.acquire);
+    if (address == 0) return;
+    const service = @as(*Service, @ptrFromInt(address));
+    service.nativeFinished(callback.operation);
+}
+
+fn advertisedReceiverCount(name_count: usize) usize {
+    return @max(1, name_count);
 }
 
 fn validText(value: []const u8) bool {
@@ -840,6 +970,19 @@ test "promise service rejects empty and oversized receiver budgets" {
     try std.testing.expect(validText("/tmp/promised"));
 }
 
+test "promise preflight never treats type metadata as file cardinality" {
+    try std.testing.expectEqual(@as(usize, 1), advertisedReceiverCount(0));
+    try std.testing.expectEqual(@as(usize, 4), advertisedReceiverCount(4));
+}
+
+test "promise callback ingress rejects work beyond the file budget" {
+    var ingress: OperationIngress = .{ .maximum_files = 2 };
+    try std.testing.expect(ingress.claim());
+    try std.testing.expect(ingress.claim());
+    try std.testing.expect(!ingress.claim());
+    try std.testing.expect(ingress.budget_exceeded.load(.acquire));
+}
+
 test "macOS promised receives do not share the global main operation queue" {
     var pool = objc.AutoreleasePool.init();
     defer pool.deinit();
@@ -854,8 +997,14 @@ test "macOS promised receives do not share the global main operation queue" {
 const BridgeProbe = struct {
     success_calls: usize = 0,
     failure_calls: usize = 0,
+    finished_calls: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     references: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
 };
+
+fn bridgeProbeFinished(raw: ?*anyopaque) callconv(.c) void {
+    const probe = @as(*BridgeProbe, @ptrCast(@alignCast(raw orelse return)));
+    _ = probe.finished_calls.fetchAdd(1, .acq_rel);
+}
 
 fn bridgeProbeCallback(raw: ?*anyopaque, _: objc.Id, error_object: objc.Id) callconv(.c) void {
     const probe = @as(*BridgeProbe, @ptrCast(@alignCast(raw orelse return)));
@@ -898,4 +1047,19 @@ test "macOS promise reader retains callback context through block lifetime" {
     try std.testing.expectEqual(@as(usize, 2), probe.references.load(.acquire));
     zigui_promise_release_reader(reader);
     try std.testing.expectEqual(@as(usize, 1), probe.references.load(.acquire));
+}
+
+test "macOS promise completion barrier runs after queued provider work" {
+    var probe: BridgeProbe = .{};
+    const queue = createPrivateOperationQueue() orelse return error.PlatformFailure;
+    try std.testing.expect(zigui_promise_queue_finished(
+        queue,
+        &probe,
+        bridgeProbeFinished,
+        bridgeProbeRetain,
+        bridgeProbeRelease,
+    ));
+    objc.send(void, queue, "waitUntilAllOperationsAreFinished", .{});
+    try std.testing.expectEqual(@as(usize, 1), probe.finished_calls.load(.acquire));
+    objc.release(queue);
 }

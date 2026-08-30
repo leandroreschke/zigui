@@ -21,6 +21,22 @@ const WindowCloseProbe = struct {
     }
 };
 
+const ReentrantWindowCloseProbe = struct {
+    app: ?*ui.App = null,
+    destroy_error: ?ui.Error = null,
+    recursive_close_succeeded: bool = false,
+
+    fn closeRequested(raw: *anyopaque, window: handles.WindowId) ui.Error!void {
+        const self: *ReentrantWindowCloseProbe = @ptrCast(@alignCast(raw));
+        const app = self.app orelse return error.InvalidConfiguration;
+        app.destroy() catch |err| {
+            self.destroy_error = err;
+        };
+        try app.closeWindow(window);
+        self.recursive_close_succeeded = true;
+    }
+};
+
 const FramePulseProbe = struct {
     app: ?*ui.App = null,
     native_media: ?handles.NativeMediaId = null,
@@ -680,6 +696,26 @@ test "window close callback runs before the framework destroys the window" {
     try testing.expectEqual(window, probe.window.?);
     try testing.expect(probe.observed_live_window);
     try testing.expect(probe.observed_native_window);
+    try testing.expect(!(try app.hasWindow(window)));
+}
+
+test "window close callback cannot tear down App while the caller retains it" {
+    var probe: ReentrantWindowCloseProbe = .{};
+    const app = try ui.App.create(testing.allocator, .{
+        .application_name = "reentrant close lifetime test",
+        .window_close_callback = .{ .context = &probe, .callback = ReentrantWindowCloseProbe.closeRequested },
+    });
+    defer app.destroy() catch unreachable;
+    probe.app = app;
+
+    var model: WindowCompositionProbe = .{};
+    const window = try app.openWindow(
+        .{ .platform = .{ .title = "reentrant close lifetime", .visible = false } },
+        ui.Component.Descriptor.from(WindowCompositionProbe, &model),
+    );
+    try app.closeWindow(window);
+    try testing.expectEqual(error.CallbackReentrancy, probe.destroy_error.?);
+    try testing.expect(probe.recursive_close_succeeded);
     try testing.expect(!(try app.hasWindow(window)));
 }
 
@@ -1566,6 +1602,41 @@ test "Unicode normalization, graphemes, bidi, and line breaks share generated da
     try testing.expectEqual(@as(usize, "hello world".len + 1), breaks.boundaries.len);
 }
 
+test "Unicode iterators stay linear on long regional and close-punctuation runs" {
+    const run_length = 32 * 1024;
+    const regional = "\xf0\x9f\x87\xa6";
+    var regional_text: std.ArrayList(u8) = .empty;
+    defer regional_text.deinit(testing.allocator);
+    try regional_text.ensureTotalCapacity(testing.allocator, run_length * regional.len);
+    for (0..run_length) |_| regional_text.appendSliceAssumeCapacity(regional);
+
+    var words: ui.unicode.WordIterator = .{ .bytes = regional_text.items };
+    var word_count: usize = 0;
+    while (try words.next()) |_| word_count += 1;
+    try testing.expectEqual(run_length / 2, word_count);
+
+    var line_breaks = try ui.unicode.analyzeLineBreaks(testing.allocator, regional_text.items);
+    defer line_breaks.deinit(testing.allocator);
+    try testing.expectEqual(run_length + 1, line_breaks.boundaries.len);
+
+    var sentence_text: std.ArrayList(u8) = .empty;
+    defer sentence_text.deinit(testing.allocator);
+    try sentence_text.append(testing.allocator, '.');
+    try sentence_text.appendNTimes(testing.allocator, ')', run_length);
+    try sentence_text.appendSlice(testing.allocator, " Next");
+    var sentences: ui.unicode.SentenceIterator = .{ .bytes = sentence_text.items };
+    var covered: usize = 0;
+    while (try sentences.next()) |segment| covered = segment.end;
+    try testing.expectEqual(sentence_text.items.len, covered);
+
+    const numbers = try testing.allocator.alloc(u21, run_length);
+    defer testing.allocator.free(numbers);
+    @memset(numbers, '1');
+    var resolved = try ui.unicode.resolveBidi(testing.allocator, numbers, null);
+    defer resolved.deinit(testing.allocator);
+    try testing.expectEqual(run_length, resolved.visual_to_logical.len);
+}
+
 test "QOI decoding and orientation are deterministic and bounded" {
     const qoi = [_]u8{
         'q',  'o',  'i',  'f',
@@ -1583,6 +1654,22 @@ test "QOI decoding and orientation are deterministic and bounded" {
     try testing.expectEqualSlices(u8, &.{ 0x12, 0x34, 0x56, 0x78 }, decoded.pixels);
 
     try testing.expectError(error.BudgetExceeded, ui.image.decode(testing.allocator, &qoi, .{ .maximum_compressed_bytes = 8 }));
+}
+
+test "PNG decoding accepts a complete bounded positive fixture" {
+    const png = [_]u8{
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00,
+        0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x64, 0xf8, 0x0f, 0x00,
+        0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66, 0x00, 0x00, 0x00, 0x00,
+        0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    };
+    var decoded = try ui.image.decode(testing.allocator, &png, .{});
+    defer decoded.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), decoded.width);
+    try testing.expectEqual(@as(u32, 1), decoded.height);
+    try testing.expectEqual(@as(usize, 4), decoded.pixels.len);
 }
 
 test "font and image readers reject truncated and hostile offsets" {
@@ -2808,6 +2895,40 @@ test "headless platform deterministically exposes windows displays clipboard and
     harness.bundle.windows.destroy(window);
     while (try harness.bundle.event_loop.step(sink, false)) {}
     try testing.expectEqual(@as(EventCollector.Tag, .closed), events.tags[events.len - 1]);
+}
+
+test "headless directory picker is deterministic, owned, and cancellable" {
+    var text_backend_instance = try ui.InTreeTextBackend.createInstance(
+        testing.allocator,
+        8 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64,
+        64,
+        64 * 1024,
+    );
+    const text_backend = text_backend_instance.interface();
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, text_backend);
+    const bundle = harness.bundle;
+    harness.bundle = undefined;
+    try harness.setDirectoryPickerResult("/tmp/headless-directory");
+    const app = try ui.App.createWithBundle(testing.allocator, .{
+        .application_name = "directory picker conformance",
+        .allow_multiple_apps_for_testing = true,
+    }, bundle);
+    defer app.destroy() catch unreachable;
+
+    var root: WindowCompositionProbe = .{};
+    const window = try app.openWindow(
+        .{ .platform = .{ .title = "directory picker", .visible = false } },
+        ui.Component.Descriptor.from(WindowCompositionProbe, &root),
+    );
+    while (try app.step(false)) {}
+    var selected = (try app.openDirectory(window, testing.allocator)) orelse return error.TestUnexpectedResult;
+    defer selected.deinit();
+    try testing.expectEqualStrings("/tmp/headless-directory", selected.value);
+
+    try harness.setDirectoryPickerResult(null);
+    try testing.expect((try app.openDirectory(window, testing.allocator)) == null);
 }
 
 test "headless promised-file service preserves mixed outcomes and cancellation" {
@@ -4408,6 +4529,44 @@ test "SVG path arithmetic cannot retain non-finite geometry" {
     try testing.expectError(error.InvalidSvg, ui.svg.Document.parse(testing.allocator, source, .{}));
 }
 
+test "SVG dashed strokes reject non-finite length before subdivision" {
+    const source =
+        \\<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1" viewBox="0 0 1 1">
+        \\  <path d="M 0 0 L 1e20 0" fill="none" stroke="black" stroke-dasharray="1 1"/>
+        \\</svg>
+    ;
+    var document = try ui.svg.Document.parse(testing.allocator, source, .{ .maximum_dash_subdivisions = 1_024 });
+    defer document.deinit();
+    var rendered = ui.scene.Scene.init(testing.allocator);
+    defer rendered.deinit();
+    var builder = ui.scene.Builder.init(&rendered, .{});
+    defer builder.deinit();
+    try testing.expectError(error.BudgetExceeded, document.paint(
+        &builder,
+        ui.Rect.fromXYWH(0, 0, 1, 1),
+        .none,
+    ));
+}
+
+test "SVG near-zero dash cycles consume the subdivision budget" {
+    const source =
+        \\<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1">
+        \\  <path d="M 0 0 L 1 0" fill="none" stroke="black" stroke-dasharray="0.000001 0.000001"/>
+        \\</svg>
+    ;
+    var document = try ui.svg.Document.parse(testing.allocator, source, .{ .maximum_dash_subdivisions = 32 });
+    defer document.deinit();
+    var rendered = ui.scene.Scene.init(testing.allocator);
+    defer rendered.deinit();
+    var builder = ui.scene.Builder.init(&rendered, .{});
+    defer builder.deinit();
+    try testing.expectError(error.BudgetExceeded, document.paint(
+        &builder,
+        ui.Rect.fromXYWH(0, 0, 1, 1),
+        .none,
+    ));
+}
+
 test "accessibility validation enforces its iterative depth limit" {
     const window = handles.WindowId.init(1, 1);
     const root = handles.SemanticId.init(1, 1);
@@ -4443,6 +4602,68 @@ test "render extension registry owns labels and bounds retired entries" {
     registry.collect(10);
     try testing.expectEqual(@as(usize, 1), probe.deinits);
     _ = try registry.register(probe.descriptor("second"));
+}
+
+test "render extension callbacks cannot mutate their borrowed registry" {
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    defer renderer.deinit();
+    var probe: ReentrantRenderExtensionProbe = .{ .renderer = renderer };
+    probe.id = try renderer.registerExtension(probe.descriptor());
+
+    var rendered = ui.scene.Scene.init(testing.allocator);
+    defer rendered.deinit();
+    var builder = ui.scene.Builder.init(&rendered, .{});
+    defer builder.deinit();
+    try builder.customPass(probe.id, ui.Rect.fromXYWH(0, 0, 1, 1), &.{}, 0);
+    try builder.finish();
+    var readback = (try renderer.renderOffscreen(.{
+        .width = 1,
+        .height = 1,
+        .scale_factor = try ui.ScaleFactor.init(1),
+        .format = .rgba8,
+    }, rendered.view(), testing.allocator)).?;
+    defer readback.deinit(testing.allocator);
+    try testing.expectEqual(error.CallbackReentrancy, probe.destroy_error.?);
+    try testing.expectEqual(error.CallbackReentrancy, probe.register_error.?);
+}
+
+test "render extension deinit cannot mutate its registry" {
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    var probe: ReentrantRenderExtensionProbe = .{ .renderer = renderer };
+    probe.id = try renderer.registerExtension(probe.descriptor());
+    renderer.deinit();
+    try testing.expectEqual(error.CallbackReentrancy, probe.deinit_destroy_error.?);
+    try testing.expectEqual(error.CallbackReentrancy, probe.deinit_register_error.?);
+}
+
+test "collect removes a retired extension before its deinit callback reenters" {
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    defer renderer.deinit();
+    var probe: ReentrantRenderExtensionProbe = .{ .renderer = renderer };
+    probe.id = try renderer.registerExtension(probe.descriptor());
+    try renderer.destroyExtension(probe.id, 0);
+
+    var replacement: RenderExtensionProbe = .{};
+    _ = try renderer.registerExtension(replacement.descriptor("replacement"));
+    try testing.expectEqual(error.CallbackReentrancy, probe.deinit_destroy_error.?);
+    try testing.expectEqual(error.CallbackReentrancy, probe.deinit_register_error.?);
+}
+
+test "render extension device-lost callback cannot recover recursively" {
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    defer renderer.deinit();
+    var probe: ReentrantRenderExtensionProbe = .{ .renderer = renderer };
+    _ = try renderer.registerExtension(probe.descriptor());
+    try renderer.recover(.{});
+    try testing.expectEqual(error.CallbackReentrancy, probe.device_lost_recover_error.?);
+}
+
+test "render extension deinit cannot recursively destroy App" {
+    const app = try ui.App.create(testing.allocator, .{ .allow_multiple_apps_for_testing = true });
+    var probe: ReentrantRenderExtensionProbe = .{ .app = app };
+    _ = try app.registerRenderExtension(probe.descriptor());
+    try app.destroy();
+    try testing.expectEqual(error.AppClosed, probe.deinit_app_destroy_error.?);
 }
 
 test "renderer rejects backdrop scenes when the backend does not advertise support" {
@@ -4862,6 +5083,62 @@ const RenderExtensionProbe = struct {
     fn deinit(context: *anyopaque) void {
         const self: *RenderExtensionProbe = @ptrCast(@alignCast(context));
         self.deinits += 1;
+    }
+};
+
+const ReentrantRenderExtensionProbe = struct {
+    renderer: ui.render.Renderer = undefined,
+    app: ?*ui.App = null,
+    id: handles.RenderExtensionId = .invalid,
+    destroy_error: ?ui.Error = null,
+    register_error: ?ui.Error = null,
+    deinit_destroy_error: ?ui.Error = null,
+    deinit_register_error: ?ui.Error = null,
+    deinit_app_destroy_error: ?ui.Error = null,
+    device_lost_recover_error: ?ui.Error = null,
+
+    fn descriptor(self: *ReentrantRenderExtensionProbe) ui.render_extension.Descriptor {
+        return .{ .context = self, .vtable = &vtable, .label = "reentrant extension" };
+    }
+
+    const vtable: ui.render_extension.Descriptor.VTable = .{
+        .prepare = prepare,
+        .encode = encode,
+        .device_lost = deviceLost,
+        .deinit = deinit,
+    };
+
+    fn prepare(raw: *anyopaque, _: ui.render_extension.Device, _: ui.render_extension.DeviceGeneration) ui.Error!void {
+        const self: *ReentrantRenderExtensionProbe = @ptrCast(@alignCast(raw));
+        self.renderer.destroyExtension(self.id, 0) catch |err| {
+            self.destroy_error = err;
+        };
+        _ = self.renderer.registerExtension(self.descriptor()) catch |err| {
+            self.register_error = err;
+            return;
+        };
+    }
+
+    fn encode(_: *anyopaque, _: ui.render_extension.Pass, _: []const u8, _: u32) ui.Error!void {}
+    fn deviceLost(raw: *anyopaque, _: ui.render_extension.DeviceGeneration) void {
+        const self: *ReentrantRenderExtensionProbe = @ptrCast(@alignCast(raw));
+        self.renderer.recover(.{}) catch |err| {
+            self.device_lost_recover_error = err;
+        };
+    }
+    fn deinit(raw: *anyopaque) void {
+        const self: *ReentrantRenderExtensionProbe = @ptrCast(@alignCast(raw));
+        if (self.app) |app| app.destroy() catch |err| {
+            self.deinit_app_destroy_error = err;
+        } else {
+            self.renderer.destroyExtension(self.id, 0) catch |err| {
+                self.deinit_destroy_error = err;
+            };
+            _ = self.renderer.registerExtension(self.descriptor()) catch |err| {
+                self.deinit_register_error = err;
+                return;
+            };
+        }
     }
 };
 

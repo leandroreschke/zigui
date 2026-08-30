@@ -339,12 +339,18 @@ fn isBasicType(token: u8) bool {
 }
 
 pub fn skipValue(reader: *Reader, signature_value: []const u8) Error!void {
+    return skipValueDepth(reader, signature_value, 0);
+}
+
+fn skipValueDepth(reader: *Reader, signature_value: []const u8, depth: usize) Error!void {
+    if (depth > maximum_signature_depth) return error.BudgetExceeded;
     var signature_offset: usize = 0;
-    try skipType(reader, signature_value, &signature_offset);
+    try skipType(reader, signature_value, &signature_offset, depth);
     if (signature_offset != signature_value.len) return error.PlatformFailure;
 }
 
-fn skipType(reader: *Reader, signature_value: []const u8, signature_offset: *usize) Error!void {
+fn skipType(reader: *Reader, signature_value: []const u8, signature_offset: *usize, depth: usize) Error!void {
+    if (depth > maximum_signature_depth) return error.BudgetExceeded;
     if (signature_offset.* >= signature_value.len) return error.PlatformFailure;
     const token = signature_value[signature_offset.*];
     signature_offset.* += 1;
@@ -358,7 +364,7 @@ fn skipType(reader: *Reader, signature_value: []const u8, signature_offset: *usi
         'g' => _ = try reader.signature(),
         'v' => {
             const nested = try reader.variantHeader();
-            try skipValue(reader, nested);
+            try skipValueDepth(reader, nested, depth + 1);
         },
         'a' => {
             const element_start = signature_offset.*;
@@ -375,7 +381,7 @@ fn skipType(reader: *Reader, signature_value: []const u8, signature_offset: *usi
                     signature_offset.* += 1;
                     break;
                 }
-                try skipType(reader, signature_value, signature_offset);
+                try skipType(reader, signature_value, signature_offset, depth + 1);
             }
         },
         '{' => {
@@ -386,7 +392,7 @@ fn skipType(reader: *Reader, signature_value: []const u8, signature_offset: *usi
                     signature_offset.* += 1;
                     break;
                 }
-                try skipType(reader, signature_value, signature_offset);
+                try skipType(reader, signature_value, signature_offset, depth + 1);
             }
         },
         else => return error.PlatformFailure,

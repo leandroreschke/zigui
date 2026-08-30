@@ -20,7 +20,7 @@ is stored in the source tree.
 
 Examples include AppKit window/input contracts, Metal, Win32 window/input
 contracts, D3D11, UI Automation, native IME contracts, ImageIO's bounded
-macOS WebP image provider, and the native Vulkan loader ABI opened through
+macOS WebP and AVIF image providers, and the native Vulkan loader ABI opened through
 `std.DynLib` with dynamically resolved driver dispatch. Native APIs are
 boundary contracts, not alternate engines: ZigUI still owns layout, Unicode
 processing, OpenType shaping, font fallback, glyph rasterization, the in-tree
@@ -49,7 +49,7 @@ ZigUI implements and tests its own:
 - Wayland, X11, keyboard, clipboard, drag/drop, D-Bus, and AT-SPI protocols;
 - Vulkan loading and dispatch;
 - enabled in-tree image and SVG decoders, plus the explicitly documented
-  macOS ImageIO WebP provider;
+  macOS ImageIO WebP and AVIF providers;
 - deterministic headless and testing infrastructure.
 
 Apple and Windows font directories are discovered through narrow native

@@ -22,6 +22,7 @@ pub const HICON = HANDLE;
 pub const HCURSOR = HANDLE;
 pub const HBRUSH = HANDLE;
 pub const HMENU = HANDLE;
+pub const HACCEL = HANDLE;
 pub const HDC = HANDLE;
 pub const HMONITOR = HANDLE;
 pub const HGLOBAL = HANDLE;
@@ -116,6 +117,7 @@ pub const DROPFILES = extern struct {
 };
 pub const COMPOSITIONFORM = extern struct { style: DWORD, current_pos: POINT, area: RECT };
 pub const CANDIDATEFORM = extern struct { index: DWORD, style: DWORD, current_pos: POINT, area: RECT };
+pub const ACCEL = extern struct { fVirt: BYTE, key: WORD, cmd: WORD };
 
 pub const OPENFILENAMEW = extern struct {
     struct_size: DWORD = @sizeOf(OPENFILENAMEW),
@@ -321,6 +323,11 @@ pub const MF_GRAYED: UINT = 0x00000001;
 pub const MF_CHECKED: UINT = 0x00000008;
 pub const TPM_RETURNCMD: UINT = 0x0100;
 pub const TPM_RIGHTBUTTON: UINT = 0x0002;
+pub const FVIRTKEY: BYTE = 0x01;
+pub const FNOINVERT: BYTE = 0x02;
+pub const FSHIFT: BYTE = 0x04;
+pub const FCONTROL: BYTE = 0x08;
+pub const FALT: BYTE = 0x10;
 
 pub const GCS_COMPSTR: DWORD = 0x0008;
 pub const GCS_COMPATTR: DWORD = 0x0010;
@@ -373,6 +380,7 @@ pub extern "user32" fn SetProcessDpiAwarenessContext(context: isize) callconv(.w
 pub extern "user32" fn PeekMessageW(message: *MSG, window: HWND, minimum: UINT, maximum: UINT, remove: UINT) callconv(.winapi) BOOL;
 pub extern "user32" fn GetMessageW(message: *MSG, window: HWND, minimum: UINT, maximum: UINT) callconv(.winapi) BOOL;
 pub extern "user32" fn TranslateMessage(message: *const MSG) callconv(.winapi) BOOL;
+pub extern "user32" fn TranslateAcceleratorW(window: HWND, table: HACCEL, message: *MSG) callconv(.winapi) i32;
 pub extern "user32" fn DispatchMessageW(message: *const MSG) callconv(.winapi) LRESULT;
 pub extern "user32" fn PostThreadMessageW(thread: DWORD, message: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) BOOL;
 pub extern "user32" fn PostMessageW(window: HWND, message: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) BOOL;
@@ -403,6 +411,8 @@ pub extern "user32" fn AppendMenuW(menu: HMENU, flags: UINT, identifier: usize, 
 pub extern "user32" fn SetMenu(window: HWND, menu: HMENU) callconv(.winapi) BOOL;
 pub extern "user32" fn DrawMenuBar(window: HWND) callconv(.winapi) BOOL;
 pub extern "user32" fn TrackPopupMenu(menu: HMENU, flags: UINT, x: i32, y: i32, reserved: i32, owner: HWND, rect: ?*const RECT) callconv(.winapi) UINT;
+pub extern "user32" fn CreateAcceleratorTableW(entries: [*]const ACCEL, count: i32) callconv(.winapi) HACCEL;
+pub extern "user32" fn DestroyAcceleratorTable(table: HACCEL) callconv(.winapi) BOOL;
 
 pub extern "shell32" fn DragAcceptFiles(window: HWND, accept: BOOL) callconv(.winapi) void;
 pub extern "shell32" fn DragQueryFileW(drop: HDROP, index: UINT, output: ?[*]WCHAR, count: UINT) callconv(.winapi) UINT;

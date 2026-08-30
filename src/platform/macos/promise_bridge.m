@@ -3,6 +3,7 @@
 #import <Block.h>
 
 typedef void (*zigui_promise_reader_callback)(void *context, NSURL *url, NSError *error);
+typedef void (*zigui_promise_finished_callback)(void *context);
 typedef void (*zigui_promise_context_retain)(void *context);
 typedef void (*zigui_promise_context_release)(void *context);
 
@@ -48,6 +49,27 @@ void zigui_promise_receive(NSFilePromiseReceiver *receiver, NSURL *destination, 
                                         options:@{}
                                   operationQueue:queue
                                           reader:(void (^)(NSURL *, NSError *))reader];
+}
+
+BOOL zigui_promise_queue_finished(NSOperationQueue *queue,
+                                  void *context,
+                                  zigui_promise_finished_callback callback,
+                                  zigui_promise_context_retain retain_context,
+                                  zigui_promise_context_release release_context) {
+    if (queue == nil || context == NULL || callback == NULL || retain_context == NULL || release_context == NULL) return NO;
+    retain_context(context);
+    ZigUIPromiseContextOwner *owner = [[ZigUIPromiseContextOwner alloc] init];
+    if (owner == nil) {
+        release_context(context);
+        return NO;
+    }
+    owner.context = context;
+    owner.releaseContext = release_context;
+    [queue addOperationWithBlock:^{
+        callback(owner.context);
+    }];
+    [owner release];
+    return YES;
 }
 
 // Kept private to the framework's macOS conformance target.  Calling a

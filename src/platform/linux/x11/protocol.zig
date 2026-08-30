@@ -363,19 +363,14 @@ pub fn getProperty(
     try writer.u32(long_offset);
     try writer.u32(long_length);
     const sequence = try client.send(try writer.finish(start), null);
-    var reply = try client.waitReply(sequence);
+    const requested_value_bytes = std.math.mul(usize, long_length, 4) catch return error.BudgetExceeded;
+    const maximum_reply_bytes = std.math.add(usize, 32, requested_value_bytes) catch return error.BudgetExceeded;
+    var reply = try client.waitReplyLimited(sequence, maximum_reply_bytes);
     defer reply.deinit();
     if (reply.bytes.len < 32) return error.PlatformFailure;
     const format = reply.bytes[1];
     const count = try wire.readU32(reply.bytes, 16);
-    const bytes_per_item: usize = switch (format) {
-        0 => 0,
-        8 => 1,
-        16 => 2,
-        32 => 4,
-        else => return error.PlatformFailure,
-    };
-    const byte_length = std.math.mul(usize, count, bytes_per_item) catch return error.BudgetExceeded;
+    const byte_length = try propertyReplyByteLength(format, count, long_length);
     if (32 + byte_length > reply.bytes.len) return error.PlatformFailure;
     return .{
         .allocator = allocator,
@@ -384,6 +379,20 @@ pub fn getProperty(
         .bytes_after = try wire.readU32(reply.bytes, 12),
         .value = try allocator.dupe(u8, reply.bytes[32..][0..byte_length]),
     };
+}
+
+pub fn propertyReplyByteLength(format: u8, item_count: u32, requested_longs: u32) Error!usize {
+    const bytes_per_item: usize = switch (format) {
+        0 => 0,
+        8 => 1,
+        16 => 2,
+        32 => 4,
+        else => return error.PlatformFailure,
+    };
+    const byte_length = std.math.mul(usize, item_count, bytes_per_item) catch return error.BudgetExceeded;
+    const requested_bytes = std.math.mul(usize, requested_longs, 4) catch return error.BudgetExceeded;
+    if (byte_length > requested_bytes) return error.BudgetExceeded;
+    return byte_length;
 }
 
 pub fn setSelectionOwner(client: *client_mod.Client, writer: *wire.Writer, owner: u32, selection: u32, time: u32) Error!void {

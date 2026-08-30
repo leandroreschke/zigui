@@ -62,6 +62,15 @@ Retained-node, platform-text, clipboard-ownership, menu, action-name,
 display/dialog, and native-protocol budgets are refusal boundaries and are
 included in stress and allocation-failure coverage.
 
+`zig build stress -Dplatform=headless -Drenderer=null` records the wall-clock
+CPU duration of each measured frame into fixed stack storage and reports
+nearest-rank p50/p95/p99 values. On macOS it also samples the process resident
+set every 64 frames and reports the kernel peak RSS. These are headless engine
+and process-memory gates: they do not stand in for compositor presentation,
+GPU-driver allocation, or native input-to-present evidence. The 50 ms
+input-to-present budget is accepted only from a native proof run whose
+`PresentationStats.input_to_present` contains real input-associated presents.
+
 ## Measured baseline
 
 The 2026-08-24 consolidated campaign used an Apple M3 Pro MacBook Pro with
@@ -84,3 +93,9 @@ still require workload-specific profiling on each deployment machine. A
 display-link callback count is not presentation evidence; use
 `frames_presented`, `presentation.presented_count`, the retained timestamps,
 and the platform-reported refresh rate from the same run.
+
+The 2026-08-30 audit-repair campaign added the fixed-storage frame percentile
+and resident-set sampling above. Its final values are recorded in
+[Verification](VERIFICATION.md) together with the exact command and host; they
+must be refreshed after a material renderer, layout, allocation, or stress
+workload change instead of being copied forward as a timeless claim.

@@ -9,7 +9,7 @@ const extension = @import("extension.zig");
 const path_tessellator = @import("path_tessellator.zig");
 
 const maximum_offscreen_pixels = 67_108_864;
-const maximum_layer_depth = 32;
+const maximum_layer_depth = 63;
 const maximum_clip_depth = 64;
 const maximum_layer_bytes = 512 * 1024 * 1024;
 
@@ -304,6 +304,7 @@ pub const NullRenderer = struct {
     fn recover(context: *anyopaque, policy: config.GpuPolicy) Error!void {
         _ = policy;
         const renderer = self(context);
+        if (renderer.extensions.callbacksActive()) return error.CallbackReentrancy;
         drainOffscreen(renderer);
         renderer.generation +%= 1;
         if (renderer.generation == 0) renderer.generation = 1;

@@ -52,7 +52,7 @@ retires both ownership claims in submission order.
 Product adoption, including Bookmarkitall, is an independent consumer gate and
 is not coupled into the framework repository or its dependency graph.
 
-## Consolidated campaign result
+## Historical consolidated campaign
 
 The 2026-08-24 through 2026-08-25 campaign used Zig
 `0.17.0-dev.1745+ac8a8d0c5`. The Windows and Linux validation repairs were
@@ -122,3 +122,43 @@ texture import, and full screen-reader narration on Windows; physical monitor
 migration on the available single-display Mac; and a real marked-text input
 source plus forced Metal device loss on macOS. Their bounded shared state
 transitions remain covered by deterministic conformance tests.
+
+The counts and commit above are an immutable historical record, not the test
+count of the current tree. Current verification reports commands and outcomes
+rather than copying those counts forward as new tests are added.
+
+## Current audit-repair gate
+
+The 2026-08-30 security, correctness, performance, and platform audit requires
+one final gate over the repaired tree:
+
+- `zig fmt --check build.zig src tests examples tools`
+- `zig build test -Dplatform=headless -Drenderer=null`
+- `zig build examples -Dplatform=headless -Drenderer=null`
+- `zig build stress -Dplatform=headless -Drenderer=null`
+- `zig build backend-checks`
+- `zig build shader-sdk-checks` on a native macOS or Windows SDK host
+- full macOS/Metal build and tests on macOS
+- compile-only Windows/D3D11, Wayland/Vulkan, and X11/Vulkan test graphs from
+  the macOS host; live platform QA remains a separate native-host gate
+
+`backend-checks` proves Zig source analysis for every backend but deliberately
+does not claim native shader compilation. `shader-sdk-checks` invokes the Metal
+compiler and linker on macOS, or the D3D compiler conformance root on Windows;
+it fails explicitly on hosts with neither native SDK instead of producing a
+misleading portable pass.
+
+The current stress executable measures 10,000 retained and paint-only headless
+frames, checks exact submitted/presented frame counts, refuses tracked live-heap
+growth or any post-warm-up allocation, reports fixed-storage CPU frame
+percentiles, and samples resident memory on macOS. Those CPU and RSS values are
+not relabeled as native input-to-present or GPU evidence.
+
+On the 2026-08-30 Apple M3 Pro verification host (18 GB memory, arm64 macOS
+27.0 build 26A5416b, Zig `0.17.0-dev.1745+ac8a8d0c5`), that exact stress
+command completed 10,000 frames and 2,580,000 primitives in 24,061 ms. Tracked
+live bytes remained 22,662,279 before and after measurement, peak tracked bytes
+were 22,931,163, and allocation count remained 671. Headless CPU frame
+p50/p95/p99 were 2,396/2,620/2,723 microseconds. Process RSS moved from
+28,377,088 to 7,864,320 bytes, with a 6,864,896-to-28,393,472-byte sampled
+range and no monotonic-growth violation.

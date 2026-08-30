@@ -4,6 +4,7 @@ const Error = @import("../core/error.zig").Error;
 const image = @import("image.zig");
 
 const CFData = opaque {};
+const CFDictionary = opaque {};
 const CGImageSource = opaque {};
 const CGImage = opaque {};
 const CGColorSpace = opaque {};
@@ -12,7 +13,12 @@ const CGContext = opaque {};
 extern "C" fn CFDataCreate(allocator: ?*anyopaque, bytes: [*]const u8, length: c_long) ?*CFData;
 extern "C" fn CFRelease(value: ?*const anyopaque) void;
 extern "C" fn CGImageSourceCreateWithData(data: *CFData, options: ?*const anyopaque) ?*CGImageSource;
+extern "C" fn CGImageSourceCopyPropertiesAtIndex(source: *CGImageSource, index: usize, options: ?*const anyopaque) ?*CFDictionary;
 extern "C" fn CGImageSourceCreateImageAtIndex(source: *CGImageSource, index: usize, options: ?*const anyopaque) ?*CGImage;
+extern "C" fn CFDictionaryGetValue(dictionary: *CFDictionary, key: *const anyopaque) ?*const anyopaque;
+extern "C" fn CFNumberGetValue(number: *const anyopaque, number_type: isize, value: *anyopaque) u8;
+extern "C" var kCGImagePropertyPixelWidth: *const anyopaque;
+extern "C" var kCGImagePropertyPixelHeight: *const anyopaque;
 extern "C" fn CGImageGetWidth(value: *CGImage) usize;
 extern "C" fn CGImageGetHeight(value: *CGImage) usize;
 extern "C" fn CGColorSpaceCreateDeviceRGB() ?*CGColorSpace;
@@ -33,6 +39,7 @@ const CGPoint = extern struct { x: f64, y: f64 };
 const CGSize = extern struct { width: f64, height: f64 };
 const CGRect = extern struct { origin: CGPoint, size: CGSize };
 const cg_alpha_premultiplied_last: u32 = 1;
+const cf_number_sint64_type: isize = 4;
 
 pub fn isAvif(bytes: []const u8) bool {
     if (bytes.len < 16 or !std.mem.eql(u8, bytes[4..8], "ftyp")) return false;
@@ -62,13 +69,13 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, limits: image.Lim
     defer CFRelease(data);
     const source = CGImageSourceCreateWithData(data, null) orelse return error.InvalidImage;
     defer CFRelease(source);
+    const dimensions = try preflightDimensions(source, limits);
     const source_image = CGImageSourceCreateImageAtIndex(source, 0, null) orelse return error.InvalidImage;
     defer CFRelease(source_image);
 
     const width = CGImageGetWidth(source_image);
     const height = CGImageGetHeight(source_image);
-    if (width == 0 or height == 0 or width > std.math.maxInt(u32) or height > std.math.maxInt(u32)) return error.InvalidImage;
-    _ = try image.validateDimensions(@intCast(width), @intCast(height), limits);
+    if (width != dimensions.width or height != dimensions.height) return error.InvalidImage;
     const stride = std.math.mul(usize, width, 4) catch return error.BudgetExceeded;
     const byte_count = std.math.mul(usize, stride, height) catch return error.BudgetExceeded;
     const pixels = try allocator.alloc(u8, byte_count);
@@ -83,6 +90,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, limits: image.Lim
         .origin = .{ .x = 0, .y = 0 },
         .size = .{ .width = @floatFromInt(width), .height = @floatFromInt(height) },
     }, source_image);
+    image.unpremultiplyRgba8(pixels, width, height, stride);
     return .{
         .width = @intCast(width),
         .height = @intCast(height),
@@ -90,6 +98,24 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, limits: image.Lim
         .pixels = pixels,
         .color_space = .srgb,
     };
+}
+
+fn preflightDimensions(source: *CGImageSource, limits: image.Limits) Error!struct { width: usize, height: usize } {
+    const properties = CGImageSourceCopyPropertiesAtIndex(source, 0, null) orelse return error.InvalidImage;
+    defer CFRelease(properties);
+    const width = try propertyDimension(properties, kCGImagePropertyPixelWidth);
+    const height = try propertyDimension(properties, kCGImagePropertyPixelHeight);
+    if (width > std.math.maxInt(u32) or height > std.math.maxInt(u32)) return error.BudgetExceeded;
+    _ = try image.validateDimensions(@intCast(width), @intCast(height), limits);
+    return .{ .width = width, .height = height };
+}
+
+fn propertyDimension(properties: *CFDictionary, key: *const anyopaque) Error!usize {
+    const number = CFDictionaryGetValue(properties, key) orelse return error.InvalidImage;
+    var value: i64 = 0;
+    if (CFNumberGetValue(number, cf_number_sint64_type, &value) == 0 or value <= 0)
+        return error.InvalidImage;
+    return std.math.cast(usize, value) orelse error.BudgetExceeded;
 }
 
 test "AVIF classifier requires an avif or avis ftyp brand" {

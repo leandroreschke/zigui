@@ -35,6 +35,7 @@ pub const Manager = struct {
     resources: *resource.Manager,
     entries: std.AutoHashMap(ImageKey, Entry),
     animations: AnimationPool,
+    animation_by_texture: std.AutoHashMap(u64, handles.AnimationId),
     limits: image.Limits,
     frame: u64 = 0,
     maximum_images: usize,
@@ -63,6 +64,7 @@ pub const Manager = struct {
             .resources = resources,
             .entries = std.AutoHashMap(ImageKey, Entry).init(allocator),
             .animations = AnimationPool.init(allocator),
+            .animation_by_texture = std.AutoHashMap(u64, handles.AnimationId).init(allocator),
             .limits = limits,
             .maximum_images = maximum_images,
             .maximum_animations = maximum_animations,
@@ -76,6 +78,7 @@ pub const Manager = struct {
             entry.value.player.deinit();
         }
         self.animations.deinit();
+        self.animation_by_texture.deinit();
         var iterator = self.entries.iterator();
         while (iterator.next()) |entry| self.resources.destroyTextureOnRenderer(self.renderer, entry.value_ptr.texture) catch {};
         self.entries.deinit();
@@ -85,7 +88,8 @@ pub const Manager = struct {
     pub fn loadAnimation(self: *Manager, bytes: []const u8, now_ns: u64) Error!handles.AnimationId {
         if (self.animations.live_count >= self.maximum_animations) return error.BudgetExceeded;
         var player = try animation.Player.init(self.allocator, bytes, self.limits, now_ns);
-        errdefer player.deinit();
+        var player_owned = true;
+        errdefer if (player_owned) player.deinit();
         const frame = player.frame() orelse return error.InvalidImage;
         const texture = try self.resources.createTexture(.{
             .width = frame.width,
@@ -95,7 +99,14 @@ pub const Manager = struct {
         }, frame.pixels, true);
         errdefer self.resources.destroyTextureOnRenderer(self.renderer, texture) catch {};
         try self.resources.realize(self.renderer, texture);
-        return self.animations.insert(.{ .player = player, .texture = texture });
+        const id = try self.animations.insert(.{ .player = player, .texture = texture });
+        player_owned = false;
+        errdefer {
+            var removed = self.animations.remove(id).?;
+            removed.player.deinit();
+        }
+        try self.animation_by_texture.put(texture.encode(), id);
+        return id;
     }
 
     pub fn retainAnimation(self: *Manager, id: handles.AnimationId) Error!void {
@@ -112,6 +123,7 @@ pub const Manager = struct {
         }
         const entry_value = self.animations.get(id) orelse return error.InvalidHandle;
         try self.resources.destroyTextureOnRenderer(self.renderer, entry_value.texture);
+        _ = self.animation_by_texture.remove(entry_value.texture.encode());
         var removed = self.animations.remove(id) orelse return error.InvalidHandle;
         removed.player.deinit();
     }
@@ -155,19 +167,14 @@ pub const Manager = struct {
     }
 
     pub fn advanceTexture(self: *Manager, texture: handles.TextureId, now_ns: u64) Error!bool {
-        var iterator = self.animations.iterator();
-        while (iterator.next()) |entry| if (entry.value.texture.eql(texture)) {
-            if (!try entry.value.player.advance(now_ns)) return false;
-            try self.uploadAnimation(entry.value);
-            return true;
-        };
-        return false;
+        const animation_id = self.animation_by_texture.get(texture.encode()) orelse return false;
+        return self.advanceAnimation(animation_id, now_ns);
     }
 
     pub fn isPlayingTexture(self: *Manager, texture: handles.TextureId) bool {
-        var iterator = self.animations.iterator();
-        while (iterator.next()) |entry| if (entry.value.texture.eql(texture)) return entry.value.player.isPlaying();
-        return false;
+        const animation_id = self.animation_by_texture.get(texture.encode()) orelse return false;
+        const entry = self.animations.get(animation_id) orelse return false;
+        return entry.player.isPlaying();
     }
 
     fn uploadAnimation(self: *Manager, entry: *AnimatedEntry) Error!void {

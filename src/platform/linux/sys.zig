@@ -149,6 +149,23 @@ pub fn writeAll(descriptor: fd_t, bytes: []const u8) Error!void {
     }
 }
 
+pub fn writeAllUntil(descriptor: fd_t, bytes: []const u8, deadline_ns: u64) Error!void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const result = linux.write(descriptor, bytes[offset..].ptr, bytes.len - offset);
+        switch (linux.errno(result)) {
+            .SUCCESS => {
+                const written: usize = result;
+                if (written == 0) return error.PlatformFailure;
+                offset += written;
+            },
+            .INTR => continue,
+            .AGAIN => try waitWritableUntil(descriptor, deadline_ns),
+            else => return error.PlatformFailure,
+        }
+    }
+}
+
 /// Sends a byte stream carrying one SCM_RIGHTS descriptor. The descriptor is
 /// attached only to the first byte; any short remainder is completed as an
 /// ordinary stream write so it cannot be duplicated at the receiver.
@@ -298,6 +315,20 @@ pub fn poll(descriptors: []linux.pollfd, timeout_ms: i32) Error!usize {
 pub fn waitWritable(descriptor: fd_t) Error!void {
     var descriptors = [_]linux.pollfd{.{ .fd = descriptor, .events = linux.POLL.OUT, .revents = 0 }};
     _ = try poll(&descriptors, -1);
+    if (descriptors[0].revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0)
+        return error.PlatformFailure;
+}
+
+fn waitWritableUntil(descriptor: fd_t, deadline_ns: u64) Error!void {
+    const now = monotonicNanoseconds();
+    if (now >= deadline_ns) return error.PlatformFailure;
+    const remaining_ns = deadline_ns - now;
+    const timeout_ms: i32 = @intCast(@min(
+        (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms,
+        std.math.maxInt(i32),
+    ));
+    var descriptors = [_]linux.pollfd{.{ .fd = descriptor, .events = linux.POLL.OUT, .revents = 0 }};
+    if (try poll(&descriptors, timeout_ms) == 0) return error.PlatformFailure;
     if (descriptors[0].revents & (linux.POLL.ERR | linux.POLL.HUP | linux.POLL.NVAL) != 0)
         return error.PlatformFailure;
 }

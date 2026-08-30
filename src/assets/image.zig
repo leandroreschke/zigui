@@ -37,6 +37,31 @@ pub const Image = struct {
     }
 };
 
+/// Quartz bitmap contexts expose premultiplied RGBA. ZigUI texture sampling
+/// accepts straight RGBA and applies alpha exactly once in the shader.
+pub fn unpremultiplyRgba8(pixels: []u8, width: usize, height: usize, stride: usize) void {
+    if (stride == 0) return;
+    if (width > stride / 4 or height > pixels.len / stride) return;
+    for (0..height) |y| for (0..width) |x| {
+        const offset = y * stride + x * 4;
+        const alpha: u16 = pixels[offset + 3];
+        if (alpha == 0) {
+            @memset(pixels[offset..][0..3], 0);
+        } else if (alpha != 255) {
+            inline for (0..3) |channel| {
+                const premultiplied: u16 = pixels[offset + channel];
+                pixels[offset + channel] = @intCast(@min(@as(u16, 255), (premultiplied * 255 + alpha / 2) / alpha));
+            }
+        }
+    };
+}
+
+test "premultiplied native pixels are normalized to straight RGBA" {
+    var pixels = [_]u8{ 64, 32, 16, 128, 9, 8, 7, 0, 12, 34, 56, 255 };
+    unpremultiplyRgba8(&pixels, 3, 1, pixels.len);
+    try std.testing.expectEqualSlices(u8, &.{ 128, 64, 32, 128, 0, 0, 0, 0, 12, 34, 56, 255 }, &pixels);
+}
+
 /// Normalizes encoded orientation into top-left row-major pixels. Rendering
 /// and hit testing therefore never need format-specific orientation branches.
 pub fn applyOrientation(

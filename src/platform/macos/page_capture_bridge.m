@@ -73,13 +73,18 @@ static const char *zigui_page_capture_error_string(NSError *error) {
 }
 
 - (void)setOperation:(ZigUIPageCaptureOperation *)operation {
-    if (_operation == operation) return;
-    [_operation release];
-    _operation = [operation retain];
+    @synchronized(self) {
+        if (_operation == operation) return;
+        [_operation release];
+        _operation = [operation retain];
+    }
 }
 
 - (void)metadata:(LPLinkMetadata *)metadata error:(NSError *)error {
-    ZigUIPageCaptureOperation *operation = [_operation retain];
+    ZigUIPageCaptureOperation *operation = nil;
+    @synchronized(self) {
+        operation = [_operation retain];
+    }
     if (operation != nil) {
         [operation receiveMetadata:metadata error:error];
         [operation release];
@@ -87,7 +92,10 @@ static const char *zigui_page_capture_error_string(NSError *error) {
 }
 
 - (void)dealloc {
-    [_operation release];
+    @synchronized(self) {
+        [_operation release];
+        _operation = nil;
+    }
     [super dealloc];
 }
 
@@ -138,20 +146,23 @@ static const char *zigui_page_capture_error_string(NSError *error) {
 
 - (void)startProvider {
     @autoreleasepool {
-        if (_cancelled) return;
         LPMetadataProvider *provider = [[LPMetadataProvider alloc] init];
         if (provider == nil) {
             [self receiveMetadata:nil error:nil];
             return;
         }
-        _provider = provider;
-        [_provider setShouldFetchSubresources:YES];
-        [_provider setTimeout:_timeout];
-        ZigUIPageCaptureCallbackOwner *owner = [_owner retain];
+        [provider setShouldFetchSubresources:YES];
+        [provider setTimeout:_timeout];
+        ZigUIPageCaptureCallbackOwner *owner = nil;
+        @synchronized(self) {
+            if (!_cancelled && !_completed && _provider == nil) {
+                _provider = provider;
+                owner = [_owner retain];
+            }
+        }
         if (owner == nil) {
-            [_provider release];
-            _provider = nil;
-            [self receiveMetadata:nil error:nil];
+            [provider cancel];
+            [provider release];
             return;
         }
         NSURL *url = [NSURL URLWithString:_urlString];
@@ -163,7 +174,7 @@ static const char *zigui_page_capture_error_string(NSError *error) {
         void (^completion)(LPLinkMetadata *, NSError *) = ^(LPLinkMetadata *metadata, NSError *error) {
             [owner metadata:metadata error:error];
         };
-        [_provider startFetchingMetadataForURL:url completionHandler:completion];
+        [provider startFetchingMetadataForURL:url completionHandler:completion];
         [owner release];
     }
 }
@@ -208,7 +219,9 @@ static const char *zigui_page_capture_error_string(NSError *error) {
 
 - (void)renderMetadata:(LPLinkMetadata *)metadata {
     @autoreleasepool {
-        if (_cancelled) return;
+        @synchronized(self) {
+            if (_cancelled) return;
+        }
         LPLinkView *view = [[LPLinkView alloc] initWithMetadata:metadata];
         if (view == nil) {
             _callback(_callbackContext, NULL, 0, 0, 0, "LinkPresentation could not render the link metadata.");
@@ -243,12 +256,16 @@ static const char *zigui_page_capture_error_string(NSError *error) {
 }
 
 - (void)detachProvider {
-    ZigUIPageCaptureCallbackOwner *owner = _owner;
-    _owner = nil;
+    ZigUIPageCaptureCallbackOwner *owner = nil;
+    LPMetadataProvider *provider = nil;
+    @synchronized(self) {
+        owner = _owner;
+        _owner = nil;
+        provider = _provider;
+        _provider = nil;
+    }
     [owner setOperation:nil];
     [owner release];
-    LPMetadataProvider *provider = _provider;
-    _provider = nil;
     [provider cancel];
     [provider release];
 }
@@ -257,7 +274,10 @@ static const char *zigui_page_capture_error_string(NSError *error) {
     @synchronized(self) {
         _cancelled = YES;
     }
-    LPMetadataProvider *provider = [_provider retain];
+    LPMetadataProvider *provider = nil;
+    @synchronized(self) {
+        provider = [_provider retain];
+    }
     [provider cancel];
     [provider release];
     [_privateQueue cancelAllOperations];
