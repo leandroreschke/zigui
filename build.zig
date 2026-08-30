@@ -36,6 +36,16 @@ pub fn build(b: *std.Build) void {
         "metal-toolchain",
         "Path to an installed Metal.xctoolchain when xcrun cannot select it",
     );
+    const dependency_macos_sdk_path = b.option(
+        []const u8,
+        "macos_sdk_path",
+        "Path to the macOS SDK supplied through a package dependency",
+    );
+    const macos_sdk_path = dependency_macos_sdk_path orelse b.option(
+        []const u8,
+        "macos-sdk-path",
+        "Path to the macOS SDK used by external consumers",
+    ) orelse "";
 
     const platform = resolvePlatform(requested_platform, target.result.os.tag);
     const renderer = resolveRenderer(requested_renderer, platform);
@@ -77,6 +87,7 @@ pub fn build(b: *std.Build) void {
         }},
     });
     linkPlatform(b, zigui, platform, enable_media, enable_images);
+    if (platform == .macos and macos_sdk_path.len != 0) addMacOsSdkPaths(b, zigui, macos_sdk_path);
     if (platform == .macos and renderer == .metal) addMetalLibrary(b, zigui, metal_toolchain);
     if (renderer == .d3d11) zigui.addAnonymousImport("zigui_hlsl_source", .{
         .root_source_file = b.path("shaders/d3d11/zigui.hlsl"),
@@ -266,6 +277,12 @@ pub fn build(b: *std.Build) void {
     });
     const stress_step = b.step("stress", "Run 10,000 deterministic retained and paint-only frames");
     stress_step.dependOn(&b.addRunArtifact(stress_check).step);
+}
+
+fn addMacOsSdkPaths(b: *std.Build, module: *std.Build.Module, sdk_path: []const u8) void {
+    module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr", "include" }) });
+    module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "usr", "lib" }) });
+    module.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "System", "Library", "Frameworks" }) });
 }
 
 fn addMetalLibrary(b: *std.Build, module: *std.Build.Module, toolchain: ?[]const u8) void {
