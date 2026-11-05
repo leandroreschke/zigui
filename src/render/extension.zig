@@ -11,19 +11,43 @@ pub const DepthFormat = enum(u32) {
 };
 
 /// Framework-owned depth storage requested by an extension. The attachment is
-/// cleared before each extension encode and is borrowed only for that encode.
+/// cleared by default and is borrowed only for that encode. Set load_flag to
+/// preserve depth from an earlier pass on the same target in this frame.
 pub const DepthRequest = struct {
     format: DepthFormat = .depth32_float,
     clear_depth: f32 = 1,
+    /// When set, a pass whose flags contain this bit loads the depth target
+    /// left by the previous pass for this frame. This lets a single extension
+    /// submit an opaque pass followed by a water pass without clearing away
+    /// the scene depth between them.
+    load_flag: ?u32 = null,
+};
+
+pub const SnapshotRequest = struct {
+    color: bool = true,
+    depth: bool = false,
+    /// Restrict capture to passes carrying this flag. This is useful when an
+    /// extension uses one descriptor for an opaque prepass followed by a
+    /// sampling pass: the first pass must not receive an uninitialized
+    /// snapshot of its own attachments.
+    when_flag: ?u32 = null,
 };
 
 pub const Requirements = struct {
     depth: ?DepthRequest = null,
+    snapshot: ?SnapshotRequest = null,
 };
 
 pub const DepthAttachment = struct {
     texture: usize,
     format: DepthFormat,
+};
+
+/// Immutable copies of the target before this pass. Borrowed during encode;
+/// depth requires an earlier depth-writing pass on the same target this frame.
+pub const SnapshotAttachments = struct {
+    color: ?usize = null,
+    depth: ?usize = null,
 };
 
 pub const Backend = enum { null, metal, d3d11, vulkan };
@@ -75,6 +99,7 @@ pub const Pass = union(Backend) {
         render_encoder: usize,
         target_texture: usize,
         depth: ?DepthAttachment = null,
+        snapshot: ?SnapshotAttachments = null,
         geometry: Geometry,
     },
     d3d11: struct {
@@ -202,6 +227,15 @@ pub const Registry = struct {
         submission: SubmissionEpoch,
     ) Error!void {
         const entry = self.entries.get(id) orelse return error.InvalidHandle;
+        // Attachment requirements are currently implemented by the Metal
+        // host only. Reject them at the shared boundary on other backends so
+        // an extension cannot accidentally render as if its depth/snapshot
+        // inputs existed when they were silently omitted.
+        switch (pass) {
+            .metal => {},
+            else => if (entry.descriptor.requirements.depth != null or entry.descriptor.requirements.snapshot != null)
+                return error.Unsupported,
+        }
         if (entry.prepared_generation != generation) {
             self.callback_depth += 1;
             defer self.callback_depth -= 1;
@@ -260,6 +294,12 @@ pub fn validateRequirements(requirements: Requirements) Error!void {
     if (requirements.depth) |depth| {
         if (!std.math.isFinite(depth.clear_depth) or depth.clear_depth < 0 or depth.clear_depth > 1)
             return error.InvalidConfiguration;
+        if (depth.load_flag) |flag| if (flag == 0) return error.InvalidConfiguration;
+    }
+    if (requirements.snapshot) |snapshot| {
+        if (!snapshot.color and !snapshot.depth) return error.InvalidConfiguration;
+        if (snapshot.depth and requirements.depth == null) return error.InvalidConfiguration;
+        if (snapshot.when_flag) |flag| if (flag == 0) return error.InvalidConfiguration;
     }
 }
 

@@ -224,9 +224,24 @@ pub const Record = struct {
     semantics: OwnedSemantics,
     children: std.ArrayList(handles.NodeId) = .empty,
     layout: layout.LayoutResult = .{},
+    /// Measurement must not overwrite the final baseline in cached layout.
+    measured_baseline: ?f32 = null,
     dirty: layout.Dirty = .{},
     semantic_id: handles.SemanticId = .invalid,
     paint_generation: u64 = 1,
+    /// Changes to this node's kind or layout-affecting inputs. The value is
+    /// advanced as part of a successful reconciliation transaction and is
+    /// restored if that transaction rolls back.
+    revision: u64 = 1,
+    /// Changes to this node or any retained descendant. This lets layout and
+    /// scene caches reject a parent subtree without walking the whole tree.
+    subtree_revision: u64 = 1,
+    /// True only when this node and every descendant can be evaluated from
+    /// retained inputs. Custom callbacks and portals are deliberately
+    /// excluded because they can observe external state or containing bounds.
+    retention_safe: bool = true,
+    measure_cache: MeasureCache = .{},
+    arrange_cache: ArrangeCache = .{},
     owned_bytes: usize = 0,
     children_bytes: usize = 0,
 
@@ -239,6 +254,77 @@ pub const Record = struct {
     }
 };
 
+pub const MeasureCacheEntry = struct {
+    valid: bool = false,
+    revision: u64 = 0,
+    store_generation: u64 = 0,
+    constraints: layout.Constraints = .{},
+    scale_factor: f32 = 0,
+    size: geometry.Size = .{},
+    baseline: ?f32 = null,
+};
+
+pub const MeasureCache = struct {
+    const capacity = 4;
+
+    slots: [capacity]MeasureCacheEntry = @splat(.{}),
+    epoch_valid: bool = false,
+    revision: u64 = 0,
+    store_generation: u64 = 0,
+    scale_factor: f32 = 0,
+    next_slot: u2 = 0,
+
+    /// Starts a new cache epoch when any retained input changes. Clearing the
+    /// fixed slots here keeps stale constraints from surviving a revision,
+    /// generation, or scale transition while avoiding per-frame allocation.
+    pub fn prepare(self: *MeasureCache, revision: u64, store_generation: u64, scale_factor: f32) void {
+        if (self.epoch_valid and self.revision == revision and
+            self.store_generation == store_generation and self.scale_factor == scale_factor) return;
+        self.slots = @splat(.{});
+        self.epoch_valid = true;
+        self.revision = revision;
+        self.store_generation = store_generation;
+        self.scale_factor = scale_factor;
+        self.next_slot = 0;
+    }
+
+    pub fn find(
+        self: *const MeasureCache,
+        constraints: layout.Constraints,
+        revision: u64,
+        store_generation: u64,
+        scale_factor: f32,
+    ) ?MeasureCacheEntry {
+        for (self.slots) |entry| {
+            if (entry.valid and entry.revision == revision and
+                entry.store_generation == store_generation and entry.scale_factor == scale_factor and
+                std.meta.eql(entry.constraints, constraints)) return entry;
+        }
+        return null;
+    }
+
+    pub fn insert(self: *MeasureCache, entry: MeasureCacheEntry) void {
+        var slot = self.next_slot;
+        for (self.slots, 0..) |candidate, index| {
+            if (!candidate.valid) {
+                slot = @intCast(index);
+                break;
+            }
+        }
+        self.slots[slot] = entry;
+        self.next_slot = @intCast((@as(usize, slot) + 1) % capacity);
+    }
+};
+
+pub const ArrangeCache = struct {
+    valid: bool = false,
+    revision: u64 = 0,
+    store_generation: u64 = 0,
+    bounds: geometry.Rect = .{},
+    measured_baseline: ?f32 = null,
+    scale_factor: f32 = 0,
+};
+
 pub const Store = struct {
     const Pool = handles.SlotPool(Record, handles.NodeId);
 
@@ -246,6 +332,7 @@ pub const Store = struct {
         maximum_nodes: usize = 1_000_000,
         maximum_depth: usize = core_config.maximum_retained_tree_depth,
         maximum_bytes: usize = 256 * 1024 * 1024,
+        retain_frame_work: bool = false,
     };
 
     const FieldUndo = struct {
@@ -274,28 +361,48 @@ pub const Store = struct {
         new_bytes: usize,
     };
 
+    const RevisionUndo = struct {
+        id: handles.NodeId,
+        revision: u64,
+        subtree_revision: u64,
+        retention_safe: bool,
+    };
+
     const Undo = union(enum) {
         created: handles.NodeId,
         retired: handles.NodeId,
         fields: *FieldUndo,
         children: *ChildrenUndo,
+        revision: RevisionUndo,
     };
 
     const ReconcileTransaction = struct {
         scratch: std.mem.Allocator,
         undo: std.ArrayList(Undo) = .empty,
+        revision_ids: std.AutoHashMap(u64, void),
 
         fn init(scratch: std.mem.Allocator) ReconcileTransaction {
-            return .{ .scratch = scratch };
+            return .{ .scratch = scratch, .revision_ids = std.AutoHashMap(u64, void).init(scratch) };
         }
 
         fn deinit(self: *ReconcileTransaction) void {
             self.undo.deinit(self.scratch);
+            self.revision_ids.deinit();
             self.* = undefined;
         }
 
         fn record(self: *ReconcileTransaction, undo: Undo) std.mem.Allocator.Error!void {
             try self.undo.append(self.scratch, undo);
+        }
+
+        fn recordRevision(self: *ReconcileTransaction, revision: RevisionUndo) std.mem.Allocator.Error!bool {
+            const result = try self.revision_ids.getOrPut(revision.id.encode());
+            if (result.found_existing) return false;
+            self.undo.append(self.scratch, .{ .revision = revision }) catch |err| {
+                _ = self.revision_ids.remove(revision.id.encode());
+                return err;
+            };
+            return true;
         }
 
         fn recordFields(self: *ReconcileTransaction, fields: FieldUndo) std.mem.Allocator.Error!void {
@@ -336,9 +443,17 @@ pub const Store = struct {
                         }
                         self.scratch.destroy(children);
                     },
+                    .revision => |revision| {
+                        if (store.get(revision.id)) |node_record| {
+                            node_record.revision = revision.revision;
+                            node_record.subtree_revision = revision.subtree_revision;
+                            node_record.retention_safe = revision.retention_safe;
+                        }
+                    },
                 }
             }
             self.undo.clearRetainingCapacity();
+            self.revision_ids.clearRetainingCapacity();
         }
 
         fn commit(self: *ReconcileTransaction, store: *Store) void {
@@ -357,8 +472,10 @@ pub const Store = struct {
                     for (children.stale) |id| store.destroyTree(id);
                     self.scratch.destroy(children);
                 },
+                .revision => {},
             };
             self.undo.clearRetainingCapacity();
+            self.revision_ids.clearRetainingCapacity();
         }
     };
 
@@ -366,13 +483,26 @@ pub const Store = struct {
     pool: Pool,
     limits: Limits,
     retained_bytes: usize = 0,
+    /// Enables revision propagation for retained layout/scene work. It is
+    /// disabled by default so low-level NodeStore users keep the old cost
+    /// profile until they opt in.
+    retain_frame_work: bool = false,
+    /// Explicit invalidation generation for callers that mutate records
+    /// through the low-level NodeStore API. Retained layout/scene work uses
+    /// this alongside each record's subtree revision.
+    retained_work_generation: u64 = 1,
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return initWithLimits(allocator, .{});
     }
 
     pub fn initWithLimits(allocator: std.mem.Allocator, limits: Limits) Store {
-        return .{ .allocator = allocator, .pool = Pool.init(allocator), .limits = limits };
+        return .{
+            .allocator = allocator,
+            .pool = Pool.init(allocator),
+            .limits = limits,
+            .retain_frame_work = limits.retain_frame_work,
+        };
     }
 
     pub fn deinit(self: *Store) void {
@@ -392,6 +522,61 @@ pub const Store = struct {
 
     pub fn retainedBytes(self: *const Store) usize {
         return self.retained_bytes;
+    }
+
+    pub fn retainedWorkGeneration(self: *const Store) u64 {
+        return self.retained_work_generation;
+    }
+
+    pub fn retainedWorkTracking(self: *const Store) bool {
+        return self.retain_frame_work;
+    }
+
+    /// Enables or disables revision bookkeeping. The layout Engine calls this
+    /// once when it is configured, so baseline low-level callers do not pay
+    /// for ancestor revision propagation when retained work is disabled.
+    pub fn setRetainedWorkTracking(self: *Store, enabled: bool) void {
+        if (self.retain_frame_work == enabled) return;
+        self.retain_frame_work = enabled;
+        if (enabled) self.invalidateRetainedWork();
+    }
+
+    /// Invalidates cached layout/scene work after a caller has changed a
+    /// Record through a mutable NodeStore reference. Reconciliation already
+    /// advances record revisions automatically; this method covers the
+    /// intentionally low-level mutable escape hatch.
+    pub fn invalidateRetainedWork(self: *Store) void {
+        self.retained_work_generation +%= 1;
+        if (self.retained_work_generation == 0) self.retained_work_generation = 1;
+        self.refreshRetentionSafety();
+    }
+
+    fn refreshRetentionSafety(self: *Store) void {
+        // Rebuild the local eligibility bit first so a direct mutation can
+        // both add and remove custom/portal descendants. Then propagate every
+        // unsafe node to its current ancestors. This path is explicit and
+        // infrequent; normal reconciliation updates only affected ancestry.
+        var iterator = self.pool.iterator();
+        while (iterator.next()) |entry| entry.value.retention_safe = ownRetentionSafe(entry.value);
+
+        iterator = self.pool.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value.retention_safe) continue;
+            var parent = entry.value.parent;
+            var depth: usize = 0;
+            while (parent.isValid() and depth < self.limits.maximum_depth) : (depth += 1) {
+                const parent_record = self.getConst(parent) orelse break;
+                if (!parent_record.retention_safe) {
+                    parent = parent_record.parent;
+                    continue;
+                }
+                // The mutable pool entry is retrieved only after the const
+                // lookup above, keeping the propagation independent of the
+                // caller's current Record pointer.
+                self.get(parent).?.retention_safe = false;
+                parent = parent_record.parent;
+            }
+        }
     }
 
     pub const InspectView = struct {
@@ -488,6 +673,66 @@ pub const Store = struct {
             .key = seed,
             .kind = .container,
         }, seed);
+    }
+
+    fn markChanged(self: *Store, id: handles.NodeId, transaction: *ReconcileTransaction) Error!void {
+        if (!self.retain_frame_work) return;
+        var cursor = id;
+        var own = true;
+        var eligibility_changed = false;
+        var depth: usize = 0;
+        while (cursor.isValid()) : (depth += 1) {
+            if (depth >= self.limits.maximum_depth) return error.BudgetExceeded;
+            const record = self.get(cursor) orelse return error.InvalidHandle;
+            const first_snapshot = try transaction.recordRevision(.{
+                .id = cursor,
+                .revision = record.revision,
+                .subtree_revision = record.subtree_revision,
+                .retention_safe = record.retention_safe,
+            });
+            const direct_change = own;
+            if (own) {
+                record.revision = nextRevision(record.revision);
+                own = false;
+            }
+            if (first_snapshot) record.subtree_revision = nextRevision(record.subtree_revision);
+
+            // A direct change can alter this node's eligibility even when it
+            // was already recorded as an ancestor of an earlier change. An
+            // ancestor only needs another eligibility scan when a descendant
+            // actually changed eligibility; subtree revisions are already
+            // advanced once per transaction for recorded nodes.
+            if (direct_change or eligibility_changed) {
+                const previous_safe = record.retention_safe;
+                record.retention_safe = computeRetentionSafe(self, record);
+                eligibility_changed = previous_safe != record.retention_safe;
+            } else if (!first_snapshot) {
+                break;
+            }
+            cursor = record.parent;
+        }
+    }
+
+    fn markChangedCommitted(self: *Store, id: handles.NodeId) void {
+        if (!self.retain_frame_work) return;
+        var cursor = id;
+        var own = true;
+        var eligibility_changed = false;
+        var depth: usize = 0;
+        while (cursor.isValid() and depth < self.limits.maximum_depth) : (depth += 1) {
+            const record = self.get(cursor) orelse return;
+            if (own) {
+                record.revision = nextRevision(record.revision);
+                own = false;
+            }
+            record.subtree_revision = nextRevision(record.subtree_revision);
+            if (eligibility_changed or depth == 0) {
+                const previous_safe = record.retention_safe;
+                record.retention_safe = computeRetentionSafe(self, record);
+                eligibility_changed = previous_safe != record.retention_safe;
+            }
+            cursor = record.parent;
+        }
     }
 
     pub fn reconcile(
@@ -602,6 +847,12 @@ pub const Store = struct {
         refreshed.children = replacement;
         refreshed.children_bytes = replacement_bytes;
         self.retained_bytes += replacement_bytes;
+        self.markChanged(id, transaction) catch |err| {
+            // The transaction owns the old child slice and all revision
+            // snapshots. Let the caller's rollback restore both if the
+            // scratch allocator cannot record the change.
+            return err;
+        };
         return id;
     }
 
@@ -617,6 +868,7 @@ pub const Store = struct {
             record.children = .{ .items = storage, .capacity = storage.len };
             record.children_bytes = replacement_bytes;
             self.retained_bytes += replacement_bytes;
+            self.markChangedCommitted(parent);
             return;
         }
         for (record.children.items) |old| {
@@ -624,6 +876,7 @@ pub const Store = struct {
         }
         record.children.clearRetainingCapacity();
         record.children.appendAssumeCapacity(child);
+        self.markChangedCommitted(parent);
     }
 
     /// Reserves retained child storage before reconciliation begins so the
@@ -683,6 +936,7 @@ pub const Store = struct {
             .handlers = handlers,
             .action_handlers = action_handlers,
             .semantics = semantics,
+            .retention_safe = specRetentionSafe(spec),
             .owned_bytes = record_bytes,
         });
         self.retained_bytes += record_bytes;
@@ -710,6 +964,7 @@ pub const Store = struct {
         transaction: *ReconcileTransaction,
     ) Error!void {
         const record = self.get(id) orelse return error.InvalidHandle;
+        const old_parent = record.parent;
         const kind_changed = !kindEqual(record.kind, spec.kind);
         const current_style = record.style.borrowed();
         const layout_changed = !layoutEqual(current_style.layout, spec.style.layout);
@@ -720,6 +975,8 @@ pub const Store = struct {
         const semantics_changed = !semanticsEqual(record.semantics, spec.semantics);
         const handlers_changed = !sliceMetaEqual(input.Handler, record.handlers, spec.handlers);
         const action_handlers_changed = !sliceMetaEqual(action.Handler, record.action_handlers, spec.action_handlers);
+        const parent_changed = !record.parent.eql(parent);
+        const component_changed = !record.component.eql(component);
         if (style_changed) try validateStyle(spec.style);
 
         var old_allocation_bytes: usize = 0;
@@ -775,7 +1032,7 @@ pub const Store = struct {
         if (action_handlers_changed) next_action_handlers = try self.allocator.dupe(action.Handler, spec.action_handlers);
 
         if (!kind_changed and !style_changed and !semantics_changed and !handlers_changed and
-            !action_handlers_changed and record.parent.eql(parent) and record.component.eql(component)) return;
+            !action_handlers_changed and !parent_changed and !component_changed) return;
 
         try transaction.recordFields(.{
             .id = id,
@@ -825,9 +1082,11 @@ pub const Store = struct {
         record.component = component;
         record.owned_bytes = new_record_bytes;
         self.retained_bytes += new_allocation_bytes;
-        if (kind_changed or style_changed) {
+        if (kind_changed or style_changed or parent_changed or component_changed) {
             record.paint_generation +%= 1;
             if (record.paint_generation == 0) record.paint_generation = 1;
+            if (parent_changed and old_parent.isValid()) try self.markChanged(old_parent, transaction);
+            try self.markChanged(id, transaction);
         }
     }
 
@@ -979,6 +1238,28 @@ fn sliceBytes(comptime T: type, count: usize) Error!usize {
 
 fn addBytes(total: usize, amount: usize) Error!usize {
     return std.math.add(usize, total, amount) catch error.BudgetExceeded;
+}
+
+fn nextRevision(value: u64) u64 {
+    const next = value +% 1;
+    return if (next == 0) 1 else next;
+}
+
+fn computeRetentionSafe(store: *const Store, record: *const Record) bool {
+    if (!ownRetentionSafe(record)) return false;
+    for (record.children.items) |child| {
+        const child_record = store.getConst(child) orelse return false;
+        if (!child_record.retention_safe) return false;
+    }
+    return true;
+}
+
+fn ownRetentionSafe(record: *const Record) bool {
+    return record.kindTag() != .custom and record.borrowedStyle().layout.portal.target == .none;
+}
+
+fn specRetentionSafe(spec: node.Spec) bool {
+    return std.meta.activeTag(spec.kind) != .custom and spec.style.layout.portal.target == .none;
 }
 
 fn sameHandles(a: []const handles.NodeId, b: []const handles.NodeId) bool {

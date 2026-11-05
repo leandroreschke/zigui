@@ -90,12 +90,22 @@ pub const Atlas = struct {
         self.* = undefined;
     }
 
-    pub fn allocate(
+    pub const EvictionSink = struct {
+        context: *anyopaque,
+        evicted: *const fn (*anyopaque, handles.AtlasTileId) void,
+    };
+
+    pub fn allocate(self: *Atlas, width: u16, height: u16, frame: u64, completed: api.SubmissionEpoch) Error!handles.AtlasTileId {
+        return self.allocateNotifying(width, height, frame, completed, null);
+    }
+
+    pub fn allocateNotifying(
         self: *Atlas,
         width: u16,
         height: u16,
         frame: u64,
         completed: api.SubmissionEpoch,
+        eviction_sink: ?EvictionSink,
     ) Error!handles.AtlasTileId {
         if (width == 0 or height == 0 or width > self.page_size or height > self.page_size) return error.InvalidConfiguration;
         self.collect(completed);
@@ -106,7 +116,7 @@ pub const Atlas = struct {
                 if (try self.findSpace(width, height, frame)) |id| return id;
             }
         }
-        if (try self.evictOne(completed, frame)) {
+        if (try self.evictOne(completed, frame, eviction_sink)) {
             if (try self.findSpace(width, height, frame)) |id| return id;
         }
         if (self.tiles.live_count +| self.retired.items.len >= self.maximum_tiles) return error.BudgetExceeded;
@@ -239,7 +249,7 @@ pub const Atlas = struct {
         return id;
     }
 
-    fn evictOne(self: *Atlas, completed: api.SubmissionEpoch, frame: u64) Error!bool {
+    fn evictOne(self: *Atlas, completed: api.SubmissionEpoch, frame: u64, sink: ?EvictionSink) Error!bool {
         var candidate: ?handles.AtlasTileId = null;
         var oldest: u64 = std.math.maxInt(u64);
         var iterator = self.tiles.iterator();
@@ -255,6 +265,7 @@ pub const Atlas = struct {
         if (candidate_tile.page >= self.pages.items.len) return error.InvalidHandle;
         try self.pages.items[candidate_tile.page].free_rects.ensureUnusedCapacity(self.allocator, 1);
         const tile = self.tiles.remove(id).?;
+        if (sink) |listener| listener.evicted(listener.context, id);
         try self.returnRect(tile.page, tile.rect);
         self.resources.recordAtlasEviction();
         return true;

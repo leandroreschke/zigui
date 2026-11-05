@@ -18,13 +18,20 @@ pub const Button = struct {
     hovered: bool = false,
     pressed: bool = false,
     focused: bool = false,
+    pointer_focused: bool = false,
     pressed_pointer: ?u64 = null,
+
+    /// Keep keyboard focus after a click without leaving a focus ring on screen.
+    pub fn focusVisible(self: *const Button) bool {
+        return self.focused and !self.pointer_focused;
+    }
 
     pub fn build(self: *Button, ctx: *component.BuildContext) Error!node.Spec {
         if (self.disabled) {
             self.hovered = false;
             self.pressed = false;
             self.focused = false;
+            self.pointer_focused = false;
             self.pressed_pointer = null;
         }
         const children = try ctx.allocator.alloc(node.Spec, 1);
@@ -60,8 +67,8 @@ pub const Button = struct {
                 .paint = .{
                     .background = .{ .solid = self.background() },
                     .border = .{
-                        .widths = geometry.Insets.all(if (self.focused) self.theme.focus_ring_width else if (self.variant == .quiet) 0 else 1),
-                        .color = if (self.focused) self.theme.focus_ring else self.theme.border,
+                        .widths = geometry.Insets.all(if (self.focusVisible()) self.theme.focus_ring_width else if (self.variant == .quiet) 0 else 1),
+                        .color = if (self.focusVisible()) self.theme.focus_ring else self.theme.border,
                     },
                     .radii = geometry.CornerRadii.all(self.theme.radius),
                     .opacity = if (self.disabled) self.theme.disabled_opacity else 1,
@@ -103,10 +110,12 @@ pub const Button = struct {
         switch (value.*) {
             .focus_in => {
                 self.focused = true;
+                self.pointer_focused = self.pressed_pointer != null;
                 try event_context.invalidate(.{});
             },
             .focus_out => {
                 self.focused = false;
+                self.pointer_focused = false;
                 self.pressed = false;
                 self.pressed_pointer = null;
                 try event_context.invalidate(.{});
@@ -120,6 +129,7 @@ pub const Button = struct {
                 try event_context.invalidate(.{});
             },
             .pointer_down => |pointer| if (pointer.button == .primary) {
+                self.pointer_focused = true;
                 self.pressed = true;
                 self.pressed_pointer = pointer.pointer_id;
                 dispatch.capturePointer(dispatch.current);
@@ -143,10 +153,16 @@ pub const Button = struct {
                 dispatch.handled = true;
                 try event_context.invalidate(.{});
             },
-            .key_down => |key| if (!key.repeat and (key.key == .enter or key.key == .space)) {
-                dispatch.handled = true;
-                dispatch.preventDefault();
-                try self.on_activate.call(event_context);
+            .key_down => |key| {
+                if (self.pointer_focused) {
+                    self.pointer_focused = false;
+                    try event_context.invalidate(.{});
+                }
+                if (!key.repeat and (key.key == .enter or key.key == .space)) {
+                    dispatch.handled = true;
+                    dispatch.preventDefault();
+                    try self.on_activate.call(event_context);
+                }
             },
             .accessibility => |request| if (request.action == .activate) {
                 dispatch.handled = true;

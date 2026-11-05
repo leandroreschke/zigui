@@ -9,6 +9,7 @@ pub const Error = std.mem.Allocator.Error || error{
     Cancelled,
     DeviceLost,
     FrameActive,
+    FrameNotReady,
     FramePhaseViolation,
     InvalidConfiguration,
     InvalidHandle,

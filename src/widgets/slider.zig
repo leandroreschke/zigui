@@ -27,11 +27,11 @@ pub const Slider = struct {
         try self.validateConfiguration();
         const fraction_value = self.fraction();
         const effective_value = std.math.clamp(self.value.*, self.minimum, self.maximum);
-        const track_children = try ctx.allocator.alloc(node.Spec, 2);
+        const track_children = try ctx.allocator.alloc(node.Spec, 3);
         track_children[0] = .{
             .kind = .container,
             .style = .{
-                .layout = .{ .position = .absolute, .width = .{ .percent = @floatCast(fraction_value) }, .height = .{ .points = 4 } },
+                .layout = .{ .position = .absolute, .width = .{ .percent = @floatCast(fraction_value) }, .height = .{ .points = 4 }, .inset = .{ .top = .{ .points = 8 }, .left = .{ .points = 0 }, .right = .auto, .bottom = .auto } },
                 .paint = .{ .background = .{ .solid = self.theme.accent }, .radii = geometry.CornerRadii.all(2) },
             },
         };
@@ -42,7 +42,7 @@ pub const Slider = struct {
                     .position = .absolute,
                     .width = .{ .points = 16 },
                     .height = .{ .points = 16 },
-                    .inset = .{ .left = .{ .percent = @floatCast(fraction_value) }, .top = .{ .points = -6 }, .right = .auto, .bottom = .auto },
+                    .inset = .{ .left = .{ .percent = @floatCast(fraction_value) }, .top = .{ .points = 2 }, .right = .auto, .bottom = .auto },
                 },
                 .paint = .{
                     .background = .{ .solid = geometry.Color.white },
@@ -52,6 +52,15 @@ pub const Slider = struct {
                 },
             },
         };
+        // A full-height containing box keeps absolute thumbs from being
+        // constrained to the four-point track during layout measurement.
+        track_children[2] = track_children[0];
+        track_children[2].style.layout.width = .{ .percent = 1 };
+        track_children[2].style.paint.background = .{ .solid = self.theme.surface_pressed };
+        const background = track_children[2];
+        track_children[2] = track_children[1];
+        track_children[1] = track_children[0];
+        track_children[0] = background;
         const handlers = try ctx.allocator.alloc(input.Handler, 1);
         handlers[0] = .{ .context = self, .callback = handle };
         const available_actions: []const a11y.Action = if (self.disabled) &.{} else &.{ .increment, .decrement, .set_value };
@@ -62,8 +71,7 @@ pub const Slider = struct {
         children[0] = .{
             .kind = .container,
             .style = .{
-                .layout = .{ .width = .{ .percent = 1 }, .height = .{ .points = 4 } },
-                .paint = .{ .background = .{ .solid = self.theme.surface_pressed }, .radii = geometry.CornerRadii.all(2) },
+                .layout = .{ .width = .{ .percent = 1 }, .height = .{ .points = 20 } },
             },
             .children = track_children,
         };

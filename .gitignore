@@ -1,10 +1,48 @@
+# Zig build outputs and caches
 .zig-cache/
 zig-cache/
 zig-out/
-.DS_Store
+
+# Compiled binaries, debug symbols, and shaders
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
 *.dSYM/
 *.metallib
 *.air
 *.spv
 *.dxbc
 *.pdb
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+secrets/
+
+# Local scratch files and logs
+/tmp_*.zig
+/tmp/
+*.log
+*.swp
+*.swo
+*~
+
+# Operating-system metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini

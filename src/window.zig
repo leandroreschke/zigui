@@ -31,6 +31,7 @@ pub const Window = struct {
     frame_arena: memory.FrameArena,
     event_arena: memory.FrameArena,
     scenes: [2]scene.Scene,
+    retained_scene: @import("scene/retained.zig").Cache,
     scene_limits: scene.Limits,
     next_scene: u1 = 0,
     hits: hit_tree.Tree,
@@ -83,6 +84,7 @@ pub const Window = struct {
             .frame_arena = frame_arena,
             .event_arena = event_arena,
             .scenes = .{ scene.Scene.init(allocator), scene.Scene.init(allocator) },
+            .retained_scene = @import("scene/retained.zig").Cache.init(allocator, 0),
             .scene_limits = scene_limits,
             .hits = hit_tree.Tree.initWithLimit(allocator, maximum_retained_nodes),
             .focus_manager = focus.Manager.initWithLimit(allocator, maximum_retained_nodes),
@@ -111,6 +113,7 @@ pub const Window = struct {
         self.hits.deinit();
         self.scenes[0].deinit();
         self.scenes[1].deinit();
+        self.retained_scene.deinit();
         self.event_arena.deinit();
         self.frame_arena.deinit();
         self.* = undefined;

@@ -87,10 +87,21 @@ pub const Manager = struct {
 
     pub fn loadAnimation(self: *Manager, bytes: []const u8, now_ns: u64) Error!handles.AnimationId {
         if (self.animations.live_count >= self.maximum_animations) return error.BudgetExceeded;
-        var player = try animation.Player.init(self.allocator, bytes, self.limits, now_ns);
+        var prepared: ?animation.Player = try animation.Player.init(self.allocator, bytes, self.limits, now_ns);
+        return self.adoptAnimation(&prepared, now_ns);
+    }
+
+    /// Transfers a worker-initialized decoder; subsequent playback keeps the
+    /// existing incremental animation contract.
+    pub fn adoptAnimation(self: *Manager, prepared: *?animation.Player, now_ns: u64) Error!handles.AnimationId {
+        var player = prepared.* orelse return error.InvalidImage;
+        prepared.* = null;
         var player_owned = true;
         errdefer if (player_owned) player.deinit();
+        if (self.animations.live_count >= self.maximum_animations) return error.BudgetExceeded;
         const frame = player.frame() orelse return error.InvalidImage;
+        _ = try image.validateDimensions(frame.width, frame.height, self.limits);
+        player.deadline_ns = now_ns +| frame.duration_ns;
         const texture = try self.resources.createTexture(.{
             .width = frame.width,
             .height = frame.height,
@@ -202,18 +213,52 @@ pub const Manager = struct {
         if (self.entries.count() >= self.maximum_images) return error.BudgetExceeded;
         var decoded = try image.decode(self.allocator, bytes, self.limits);
         defer decoded.deinit(self.allocator);
-        const texture = try self.resources.createTexture(.{
+        const texture = try self.resources.createTextureOwned(.{
             .width = decoded.width,
             .height = decoded.height,
             .format = .rgba8_srgb,
             .usage = .sampled,
-        }, decoded.pixels, true);
+        }, decoded.pixels, self.allocator);
+        decoded.pixels = &.{};
         errdefer self.resources.destroyTextureOnRenderer(self.renderer, texture) catch {};
         try self.resources.realize(self.renderer, texture);
         try self.entries.put(key, .{
             .texture = texture,
             .width = decoded.width,
             .height = decoded.height,
+            .last_used_frame = self.frame,
+        });
+        return texture;
+    }
+
+    /// Consumes prepared pixels on every outcome, including a dedup hit.
+    pub fn adopt(self: *Manager, prepared: *image.Prepared) Error!handles.TextureId {
+        defer prepared.deinit();
+        if (self.entries.getPtr(prepared.key)) |entry| {
+            if (entry.references == std.math.maxInt(usize)) return error.BudgetExceeded;
+            entry.references += 1;
+            entry.last_used_frame = self.frame;
+            return entry.texture;
+        }
+        if (self.entries.count() >= self.maximum_images) return error.BudgetExceeded;
+        const value = prepared.value;
+        _ = try image.validateDimensions(value.width, value.height, self.limits);
+        try image.validateImage(value);
+        try self.entries.ensureUnusedCapacity(1);
+        self.resources.collect(self.renderer.completedEpoch());
+        const texture = try self.resources.createTextureOwned(.{
+            .width = value.width,
+            .height = value.height,
+            .format = .rgba8_srgb,
+            .usage = .sampled,
+        }, value.pixels, prepared.allocator);
+        prepared.value.pixels = &.{};
+        errdefer self.resources.destroyTextureOnRenderer(self.renderer, texture) catch {};
+        try self.resources.realize(self.renderer, texture);
+        self.entries.putAssumeCapacity(prepared.key, .{
+            .texture = texture,
+            .width = value.width,
+            .height = value.height,
             .last_used_frame = self.frame,
         });
         return texture;

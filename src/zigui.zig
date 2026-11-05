@@ -96,6 +96,8 @@ pub const internal_shader_test = if (builtin.is_test) struct {
 /// Native backend modules are exposed only to their dedicated repository
 /// conformance roots; applications never depend on this test-only surface.
 pub const internal_backend_test = if (builtin.is_test) struct {
+    pub const metal_drawable = if (builtin.os.tag == .macos and config.compiled_renderer == .metal) @import("backend/metal/drawable.zig") else DisabledCapability;
+    pub const metal_objc = if (builtin.os.tag == .macos and config.compiled_renderer == .metal) @import("platform/macos/objc.zig") else DisabledCapability;
     pub const metal_renderer = if (builtin.os.tag == .macos and config.compiled_renderer == .metal)
         @import("backend/metal/renderer.zig")
     else

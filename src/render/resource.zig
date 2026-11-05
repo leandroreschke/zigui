@@ -12,6 +12,7 @@ pub const Texture = struct {
     resident: bool = false,
     last_submission: api.SubmissionEpoch = 0,
     cpu_copy: ?[]u8 = null,
+    cpu_allocator: ?std.mem.Allocator = null,
     byte_length: usize,
 };
 
@@ -92,6 +93,27 @@ pub const Manager = struct {
         });
         self.gpu_reserved += byte_length;
         if (cpu_copy != null) self.cpu_reserved += byte_length;
+        return id;
+    }
+
+    /// Takes ownership only on success. The original allocator follows the
+    /// pixels through retirement and device recovery.
+    pub fn createTextureOwned(self: *Manager, descriptor: TextureDescriptor, pixels: []u8, pixel_allocator: std.mem.Allocator) Error!handles.TextureId {
+        if (descriptor.width == 0 or descriptor.height == 0) return error.InvalidConfiguration;
+        const byte_length = try descriptor.byteLength();
+        if (pixels.len != byte_length) return error.InvalidConfiguration;
+        if (self.textures.live_count +| self.retired.items.len >= self.maximum_textures or
+            byte_length > self.gpu_budget -| self.gpu_reserved or
+            byte_length > self.cpu_budget -| self.cpu_reserved) return error.BudgetExceeded;
+        const id = try self.textures.insert(.{
+            .descriptor = descriptor,
+            .device_generation = self.device_generation,
+            .cpu_copy = pixels,
+            .cpu_allocator = pixel_allocator,
+            .byte_length = byte_length,
+        });
+        self.gpu_reserved += byte_length;
+        self.cpu_reserved += byte_length;
         return id;
     }
 
@@ -233,7 +255,7 @@ pub const Manager = struct {
 };
 
 fn releaseTexture(allocator: std.mem.Allocator, texture: Texture) void {
-    if (texture.cpu_copy) |copy| allocator.free(copy);
+    if (texture.cpu_copy) |copy| (texture.cpu_allocator orelse allocator).free(copy);
 }
 
 fn bytesPerPixel(format: api.PixelFormat) usize {

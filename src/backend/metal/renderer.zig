@@ -11,6 +11,7 @@ const scene_abi = @import("../../scene/abi.zig");
 const path_tessellator = @import("../../render/path_tessellator.zig");
 const objc = @import("../../platform/macos/objc.zig");
 const surface = @import("../../platform/macos/surface.zig");
+const Acquisition = @import("drawable.zig").Acquisition;
 
 extern "c" fn MTLCreateSystemDefaultDevice() objc.Id;
 extern "c" fn dispatch_data_create(buffer: *const anyopaque, size: usize, queue: objc.Id, destructor: objc.Id) objc.Id;
@@ -153,6 +154,8 @@ const FrameResources = struct {
     layer_targets: std.ArrayList(LayerTarget) = .empty,
     backdrop_targets: std.ArrayList(LayerTarget) = .empty,
     extension_depth_targets: std.ArrayList(LayerTarget) = .empty,
+    extension_snapshot_color_targets: std.ArrayList(LayerTarget) = .empty,
+    extension_snapshot_depth_targets: std.ArrayList(LayerTarget) = .empty,
     busy_epoch: api.SubmissionEpoch = 0,
 
     fn acquireLayerTarget(
@@ -188,6 +191,28 @@ const FrameResources = struct {
         return acquireTarget(&self.extension_depth_targets, allocator, device, depth, width, height, 252);
     }
 
+    fn acquireExtensionSnapshotColorTarget(
+        self: *FrameResources,
+        allocator: std.mem.Allocator,
+        device: objc.Id,
+        depth: usize,
+        width: u32,
+        height: u32,
+    ) Error!objc.Id {
+        return acquireTarget(&self.extension_snapshot_color_targets, allocator, device, depth, width, height, 81);
+    }
+
+    fn acquireExtensionSnapshotDepthTarget(
+        self: *FrameResources,
+        allocator: std.mem.Allocator,
+        device: objc.Id,
+        depth: usize,
+        width: u32,
+        height: u32,
+    ) Error!objc.Id {
+        return acquireTarget(&self.extension_snapshot_depth_targets, allocator, device, depth, width, height, 252);
+    }
+
     fn deinit(self: *FrameResources, allocator: std.mem.Allocator) void {
         self.materials.deinit();
         self.stops.deinit();
@@ -205,6 +230,10 @@ const FrameResources = struct {
         self.backdrop_targets.deinit(allocator);
         for (self.extension_depth_targets.items) |*target| target.deinit();
         self.extension_depth_targets.deinit(allocator);
+        for (self.extension_snapshot_color_targets.items) |*target| target.deinit();
+        self.extension_snapshot_color_targets.deinit(allocator);
+        for (self.extension_snapshot_depth_targets.items) |*target| target.deinit();
+        self.extension_snapshot_depth_targets.deinit(allocator);
         self.* = .{};
     }
 };
@@ -274,7 +303,7 @@ const DeviceBounds = struct {
 };
 
 const EncodeTarget = struct { texture: objc.Id, bounds: DeviceBounds };
-const DepthEncodeTarget = struct { texture: objc.Id, clear_depth: f32 };
+const DepthEncodeTarget = struct { texture: objc.Id, clear_depth: f32, load: bool = false };
 const TargetState = struct { target: ?EncodeTarget, layer: u32, isolated: bool = false };
 
 pub const Renderer = struct {
@@ -290,6 +319,8 @@ pub const Renderer = struct {
     retired_textures: std.ArrayList(RetiredTexture) = .empty,
     in_flight: std.ArrayList(InFlight) = .empty,
     active: ?ActiveFrame = null,
+    acquisitions: std.ArrayList(struct { window: handles.WindowId, value: *Acquisition }) = .empty,
+    maximum_windows: usize,
     generation: api.DeviceGeneration = 1,
     next_token: u64 = 1,
     submitted: api.SubmissionEpoch = 0,
@@ -330,6 +361,7 @@ pub const Renderer = struct {
         errdefer allocator.free(frame_resources);
         self.* = .{
             .allocator = allocator,
+            .maximum_windows = memory.window_count,
             .provider = provider,
             .policy = policy,
             .device = device,
@@ -395,6 +427,7 @@ pub const Renderer = struct {
         const self = cast(context);
         if (self.active != null) return error.FrameActive;
         try self.collect(false);
+        if (self.policy.asynchronous_drawables and self.availableFrameSlot() == null) return error.FrameNotReady;
         while (self.in_flight.items.len >= self.frame_resources.len) try self.waitOldest();
         var maybe_slot = self.availableFrameSlot();
         if (maybe_slot == null) {
@@ -403,15 +436,74 @@ pub const Renderer = struct {
         }
         const slot = maybe_slot orelse return error.ResourceBusy;
         const layer = self.provider.layer(descriptor.window) orelse return error.SurfaceUnavailable;
-        objc.send(void, layer, "setDevice:", .{self.device});
-        objc.send(void, layer, "setPixelFormat:", .{@as(usize, 81)});
-        objc.send(void, layer, "setDrawableSize:", .{Size{ .width = descriptor.drawable_width, .height = descriptor.drawable_height }});
-        const drawable = objc.send(objc.Id, layer, "nextDrawable", .{}) orelse return error.SurfaceUnavailable;
+        const drawable = if (self.policy.asynchronous_drawables) blk: {
+            const acquisition = try self.getAcquisition(descriptor.window, layer);
+            const size = objc.send(Size, layer, "drawableSize", .{});
+            const changed = objc.send(objc.Id, layer, "device", .{}) != self.device or
+                objc.send(usize, layer, "pixelFormat", .{}) != 81 or
+                size.width != descriptor.drawable_width or size.height != descriptor.drawable_height;
+            if (changed) {
+                if (acquisition.pending()) return error.FrameNotReady;
+                release(acquisition.take() catch null);
+                configureLayer(layer, self.device, descriptor);
+            }
+            if (try acquisition.take()) |ready| {
+                const texture = objc.send(objc.Id, ready, "texture", .{});
+                if (objc.send(usize, texture, "width", .{}) == descriptor.drawable_width and
+                    objc.send(usize, texture, "height", .{}) == descriptor.drawable_height) break :blk ready;
+                release(ready);
+            }
+            acquisition.start();
+            return error.FrameNotReady;
+        } else blk: {
+            objc.send(void, layer, "setDevice:", .{self.device});
+            objc.send(void, layer, "setPixelFormat:", .{@as(usize, 81)});
+            objc.send(void, layer, "setDrawableSize:", .{Size{ .width = descriptor.drawable_width, .height = descriptor.drawable_height }});
+            break :blk retain(objc.send(objc.Id, layer, "nextDrawable", .{}) orelse return error.SurfaceUnavailable);
+        };
         const token: api.FrameToken = .{ .value = self.next_token, .device_generation = self.generation };
         self.next_token +%= 1;
         if (self.next_token == 0) self.next_token = 1;
-        self.active = .{ .token = token, .descriptor = descriptor, .drawable = retain(drawable), .slot = slot };
+        self.active = .{ .token = token, .descriptor = descriptor, .drawable = drawable, .slot = slot };
         return token;
+    }
+
+    fn configureLayer(layer: objc.Id, device: objc.Id, descriptor: api.FrameDescriptor) void {
+        if (objc.send(objc.Id, layer, "device", .{}) != device) objc.send(void, layer, "setDevice:", .{device});
+        if (objc.send(usize, layer, "pixelFormat", .{}) != 81) objc.send(void, layer, "setPixelFormat:", .{@as(usize, 81)});
+        const size = objc.send(Size, layer, "drawableSize", .{});
+        if (size.width != descriptor.drawable_width or size.height != descriptor.drawable_height)
+            objc.send(void, layer, "setDrawableSize:", .{Size{ .width = descriptor.drawable_width, .height = descriptor.drawable_height }});
+    }
+
+    fn getAcquisition(self: *Renderer, window: handles.WindowId, layer: objc.Id) Error!*Acquisition {
+        var found: ?*Acquisition = null;
+        var index: usize = 0;
+        while (index < self.acquisitions.items.len) {
+            const entry = self.acquisitions.items[index];
+            if (entry.window.eql(window) and entry.value.layer == layer) found = entry.value;
+            if (self.provider.layer(entry.window) != entry.value.layer and !entry.value.pending()) {
+                entry.value.deinit();
+                self.allocator.destroy(entry.value);
+                _ = self.acquisitions.swapRemove(index);
+            } else index += 1;
+        }
+        if (found) |value| return value;
+        if (self.acquisitions.items.len >= self.maximum_windows) return error.FrameNotReady;
+        try self.acquisitions.ensureUnusedCapacity(self.allocator, 1);
+        const value = try self.allocator.create(Acquisition);
+        errdefer self.allocator.destroy(value);
+        value.* = try Acquisition.init(layer);
+        self.acquisitions.appendAssumeCapacity(.{ .window = window, .value = value });
+        return value;
+    }
+
+    fn drainAcquisitions(self: *Renderer) void {
+        for (self.acquisitions.items) |entry| {
+            entry.value.deinit();
+            self.allocator.destroy(entry.value);
+        }
+        self.acquisitions.clearRetainingCapacity();
     }
 
     fn submit(context: *anyopaque, token: api.FrameToken, view: api.SceneView) Error!api.Submission {
@@ -455,6 +547,12 @@ pub const Renderer = struct {
         self.in_flight.appendAssumeCapacity(.{ .epoch = self.submitted, .command_buffer = retain(command_buffer), .slot = active.slot });
         release(active.drawable);
         self.active = null;
+        // Start waiting only after returning this drawable to the compositor.
+        // A single retained result is reused by the next dirty frame.
+        for (self.acquisitions.items) |entry| if (entry.window.eql(active.descriptor.window) and entry.value.layer == self.provider.layer(entry.window)) {
+            entry.value.start();
+            break;
+        };
         return .{ .epoch = self.submitted, .device_generation = self.generation, .presented = true };
     }
 
@@ -607,26 +705,91 @@ pub const Renderer = struct {
                 for (view.custom_passes[operation.start..][0..operation.count]) |pass| {
                     const extension_id = extension.decodeId(pass.extension);
                     const requirements = try self.extensions.requirements(extension_id);
+                    const capture_snapshot = if (requirements.snapshot) |request|
+                        if (request.when_flag) |flag| (pass.flags & flag) != 0 else true
+                    else
+                        false;
                     var depth_attachment: ?extension.DepthAttachment = null;
-                    if (requirements.depth) |request| {
-                        objc.send(void, encoder, "endEncoding", .{});
-                        encoder_open = false;
-                        const depth_texture = try frame.acquireExtensionDepthTarget(
+                    var depth_texture: ?objc.Id = null;
+                    if (requirements.depth != null) {
+                        depth_texture = try frame.acquireExtensionDepthTarget(
                             self.allocator,
                             self.device,
                             depth,
                             target.bounds.width,
                             target.bounds.height,
                         );
+                    }
+
+                    // Extension requirements that cross an encoder boundary
+                    // must capture the current target before opening the
+                    // extension's encoder. Snapshot resources belong to the
+                    // frame slot and remain valid until its GPU submission is
+                    // complete.
+                    if (requirements.depth != null or capture_snapshot) {
+                        objc.send(void, encoder, "endEncoding", .{});
+                        encoder_open = false;
+                    }
+
+                    var snapshot_color: ?objc.Id = null;
+                    var snapshot_depth: ?objc.Id = null;
+                    if (capture_snapshot) {
+                        const request = requirements.snapshot orelse return error.InvalidConfiguration;
+                        if (request.color) {
+                            snapshot_color = try frame.acquireExtensionSnapshotColorTarget(
+                                self.allocator,
+                                self.device,
+                                depth,
+                                target.bounds.width,
+                                target.bounds.height,
+                            );
+                        }
+                        if (request.depth) {
+                            const source_depth = depth_texture orelse return error.InvalidConfiguration;
+                            snapshot_depth = try frame.acquireExtensionSnapshotDepthTarget(
+                                self.allocator,
+                                self.device,
+                                depth,
+                                target.bounds.width,
+                                target.bounds.height,
+                            );
+                            try copyTexture(
+                                command_buffer,
+                                source_depth,
+                                snapshot_depth.?,
+                                target.bounds.width,
+                                target.bounds.height,
+                            );
+                        }
+                        if (request.color) {
+                            try copyTexture(
+                                command_buffer,
+                                target.texture,
+                                snapshot_color.?,
+                                target.bounds.width,
+                                target.bounds.height,
+                            );
+                        }
+                    }
+
+                    if (requirements.depth) |request| {
+                        const load_depth = if (request.load_flag) |flag| (pass.flags & flag) != 0 else false;
+                        const depth_target = depth_texture orelse return error.InvalidConfiguration;
                         encoder = try beginRenderEncoder(command_buffer, target, .load, null, .{
-                            .texture = depth_texture,
+                            .texture = depth_target,
                             .clear_depth = request.clear_depth,
+                            .load = load_depth,
                         });
                         encoder_open = true;
                         depth_attachment = .{
-                            .texture = pointerValue(depth_texture),
+                            .texture = pointerValue(depth_target),
                             .format = request.format,
                         };
+                    } else if (capture_snapshot) {
+                        // Snapshot-only extensions still need a fresh encoder
+                        // after the blit, preserving the current color target.
+                        encoder = try beginRenderEncoder(command_buffer, target, .load, null, null);
+                        encoder_open = true;
                     }
                     try setClip(encoder, descriptor, view, operation.clip, target.bounds);
                     const payload = view.custom_payload[@as(usize, pass.payload_start)..][0..pass.payload_length];
@@ -642,6 +805,10 @@ pub const Renderer = struct {
                             .render_encoder = pointerValue(encoder),
                             .target_texture = pointerValue(target.texture),
                             .depth = depth_attachment,
+                            .snapshot = if (snapshot_color != null or snapshot_depth != null) .{
+                                .color = if (snapshot_color) |texture| pointerValue(texture) else null,
+                                .depth = if (snapshot_depth) |texture| pointerValue(texture) else null,
+                            } else null,
                             .geometry = .{
                                 .window = descriptor.window,
                                 .logical_size = descriptor.logical_size,
@@ -1178,13 +1345,23 @@ pub const Renderer = struct {
         return self.completed;
     }
 
-    // CAMetalLayer ownership remains with AppKit. Each frame acquires a fresh
-    // drawable, so dropping one window surface requires no device mutation.
-    fn invalidateSurface(_: *anyopaque, _: handles.WindowId) Error!void {}
+    fn invalidateSurface(context: *anyopaque, window: handles.WindowId) Error!void {
+        const self = cast(context);
+        var index: usize = 0;
+        while (index < self.acquisitions.items.len) {
+            const entry = self.acquisitions.items[index];
+            if (entry.window.eql(window)) {
+                entry.value.deinit();
+                self.allocator.destroy(entry.value);
+                _ = self.acquisitions.swapRemove(index);
+            } else index += 1;
+        }
+    }
 
     fn recover(context: *anyopaque, policy: config.GpuPolicy) Error!void {
         const self = cast(context);
         if (self.extensions.callbacksActive()) return error.CallbackReentrancy;
+        self.drainAcquisitions();
         // Failed command buffers belong to the lost device generation. Drop
         // the framework's references and rebuild immediately; waiting for a
         // successful completion would make recovery itself return DeviceLost.
@@ -1346,6 +1523,8 @@ pub const Renderer = struct {
 
     fn deinit(context: *anyopaque) void {
         const self = cast(context);
+        self.drainAcquisitions();
+        self.acquisitions.deinit(self.allocator);
         while (self.in_flight.items.len != 0) self.waitOldest() catch break;
         drainOffscreen(self);
         self.pipelines.deinit();
@@ -1399,7 +1578,9 @@ pub const Renderer = struct {
     }
 
     fn waitOldest(self: *Renderer) Error!void {
-        try self.collect(true);
+        if (self.in_flight.items.len == 0) return;
+        objc.send(void, self.in_flight.items[0].command_buffer, "waitUntilCompleted", .{});
+        try self.collect(false);
     }
 
     fn availableFrameSlot(self: *const Renderer) ?usize {
@@ -1469,6 +1650,28 @@ fn createPipeline(
 
 const LoadAction = enum(usize) { dont_care = 0, load = 1, clear = 2 };
 
+fn copyTexture(
+    command_buffer: objc.Id,
+    source: objc.Id,
+    destination: objc.Id,
+    width: u32,
+    height: u32,
+) Error!void {
+    const blit = objc.send(objc.Id, command_buffer, "blitCommandEncoder", .{}) orelse return error.DeviceLost;
+    objc.send(void, blit, "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:", .{
+        source,
+        @as(usize, 0),
+        @as(usize, 0),
+        Origin{ .x = 0, .y = 0, .z = 0 },
+        Extent{ .width = width, .height = height, .depth = 1 },
+        destination,
+        @as(usize, 0),
+        @as(usize, 0),
+        Origin{ .x = 0, .y = 0, .z = 0 },
+    });
+    objc.send(void, blit, "endEncoding", .{});
+}
+
 fn beginRenderEncoder(
     command_buffer: objc.Id,
     target: EncodeTarget,
@@ -1494,8 +1697,10 @@ fn beginRenderEncoder(
     if (depth_target) |depth| {
         const depth_attachment = objc.send(objc.Id, pass, "depthAttachment", .{});
         objc.send(void, depth_attachment, "setTexture:", .{depth.texture});
-        objc.send(void, depth_attachment, "setLoadAction:", .{@backingInt(LoadAction.clear)});
-        objc.send(void, depth_attachment, "setStoreAction:", .{@as(usize, 0)});
+        objc.send(void, depth_attachment, "setLoadAction:", .{@backingInt(if (depth.load) LoadAction.load else LoadAction.clear)});
+        // A later custom pass may copy or load this attachment. Keep it alive
+        // until the command buffer completes instead of discarding it here.
+        objc.send(void, depth_attachment, "setStoreAction:", .{@as(usize, 1)});
         objc.send(void, depth_attachment, "setClearDepth:", .{@as(f64, depth.clear_depth)});
     }
     const encoder = objc.send(objc.Id, command_buffer, "renderCommandEncoderWithDescriptor:", .{pass}) orelse return error.DeviceLost;

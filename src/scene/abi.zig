@@ -127,7 +127,14 @@ pub const Sprite = extern struct {
     texture: u64,
     tile_generation: u32,
     format: u32,
+    /// A progressively blurred contrast treatment along the bottom edge.
+    effect: SpriteEffect = .none,
+    effect_radius: f32 = 0,
+    effect_height: f32 = 0,
+    effect_reserved: u32 = 0,
 };
+
+pub const SpriteEffect = enum(u32) { none, light_text, dark_text, preview_blur };
 
 pub const ExternalSurface = extern struct {
     bounds: geometry.Rect,
@@ -160,6 +167,6 @@ comptime {
     std.debug.assert(@sizeOf(PathVertex) == 24);
     std.debug.assert(@offsetOf(PathVertex, "kind") == 16);
     std.debug.assert(@sizeOf(BackdropEffect) == 44);
-    std.debug.assert(@sizeOf(Sprite) == 64);
+    std.debug.assert(@sizeOf(Sprite) == 80);
     std.debug.assert(@sizeOf(CustomPass) == 40);
 }

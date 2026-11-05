@@ -500,6 +500,7 @@ pub const Mesh = struct {
         sprite: scene_abi.Sprite,
         kind: DrawKind,
     ) Error!void {
+        if (sprite.effect != .none) return error.Unsupported;
         if (sprite.bounds.isEmpty() or sprite.color.a <= 0) return;
         const start = self.vertices.items.len;
         const x0 = sprite.bounds.minX();

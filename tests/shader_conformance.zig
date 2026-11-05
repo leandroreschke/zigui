@@ -120,7 +120,7 @@ test "native shader record declarations match the fixed Zig scene ABI" {
     try testing.expectEqual(@as(usize, 80), @sizeOf(ui.scene_abi.Quad));
     try testing.expectEqual(@as(usize, 64), @sizeOf(ui.scene_abi.Shadow));
     try testing.expectEqual(@as(usize, 48), @sizeOf(ui.scene_abi.Underline));
-    try testing.expectEqual(@as(usize, 64), @sizeOf(ui.scene_abi.Sprite));
+    try testing.expectEqual(@as(usize, 80), @sizeOf(ui.scene_abi.Sprite));
     try testing.expectEqual(@as(usize, 56), @sizeOf(ui.scene_abi.ExternalSurface));
     try testing.expectEqual(@as(usize, 40), @sizeOf(ui.scene_abi.CustomPass));
     try testing.expectEqual(@as(usize, 44), @sizeOf(ui.scene_abi.BackdropEffect));
@@ -129,7 +129,7 @@ test "native shader record declarations match the fixed Zig scene ABI" {
         "structQuad{Rectbounds;Colorbackground;Colorborder_color;Insetsborder_widths;Radiiradii;};",
         "structShadow{Rectbounds;Colorcolor;Radiiradii;Pointoffset;floatblur_radius;floatspread;};",
         "structUnderline{Rectbounds;Colorcolor;floatthickness;floatwave_amplitude;floatwave_period;floatreserved;};",
-        "structSprite{Rectbounds;Rectuv_bounds;Colorcolor;ulongtexture;uinttile_generation;uintformat;};",
+        "structSprite{Rectbounds;Rectuv_bounds;Colorcolor;ulongtexture;uinttile_generation;uintformat;uinteffect;floateffect_radius;floateffect_height;uinteffect_reserved;};",
         "structExternalSurface{Rectbounds;Rectuv_bounds;ulongsurface;uintgeneration;uintcolor_space;floatopacity;floatreserved;};",
         "structMaterial{uintkind;uintstop_start;uintstop_count;uintreserved;Colorcolor;Pointstart;Pointend;Affinegradient_transform;};",
         "structGradientStop{floatoffset;floatreserved0;floatreserved1;floatreserved2;Colorcolor;};",
@@ -138,7 +138,7 @@ test "native shader record declarations match the fixed Zig scene ABI" {
         declarations[0],
         declarations[1],
         declarations[2],
-        "structSprite{Rectbounds;Rectuv_bounds;Colorcolor;uint2texture_id;uinttile_generation;uintformat;};",
+        "structSprite{Rectbounds;Rectuv_bounds;Colorcolor;uint2texture_id;uinttile_generation;uintformat;uinteffect;floateffect_radius;floateffect_height;uinteffect_reserved;};",
         "structExternalSurface{Rectbounds;Rectuv_bounds;uint2surface;uintgeneration;uintcolor_space;floatopacity;floatreserved;};",
         declarations[5],
         "structGradientStop{floatoffset;float3reserved;Colorcolor;};",

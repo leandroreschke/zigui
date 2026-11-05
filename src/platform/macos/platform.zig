@@ -223,6 +223,7 @@ pub const Context = struct {
     pending_open_payload_bytes: usize = 0,
     pending_payload_bytes: usize = 0,
     quit: bool = false,
+    guarded_close: bool = false,
     failure: ?Error = null,
     active_sink: ?api.EventSink = null,
     sink_dispatch_depth: u32 = 0,
@@ -754,6 +755,7 @@ pub fn create(allocator: std.mem.Allocator, app_config: config.AppConfig) Error!
         app_config.memory.offscreen_request_count,
     );
     errdefer context.deinit();
+    context.guarded_close = app_config.window_close_guard != null;
     if (app_config.pointer_event_coalescing == .disabled) {
         const event_class = objc.class("NSEvent");
         const previous = objc.send(bool, event_class, "isMouseCoalescingEnabled", .{});
@@ -1067,6 +1069,7 @@ fn createWindow(raw: *anyopaque, id: handles.WindowId, options: api.WindowOption
     var style_mask: usize = 0;
     if (options.decorated) style_mask = types.WindowStyle.titled | types.WindowStyle.closable | types.WindowStyle.miniaturizable;
     if (options.resizable) style_mask |= types.WindowStyle.resizable;
+    if (options.decorated and options.full_size_content) style_mask |= 1 << 15;
     const ns_window = objc.send(objc.Id, objc.send(objc.Id, objc.class("NSWindow"), "alloc", .{}), "initWithContentRect:styleMask:backing:defer:", .{
         frame, style_mask, types.backing_store_buffered, false,
     }) orelse return error.PlatformFailure;
@@ -1113,6 +1116,10 @@ fn createWindow(raw: *anyopaque, id: handles.WindowId, options: api.WindowOption
     objc.send(void, ns_window, "setAcceptsMouseMovedEvents:", .{true});
     objc.send(void, ns_window, "setReleasedWhenClosed:", .{false});
     objc.send(void, ns_window, "setTitle:", .{objc.nsString(options.title)});
+    if (options.full_size_content) {
+        objc.send(void, ns_window, "setTitleVisibility:", .{@as(isize, 1)});
+        objc.send(void, ns_window, "setTitlebarAppearsTransparent:", .{true});
+    }
     if (options.transparent) {
         objc.send(void, ns_window, "setOpaque:", .{false});
         objc.send(void, ns_window, "setBackgroundColor:", .{objc.send(objc.Id, objc.class("NSColor"), "clearColor", .{})});
@@ -2142,6 +2149,16 @@ fn appendSystemMenuItem(self: *Context, menu: objc.Id, definition: @FieldType(ap
             objc.release(created);
             break :blk objc.send(objc.Id, self.application, "servicesMenu", .{}) orelse return error.PlatformFailure;
         };
+        if (objc.send(objc.Id, services_menu, "supermenu", .{})) |parent_menu| {
+            const item_count = objc.send(usize, parent_menu, "numberOfItems", .{});
+            for (0..item_count) |index| {
+                const parent_item = objc.send(objc.Id, parent_menu, "itemAtIndex:", .{@as(isize, @intCast(index))}) orelse continue;
+                if (objc.send(objc.Id, parent_item, "submenu", .{}) == services_menu) {
+                    objc.send(void, parent_item, "setSubmenu:", .{@as(objc.Id, null)});
+                    break;
+                }
+            }
+        }
         objc.send(void, item, "setSubmenu:", .{services_menu});
         objc.send(void, menu, "addItem:", .{item});
         return;
@@ -2524,6 +2541,7 @@ fn registerMenuTargetClass() Error!objc.Class {
     if (!objc.addIvar(?*Context, target, "_ziguiContext", "^v")) return error.PlatformFailure;
     if (!objc.class_addMethod(target, objc.selector("ziguiMenuAction:"), @ptrCast(&menuAction), "v@:@")) return error.PlatformFailure;
     if (!objc.class_addMethod(target, objc.selector("ziguiQuit:"), @ptrCast(&menuQuit), "v@:@")) return error.PlatformFailure;
+    if (!objc.class_addMethod(target, objc.selector("applicationShouldTerminate:"), @ptrCast(&applicationShouldTerminate), "Q@:@")) return error.PlatformFailure;
     if (!objc.class_addMethod(target, objc.selector("application:openFiles:"), @ptrCast(&applicationOpenFiles), "v@:@@")) return error.PlatformFailure;
     if (!objc.class_addMethod(target, objc.selector("application:openURLs:"), @ptrCast(&applicationOpenURLs), "v@:@@")) return error.PlatformFailure;
     if (!objc.class_addMethod(target, objc.selector("application:openFile:"), @ptrCast(&applicationOpenFile), "B@:@")) return error.PlatformFailure;
@@ -2533,8 +2551,20 @@ fn registerMenuTargetClass() Error!objc.Class {
 
 fn menuQuit(target: objc.Id, _: objc.Sel, _: objc.Id) callconv(.c) void {
     const self = (objc.getIvar(?*Context, target, "_ziguiContext") orelse null) orelse return;
-    self.quit = true;
-    wake(self);
+    if (!self.guarded_close or self.windows.count() == 0) {
+        self.quit = true;
+        wake(self);
+        return;
+    }
+    var iterator = self.windows.keyIterator();
+    while (iterator.next()) |key| self.queue(.{ .index = @truncate(key.*), .generation = @truncate(key.* >> 32) }, .close_requested);
+}
+
+fn applicationShouldTerminate(target: objc.Id, selector: objc.Sel, sender: objc.Id) callconv(.c) usize {
+    const self = (objc.getIvar(?*Context, target, "_ziguiContext") orelse null) orelse return 1;
+    if (!self.guarded_close or self.windows.count() == 0) return 1;
+    menuQuit(target, selector, sender);
+    return 0;
 }
 
 fn menuAction(target: objc.Id, _: objc.Sel, sender: objc.Id) callconv(.c) void {
@@ -2572,6 +2602,7 @@ const view_methods = [_]Method{
     .{ .name = "otherMouseDown:", .implementation = @ptrCast(&otherMouseDown), .encoding = "v@:@" },
     .{ .name = "otherMouseUp:", .implementation = @ptrCast(&otherMouseUp), .encoding = "v@:@" },
     .{ .name = "mouseMoved:", .implementation = @ptrCast(&mouseMoved), .encoding = "v@:@" },
+    .{ .name = "tabletPoint:", .implementation = @ptrCast(&mouseMoved), .encoding = "v@:@" },
     .{ .name = "mouseDragged:", .implementation = @ptrCast(&mouseMoved), .encoding = "v@:@" },
     .{ .name = "rightMouseDragged:", .implementation = @ptrCast(&mouseMoved), .encoding = "v@:@" },
     .{ .name = "otherMouseDragged:", .implementation = @ptrCast(&mouseMoved), .encoding = "v@:@" },
@@ -2701,12 +2732,18 @@ fn emitPointer(view: objc.Id, native_event: objc.Id, phase: PointerPhase, button
     const self = viewContext(view) orelse return;
     const point = eventPoint(view, native_event);
     const event_type = objc.send(usize, native_event, "type", .{});
+    const tablet = event_type == types.EventType.tablet_point or
+        ((eventCarriesPressure(event_type) or event_type == types.EventType.mouse_moved) and objc.send(i16, native_event, "subtype", .{}) == 1);
+    const tilt = if (tablet) objc.send(types.Point, native_event, "tilt", .{}) else types.Point{};
     const pointer: input.PointerEvent = .{
+        // Tablet samples arrive inside ordinary mouse down/drag/up events too.
+        .kind = if (tablet) .pen else .mouse,
+        .tilt = .{ .x = @floatCast(tilt.x), .y = @floatCast(tilt.y) },
         .position = point,
-        .delta = .{
+        .delta = if (event_type == types.EventType.mouse_moved or event_type == types.EventType.left_mouse_dragged or event_type == types.EventType.right_mouse_dragged or event_type == types.EventType.other_mouse_dragged) .{
             .x = @floatCast(objc.send(f64, native_event, "deltaX", .{})),
             .y = @floatCast(objc.send(f64, native_event, "deltaY", .{})),
-        },
+        } else .{},
         .button = button,
         .buttons = @truncate(objc.send(u64, objc.class("NSEvent"), "pressedMouseButtons", .{})),
         .pressure = if (eventCarriesPressure(event_type)) objc.send(f32, native_event, "pressure", .{}) else 0,
@@ -2966,7 +3003,9 @@ fn emitKey(view: objc.Id, native_event: objc.Id, down: bool) void {
 
 fn windowShouldClose(view: objc.Id, _: objc.Sel, _: objc.Id) callconv(.c) bool {
     const self = viewContext(view) orelse return false;
-    if (self.windows.getPtr(viewWindow(view).encode())) |window| window.closing = true;
+    if (!self.guarded_close) if (self.windows.getPtr(viewWindow(view).encode())) |window| {
+        window.closing = true;
+    };
     self.queue(viewWindow(view), .close_requested);
     return false;
 }

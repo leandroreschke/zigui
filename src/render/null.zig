@@ -1046,11 +1046,46 @@ fn paintSprite(
             if (!sprite.bounds.contains(local_point)) continue;
             const u = std.math.clamp((local_point.x - sprite.bounds.origin.x) / @max(sprite.bounds.size.width, 0.00001), 0, 1);
             const v = std.math.clamp((local_point.y - sprite.bounds.origin.y) / @max(sprite.bounds.size.height, 0.00001), 0, 1);
-            const sampled = sampleTexture(
-                texture,
-                sprite.uv_bounds.origin.x + u * sprite.uv_bounds.size.width,
-                sprite.uv_bounds.origin.y + v * sprite.uv_bounds.size.height,
-            );
+            const uv_x = sprite.uv_bounds.origin.x + u * sprite.uv_bounds.size.width;
+            const uv_y = sprite.uv_bounds.origin.y + v * sprite.uv_bounds.size.height;
+            var sampled = sampleTexture(texture, uv_x, uv_y);
+            if (!monochrome and sprite.effect != .none) {
+                var t: f32 = if (sprite.effect == .preview_blur) 1 else std.math.clamp((v * sprite.bounds.size.height - (sprite.bounds.size.height - sprite.effect_height)) / sprite.effect_height, 0, 1);
+                t = t * t * (3 - 2 * t);
+                const dx = sprite.uv_bounds.size.width / @max(sprite.bounds.size.width, 0.001) * sprite.effect_radius * t;
+                const dy = sprite.uv_bounds.size.height / @max(sprite.bounds.size.height, 0.001) * sprite.effect_radius * t;
+                const low_x = sprite.uv_bounds.minX();
+                const high_x = sprite.uv_bounds.maxX();
+                const low_y = sprite.uv_bounds.minY();
+                const high_y = sprite.uv_bounds.maxY();
+                const taps = [_]geometry.Color{
+                    sampleTexture(texture, std.math.clamp(uv_x + dx, low_x, high_x), uv_y),
+                    sampleTexture(texture, std.math.clamp(uv_x - dx, low_x, high_x), uv_y),
+                    sampleTexture(texture, uv_x, std.math.clamp(uv_y + dy, low_y, high_y)),
+                    sampleTexture(texture, uv_x, std.math.clamp(uv_y - dy, low_y, high_y)),
+                };
+                var blurred: geometry.Color = .{ .r = sampled.r * 0.4, .g = sampled.g * 0.4, .b = sampled.b * 0.4, .a = sampled.a * 0.4 };
+                for (taps) |tap| {
+                    blurred.r += tap.r * 0.15;
+                    blurred.g += tap.g * 0.15;
+                    blurred.b += tap.b * 0.15;
+                    blurred.a += tap.a * 0.15;
+                }
+                const luminance = blurred.r * 0.2126 + blurred.g * 0.7152 + blurred.b * 0.0722;
+                if (sprite.effect == .light_text) {
+                    const strength = @min(1, 0.22 / @max(luminance, 0.001));
+                    blurred.r *= strength;
+                    blurred.g *= strength;
+                    blurred.b *= strength;
+                } else if (sprite.effect == .dark_text) {
+                    const strength = std.math.clamp((0.72 - luminance) / @max(1 - luminance, 0.001), 0, 1);
+                    blurred.r += (1 - blurred.r) * strength;
+                    blurred.g += (1 - blurred.g) * strength;
+                    blurred.b += (1 - blurred.b) * strength;
+                }
+                sampled = blurred;
+                if (sprite.effect != .preview_blur) sampled.a *= t;
+            }
             var color = sprite.color;
             if (monochrome or texture.descriptor.format == .a8) {
                 color.a *= sampled.a;

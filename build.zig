@@ -227,6 +227,34 @@ pub fn build(b: *std.Build) void {
     const run_conformance = b.addRunArtifact(conformance);
     dependOnTest(test_step, conformance, run_conformance, can_run_target);
 
+    const retained_tests = b.step("retained-test", "Compare retained frame work with full reconstruction");
+    for ([_][]const u8{ "tests/layout_retention.zig", "tests/scene_replay.zig", "tests/retained_conformance.zig" }) |source| {
+        const artifact = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(source),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "zigui", .module = conformance_zigui }},
+            }),
+        });
+        const run = b.addRunArtifact(artifact);
+        dependOnTest(retained_tests, artifact, run, can_run_target);
+        dependOnTest(test_step, artifact, run, can_run_target);
+    }
+    if (platform == .macos and renderer == .metal) {
+        const artifact = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/retained_metal.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "zigui", .module = zigui }},
+            }),
+        });
+        const run = b.addRunArtifact(artifact);
+        dependOnTest(retained_tests, artifact, run, can_run_target);
+        dependOnTest(test_step, artifact, run, can_run_target);
+    }
+
     // WebP is a platform capability rather than a hidden application
     // fallback. Keep the cross-target Unsupported contract in the regular
     // headless suite and force the native ImageIO path through a separate
@@ -315,6 +343,58 @@ pub fn build(b: *std.Build) void {
         stress_step.dependOn(&b.addRunArtifact(stress_check).step)
     else
         stress_step.dependOn(&stress_check.step);
+
+    const retained_check_module = b.createModule(.{
+        .root_source_file = b.path("tools/retained_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zigui", .module = conformance_zigui }},
+    });
+    retained_check_module.addAnonymousImport("retained_test_font", .{
+        .root_source_file = b.path("tests/fixtures/Abel-Regular.ttf"),
+    });
+    const retained_check = b.addExecutable(.{
+        .name = "zigui-retained-check",
+        .root_module = retained_check_module,
+    });
+    const retained_step = b.step(
+        "retained-bench",
+        "Compare full and retained frame work on deterministic headless scenes",
+    );
+    if (can_run_target) {
+        const run_retained = b.addRunArtifact(retained_check);
+        run_retained.addPassthruArgs();
+        retained_step.dependOn(&run_retained.step);
+    } else {
+        retained_step.dependOn(&retained_check.step);
+    }
+
+    if (platform == .macos and renderer == .metal) {
+        const native_retained_module = b.createModule(.{
+            .root_source_file = b.path("tools/retained_check.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zigui", .module = zigui }},
+        });
+        native_retained_module.addAnonymousImport("retained_test_font", .{
+            .root_source_file = b.path("tests/fixtures/Abel-Regular.ttf"),
+        });
+        const native_retained_check = b.addExecutable(.{
+            .name = "zigui-retained-check-native",
+            .root_module = native_retained_module,
+        });
+        const native_retained_step = b.step(
+            "retained-bench-native",
+            "Compare full and retained frame CPU work with the native Metal platform",
+        );
+        if (can_run_target) {
+            const run_native_retained = b.addRunArtifact(native_retained_check);
+            run_native_retained.addPassthruArgs();
+            native_retained_step.dependOn(&run_native_retained.step);
+        } else {
+            native_retained_step.dependOn(&native_retained_check.step);
+        }
+    }
 }
 
 fn dependOnTest(step: *std.Build.Step, artifact: *std.Build.Step.Compile, run: *std.Build.Step.Run, can_run: bool) void {

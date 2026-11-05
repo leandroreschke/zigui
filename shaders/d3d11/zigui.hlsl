@@ -8,7 +8,7 @@ struct Affine { float m11; float m12; float m21; float m22; float tx; float ty; 
 struct Quad { Rect bounds; Color background; Color border_color; Insets border_widths; Radii radii; };
 struct Shadow { Rect bounds; Color color; Radii radii; Point offset; float blur_radius; float spread; };
 struct Underline { Rect bounds; Color color; float thickness; float wave_amplitude; float wave_period; float reserved; };
-struct Sprite { Rect bounds; Rect uv_bounds; Color color; uint2 texture_id; uint tile_generation; uint format; };
+struct Sprite { Rect bounds; Rect uv_bounds; Color color; uint2 texture_id; uint tile_generation; uint format; uint effect; float effect_radius; float effect_height; uint effect_reserved; };
 struct ExternalSurface { Rect bounds; Rect uv_bounds; uint2 surface; uint generation; uint color_space; float opacity; float reserved; };
 struct Material { uint kind; uint stop_start; uint stop_count; uint reserved; Color color; Point start; Point end; Affine gradient_transform; };
 struct GradientStop { float offset; float3 reserved; Color color; };
@@ -255,6 +255,23 @@ float4 color_sprite_fragment(VertexOut input) : SV_TARGET {
     Sprite item = sprites[input.item];
     float2 uv = float2(item.uv_bounds.origin.x, item.uv_bounds.origin.y) + input.local * float2(item.uv_bounds.size.width, item.uv_bounds.size.height);
     float4 sampled = image_texture.Sample(image_sampler, uv);
+    if (item.effect != 0) {
+        float t = item.effect == 3 ? 1.0 : saturate((input.local.y * item.bounds.size.height - (item.bounds.size.height - item.effect_height)) / max(item.effect_height, 0.001));
+        t = t * t * (3.0 - 2.0 * t);
+        float2 delta = float2(item.uv_bounds.size.width / max(item.bounds.size.width, 0.001), item.uv_bounds.size.height / max(item.bounds.size.height, 0.001)) * item.effect_radius * t;
+        float2 low = float2(item.uv_bounds.origin.x, item.uv_bounds.origin.y);
+        float2 high = low + float2(item.uv_bounds.size.width, item.uv_bounds.size.height);
+        float4 blurred = sampled * 0.4;
+        blurred += image_texture.Sample(image_sampler, clamp(uv + float2(delta.x, 0.0), low, high)) * 0.15;
+        blurred += image_texture.Sample(image_sampler, clamp(uv - float2(delta.x, 0.0), low, high)) * 0.15;
+        blurred += image_texture.Sample(image_sampler, clamp(uv + float2(0.0, delta.y), low, high)) * 0.15;
+        blurred += image_texture.Sample(image_sampler, clamp(uv - float2(0.0, delta.y), low, high)) * 0.15;
+        float luminance = dot(blurred.rgb, float3(0.2126, 0.7152, 0.0722));
+        if (item.effect == 1) blurred.rgb *= min(1.0, 0.22 / max(luminance, 0.001));
+        else if (item.effect == 2) blurred.rgb = lerp(blurred.rgb, float3(1.0, 1.0, 1.0), saturate((0.72 - luminance) / max(1.0 - luminance, 0.001)));
+        sampled = blurred;
+        if (item.effect != 3) sampled.a *= t;
+    }
     sampled.rgb *= float3(item.color.r, item.color.g, item.color.b);
     sampled.a *= item.color.a * opacity * clip_mask(input.transformed, clip_index);
     sampled.rgb *= sampled.a;

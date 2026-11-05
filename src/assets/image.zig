@@ -287,6 +287,37 @@ fn encodeSrgb(value: f32) u8 {
     return @intFromFloat(@round(encoded * 255));
 }
 
+/// Worker-prepared, tightly packed straight-alpha sRGB pixels. `deinit` is
+/// also safe after adoption. Hashing belongs on the worker with decoding.
+pub const Prepared = struct {
+    allocator: std.mem.Allocator,
+    value: Image,
+    key: [32]u8,
+
+    /// Takes ownership on success only.
+    pub fn init(allocator: std.mem.Allocator, value: Image) Error!Prepared {
+        try validateImage(value);
+        if (value.stride != @as(usize, value.width) * 4 or value.pixels.len != value.stride * value.height or value.color_space != .srgb)
+            return error.InvalidImage;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(std.mem.asBytes(&value.width));
+        hash.update(std.mem.asBytes(&value.height));
+        hash.update(value.pixels);
+        return .{ .allocator = allocator, .value = value, .key = hash.finalResult() };
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, limits: Limits) Error!Prepared {
+        var value = try @import("image.zig").decode(allocator, bytes, limits);
+        errdefer value.deinit(allocator);
+        return init(allocator, value);
+    }
+
+    pub fn deinit(self: *Prepared) void {
+        self.allocator.free(self.value.pixels);
+        self.value.pixels = &.{};
+    }
+};
+
 pub const Limits = struct {
     maximum_width: u32 = 32_768,
     maximum_height: u32 = 32_768,

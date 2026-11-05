@@ -96,7 +96,7 @@ const GlyphEntry = struct {
     mode: api.RasterMode,
 };
 
-const UsedGlyph = struct { tile: handles.AtlasTileId, color: bool };
+const UsedGlyph = @import("../scene/retained.zig").GlyphUse;
 
 const GlyphContext = struct {
     pub fn hash(_: @This(), key: GlyphKey) u64 {
@@ -129,6 +129,7 @@ pub const System = struct {
     layouts: LayoutPool,
     layout_index: std.AutoHashMap(u64, handles.TextLayoutId),
     glyphs: GlyphMap,
+    glyph_keys: std.AutoHashMap(UsedGlyph, GlyphKey),
     layout_budget: usize,
     layout_bytes: usize = 0,
     frame: u64 = 0,
@@ -181,6 +182,7 @@ pub const System = struct {
             .layouts = LayoutPool.init(allocator),
             .layout_index = std.AutoHashMap(u64, handles.TextLayoutId).init(allocator),
             .glyphs = GlyphMap.init(allocator),
+            .glyph_keys = std.AutoHashMap(UsedGlyph, GlyphKey).init(allocator),
             .layout_budget = layout_budget,
             .scale_factor = scale_factor,
         };
@@ -192,6 +194,7 @@ pub const System = struct {
         self.layouts.deinit();
         self.layout_index.deinit();
         self.glyphs.deinit();
+        self.glyph_keys.deinit();
         self.glyph_atlas.deinit();
         self.color_glyph_atlas.deinit();
         self.used_glyphs.deinit(self.allocator);
@@ -215,6 +218,8 @@ pub const System = struct {
     pub fn painter(self: *System) scene_painter.TextPainter {
         return .{
             .context = self,
+            .glyph_uses_fn = glyphUses,
+            .reuse_glyphs_fn = reuseGlyphs,
             .paint_fn = paintOpaque,
             .paint_custom_fn = paintCustomOpaque,
             .measure_fn = measureCustomOpaque,
@@ -222,6 +227,28 @@ pub const System = struct {
             .caret_rect_fn = caretRectOpaque,
             .selection_rects_fn = selectionRectsOpaque,
         };
+    }
+
+    fn glyphUses(raw: *anyopaque) []const UsedGlyph {
+        const self: *System = @ptrCast(@alignCast(raw));
+        return self.used_glyphs.items;
+    }
+
+    fn reuseGlyphs(raw: *anyopaque, glyphs: []const UsedGlyph) Error!bool {
+        const self: *System = @ptrCast(@alignCast(raw));
+        // An atlas page can survive while a rectangle within it is recycled.
+        // Validate tile identities before replaying any cached sprite UVs.
+        for (glyphs) |used| {
+            const atlas = if (used.color) &self.color_glyph_atlas else &self.glyph_atlas;
+            if (atlas.get(used.tile) == null) return false;
+        }
+        try self.used_glyphs.ensureUnusedCapacity(self.allocator, glyphs.len);
+        for (glyphs) |used| {
+            const atlas = if (used.color) &self.color_glyph_atlas else &self.glyph_atlas;
+            try atlas.touch(used.tile, self.frame);
+            self.used_glyphs.appendAssumeCapacity(used);
+        }
+        return true;
     }
 
     pub fn measure(
@@ -316,6 +343,7 @@ pub const System = struct {
 
     pub fn deviceLost(self: *System) Error!void {
         self.glyphs.clearRetainingCapacity();
+        self.glyph_keys.clearRetainingCapacity();
         try self.glyph_atlas.deviceLost();
         try self.color_glyph_atlas.deviceLost();
     }
@@ -585,6 +613,7 @@ pub const System = struct {
                 self.counters.cache_hits +|= 1;
                 return cached.*;
             }
+            _ = self.glyph_keys.remove(.{ .tile = cached.tile, .color = cached.mode == .color });
             _ = self.glyphs.remove(key);
         }
         self.counters.cache_misses +|= 1;
@@ -612,7 +641,13 @@ pub const System = struct {
         const height: u16 = @intFromFloat(@ceil(rasterized.size.height));
         const color_glyph = rasterized.mode == .color;
         const active_atlas = if (color_glyph) &self.color_glyph_atlas else &self.glyph_atlas;
-        const tile = try active_atlas.allocate(width, height, self.frame, self.renderer.completedEpoch());
+        try self.glyphs.ensureUnusedCapacity(1);
+        try self.glyph_keys.ensureUnusedCapacity(1);
+        var eviction = GlyphEviction{ .system = self, .color = color_glyph };
+        const tile = try active_atlas.allocateNotifying(width, height, self.frame, self.renderer.completedEpoch(), .{
+            .context = &eviction,
+            .evicted = GlyphEviction.remove,
+        });
         errdefer active_atlas.release(tile) catch {};
         const atlas_tile = active_atlas.get(tile) orelse return error.InvalidHandle;
         const page_texture = active_atlas.pageTexture(atlas_tile.page) orelse return error.InvalidHandle;
@@ -633,9 +668,21 @@ pub const System = struct {
             .last_used_frame = self.frame,
             .mode = rasterized.mode,
         };
-        try self.glyphs.put(key, entry);
+        self.glyphs.putAssumeCapacity(key, entry);
+        self.glyph_keys.putAssumeCapacity(.{ .tile = tile, .color = color_glyph }, key);
         return entry;
     }
+
+    const GlyphEviction = struct {
+        system: *System,
+        color: bool,
+
+        fn remove(context: *anyopaque, tile: handles.AtlasTileId) void {
+            const self: *GlyphEviction = @ptrCast(@alignCast(context));
+            if (self.system.glyph_keys.fetchRemove(.{ .tile = tile, .color = self.color })) |removed|
+                _ = self.system.glyphs.remove(removed.value);
+        }
+    };
 
     fn makeLayoutRoom(self: *System, requested: usize) Error!void {
         if (requested > self.layout_budget) return error.BudgetExceeded;
@@ -1026,3 +1073,4 @@ fn layoutMatches(
         value.scale_factor == scale_factor and value.letter_spacing == style.letter_spacing and value.maximum_width == maximum_width and value.direction == style.direction and
         value.wrap == style.wrap and value.maximum_lines == style.maximum_lines;
 }
+

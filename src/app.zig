@@ -186,6 +186,7 @@ pub const App = struct {
                 .maximum_tasks = app_config.memory.worker_queue_capacity,
             }),
             .nodes = compose_store.Store.initWithLimits(allocator, .{
+                .retain_frame_work = app_config.retain_frame_work,
                 .maximum_nodes = app_config.memory.retained_node_count,
                 .maximum_depth = app_config.memory.retained_tree_depth,
                 .maximum_bytes = app_config.memory.retained_tree_bytes,
@@ -376,6 +377,7 @@ pub const App = struct {
             &self.actions,
         );
         target_window.router.setNativeTextInput(if (self.bundle.text_input) |text_input| text_input.bridge() else null);
+        target_window.retained_scene.budget.limit = self.app_config.memory.retained_scene_bytes;
         target_window.router.setNativeClipboard(if (self.bundle.clipboard) |clipboard| clipboard.bridge() else null);
         target_window.reported_refresh_millihertz = self.reported_refresh_millihertz;
         target_window.visible = options.platform.visible;
@@ -386,6 +388,7 @@ pub const App = struct {
     pub fn closeWindow(self: *App, id: handles.WindowId) Error!void {
         try self.assertMutationPhase();
         const target = self.window(id) orelse return error.InvalidHandle;
+        if (!try self.allowWindowClose(target)) return;
         try self.notifyWindowCloseRequested(target);
         if (self.coordinator.phase_state.callback_depth != 0) {
             if (target.close_scheduled) return;
@@ -1070,6 +1073,17 @@ pub const App = struct {
         } else return error.MissingCapability;
     }
 
+    /// Consumes the worker-prepared image on every outcome. GPU publication
+    /// stays on the UI thread; decoding and hashing do not.
+    pub fn adoptImage(self: *App, prepared: *@import("assets/image.zig").Prepared) Error!handles.TextureId {
+        defer prepared.deinit();
+        try self.assertMutationPhase();
+        if (comptime config.images_enabled) {
+            const manager = if (self.images) |*value| value else return error.MissingCapability;
+            return manager.adopt(prepared);
+        } else return error.MissingCapability;
+    }
+
     pub fn retainImage(self: *App, texture: handles.TextureId) Error!void {
         try self.assertMutationPhase();
         if (comptime config.images_enabled) {
@@ -1123,6 +1137,18 @@ pub const App = struct {
         if (comptime config.images_enabled) {
             const manager = if (self.images) |*value| value else return error.MissingCapability;
             return manager.loadAnimation(bytes, self.bundle.event_loop.clock.now());
+        } else return error.MissingCapability;
+    }
+
+    pub fn adoptAnimation(self: *App, prepared: *?@import("assets/animation.zig").Player) Error!handles.AnimationId {
+        defer if (prepared.*) |*player| {
+            player.deinit();
+            prepared.* = null;
+        };
+        try self.assertMutationPhase();
+        if (comptime config.images_enabled) {
+            const manager = if (self.images) |*value| value else return error.MissingCapability;
+            return manager.adoptAnimation(prepared, self.bundle.event_loop.clock.now());
         } else return error.MissingCapability;
     }
 
@@ -1482,6 +1508,7 @@ pub const App = struct {
                 if (comptime config.compiled_platform == .windows) target.occluded = false;
                 if (target.visible and self.coordinator.invalidations.isWindowDirty(id) and !target.occluded) {
                     self.renderWindow(target) catch |err| switch (err) {
+                        error.FrameNotReady => try self.requestFrame(target.id),
                         error.SurfaceLost => try self.recoverSurface(target),
                         error.DeviceLost => try self.recoverDevice(),
                         else => return err,
@@ -1489,6 +1516,7 @@ pub const App = struct {
                 }
             },
             .close_requested => {
+                if (!try self.allowWindowClose(target)) return;
                 try self.notifyWindowCloseRequested(target);
                 self.closeWindowInternal(id, true);
             },
@@ -1613,6 +1641,7 @@ pub const App = struct {
 
     fn renderWindow(self: *App, target: *Window) Error!void {
         if (target.state == .closed or target.state == .closing or target.logical_size.width <= 0 or target.logical_size.height <= 0) return;
+        self.nodes.setRetainedWorkTracking(self.app_config.retain_frame_work);
         // Focus-transition callbacks run after presentation and may close the
         // native window. Keep cleanup keyed by the generational value rather
         // than reading through `target` from a defer after that callback.
@@ -1688,6 +1717,7 @@ pub const App = struct {
         var root: handles.NodeId = .invalid;
         var layout_feedback: LayoutFeedback = .{ .coordinator = &self.coordinator };
         var engine: layout_engine.Engine = .{
+            .retain_frame_work = self.app_config.retain_frame_work,
             .scratch = scratch,
             .scale_factor = target.scale_factor,
             .measures = self.textMeasures(),
@@ -1745,13 +1775,21 @@ pub const App = struct {
         if (!root.isValid()) root = self.components.root(target.root_component) orelse return error.InvalidHandle;
 
         try self.coordinator.phase_state.transition(.preparing);
+        if (comptime config.text_enabled) {
+            // Paint-only frames also consume glyphs. Reset their submission
+            // list and advance atlas liveness before either paint or replay.
+            if (phases.scene) if (self.text) |*system|
+                system.beginFrame(frame_sequence, target.scale_factor);
+        }
         if (phases.prepare) {
             var timer = metrics.PhaseTimer.begin(&self.coordinator.counters, self.bundle.event_loop.clock, .prepare);
             defer timer.end();
             if (comptime config.text_enabled) {
                 if (self.text) |*system| {
-                    system.beginFrame(frame_sequence, target.scale_factor);
-                    try system.prepareTree(&self.nodes, root);
+                    // Cached scenes validate and touch their glyphs during
+                    // replay. Ordinary text paint prepares its own glyphs;
+                    // eagerly preparing the entire tree duplicates that work.
+                    if (!self.app_config.retain_frame_work) try system.prepareTree(&self.nodes, root);
                 }
             }
             if (comptime config.images_enabled) if (self.images) |*manager| manager.beginFrame(frame_sequence);
@@ -1773,6 +1811,9 @@ pub const App = struct {
             var builder = scene.Builder.init(scene_to_build, target.scene_limits);
             defer builder.deinit();
             var painter: scene_painter.Painter = .{
+                .retained = if (self.app_config.retain_frame_work) &target.retained_scene else null,
+                .counters = &self.coordinator.counters,
+                .device_generation = self.bundle.renderer.deviceGeneration(),
                 .builder = &builder,
                 .text = self.textPainter(),
                 .svg = self.svgServices(),
@@ -2148,6 +2189,13 @@ pub const App = struct {
         if (!self.closing and self.app_config.quit_when_last_window_closes and self.windows.live_count == 0) self.bundle.event_loop.requestQuit();
     }
 
+    fn allowWindowClose(self: *App, target: *Window) Error!bool {
+        const guard = self.app_config.window_close_guard orelse return true;
+        var callback_guard = try self.coordinator.phase_state.enterCallback();
+        defer callback_guard.deinit();
+        return guard.callback(guard.context, target.id);
+    }
+
     fn notifyWindowCloseRequested(self: *App, target: *Window) Error!void {
         if (target.close_callback_invoked) return;
         target.close_callback_invoked = true;
@@ -2217,6 +2265,7 @@ test "macOS Services action provisions an otherwise missing native menu" {
     const menu = [_]platform.MenuItem{.{ .application = .{ .items = &.{
         .{ .system_action = .{ .label = "Services", .action = .services } },
     } } }};
+    try app.setApplicationMenu(&menu);
     try app.setApplicationMenu(&menu);
 }
 

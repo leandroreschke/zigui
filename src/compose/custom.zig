@@ -8,6 +8,7 @@ const layout = @import("../layout/style.zig");
 const scene_abi = @import("../scene/abi.zig");
 const compose_style = @import("style.zig");
 const text_api = @import("../text/api.zig");
+const segmentation = @import("../text/segmentation.zig");
 
 /// A narrow view of the text engine made available to custom elements. It
 /// exposes shaped geometry and painting without giving elements ownership of
@@ -35,6 +36,36 @@ pub const TextServices = struct {
         const result = try self.measure_fn(self.context, value, style, constraints);
         if (!validSize(result)) return error.InvalidLayout;
         return result;
+    }
+
+    /// Fits a single line to its actual shaped width without splitting a
+    /// grapheme. A shortened result belongs to the supplied scratch allocator.
+    pub fn ellipsize(self: TextServices, allocator: std.mem.Allocator, value: []const u8, style: compose_style.TextStyle, width: f32) Error![]const u8 {
+        if (!std.math.isFinite(width) or width < 0 or style.wrap != .none) return error.InvalidLayout;
+        if ((try self.measure(value, style, .{})).width <= width) return value;
+        const suffix = "…";
+        if ((try self.measure(suffix, style, .{})).width > width) return "";
+        var boundaries: std.ArrayList(usize) = .empty;
+        defer boundaries.deinit(allocator);
+        try boundaries.append(allocator, 0);
+        var iterator: segmentation.GraphemeIterator = .{ .bytes = value };
+        while (try iterator.next()) |_| try boundaries.append(allocator, iterator.cursor);
+        const buffer = try allocator.alloc(u8, value.len + suffix.len);
+        defer allocator.free(buffer);
+        @memcpy(buffer[0..value.len], value);
+        var low: usize = 0;
+        var high = boundaries.items.len - 1;
+        while (low < high) {
+            const middle = low + (high - low + 1) / 2;
+            const end = boundaries.items[middle];
+            @memcpy(buffer[0..end], value[0..end]);
+            @memcpy(buffer[end..][0..suffix.len], suffix);
+            if ((try self.measure(buffer[0 .. end + suffix.len], style, .{})).width <= width) low = middle else high = middle - 1;
+        }
+        const end = boundaries.items[low];
+        @memcpy(buffer[0..end], value[0..end]);
+        @memcpy(buffer[end..][0..suffix.len], suffix);
+        return allocator.dupe(u8, buffer[0 .. end + suffix.len]);
     }
 
     pub fn paint(self: TextServices, scene_context: *anyopaque, value: []const u8, style: compose_style.TextStyle, bounds: geometry.Rect) Error!void {
@@ -96,6 +127,28 @@ pub const TextServices = struct {
         try output.appendSlice(allocator, staging.items);
     }
 };
+
+test "ellipsize fits shaped text and preserves complete graphemes" {
+    const Probe = struct {
+        fn measure(_: *anyopaque, value: []const u8, _: compose_style.TextStyle, _: layout.Constraints) Error!geometry.Size {
+            var iterator: segmentation.GraphemeIterator = .{ .bytes = value };
+            var width: f32 = 0;
+            while (try iterator.next()) |cluster| width += if (std.mem.eql(u8, cluster, "W")) 20 else 10;
+            return .{ .width = width, .height = 14 };
+        }
+    };
+    var context: u8 = 0;
+    const services: TextServices = .{ .context = &context, .measure_fn = Probe.measure };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const style: compose_style.TextStyle = .{ .wrap = .none };
+    try std.testing.expectEqualStrings("short", try services.ellipsize(allocator, "short", style, 50));
+    try std.testing.expectEqualStrings("W…", try services.ellipsize(allocator, "WWWW", style, 35));
+    try std.testing.expectEqualStrings("e\u{301}👩‍💻…", try services.ellipsize(allocator, "e\u{301}👩‍💻abcd", style, 30));
+    try std.testing.expectEqualStrings("…", try services.ellipsize(allocator, "name", style, 10));
+    try std.testing.expectEqualStrings("", try services.ellipsize(allocator, "name", style, 5));
+}
 
 /// Optional vector-asset access exposed to custom elements. The service keeps
 /// ownership, parsing caches, and scene internals inside the App; elements use

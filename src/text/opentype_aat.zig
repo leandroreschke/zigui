@@ -228,7 +228,8 @@ fn applyNoncontextual(
         if (glyph.id == deleted_glyph or !try glyphEnabled(features, default_flags, subfeature_flags, options, glyph.*)) continue;
         const replacement = (try lookupU16(body, glyph.id, glyph_count)) orelse continue;
         if (replacement == 0) continue;
-        if (replacement >= glyph_count) return error.InvalidFont;
+        // AAT uses 0xffff to delete a glyph; apply() compacts these after the subtable.
+        if (replacement != deleted_glyph and replacement >= glyph_count) return error.InvalidFont;
         glyph.id = @intCast(replacement);
     }
 }
@@ -846,6 +847,42 @@ test "AAT lookup formats map bounded glyph ranges" {
 
     const format10 = [_]u8{ 0, 10, 0, 1, 0, 50, 0, 3, 4, 5, 6 };
     try testing.expectEqual(@as(?u32, 6), try lookupU16(&format10, 52, 64));
+}
+
+test "AAT noncontextual deletion preserves surrounding glyphs and clusters" {
+    const testing = std.testing;
+    const options: layout.Options = .{ .script = "latn".*, .direction = .left_to_right };
+    // Format 8: glyph 20 is substituted, 21 deleted, and 22 retained.
+    const body = [_]u8{ 0, 8, 0, 20, 0, 3, 0, 30, 0xff, 0xff, 0, 22 };
+    var buffer: layout.Buffer = .{};
+    defer buffer.deinit(testing.allocator);
+    try buffer.glyphs.appendSlice(testing.allocator, &.{
+        .{ .id = 20, .cluster_utf8 = 0, .scalar = 'a' },
+        .{ .id = 21, .cluster_utf8 = 1, .scalar = 0x200d },
+        .{ .id = 22, .cluster_utf8 = 4, .scalar = 'b' },
+    });
+    try applyNoncontextual(&buffer, &body, &.{}, 1, 1, options, 64);
+    compactDeleted(&buffer);
+    try testing.expectEqual(@as(usize, 2), buffer.glyphs.items.len);
+    try testing.expectEqual(@as(u16, 30), buffer.glyphs.items[0].id);
+    try testing.expectEqual(@as(u32, 0), buffer.glyphs.items[0].cluster_utf8);
+    try testing.expectEqual(@as(u16, 22), buffer.glyphs.items[1].id);
+    try testing.expectEqual(@as(u32, 4), buffer.glyphs.items[1].cluster_utf8);
+
+    buffer.glyphs.clearRetainingCapacity();
+    try buffer.glyphs.append(testing.allocator, .{ .id = 21, .cluster_utf8 = 0, .scalar = 0x200d });
+    try applyNoncontextual(&buffer, &body, &.{}, 1, 1, options, 64);
+    compactDeleted(&buffer);
+    try testing.expectEqual(@as(usize, 0), buffer.glyphs.items.len);
+}
+
+test "AAT noncontextual substitution still rejects invalid glyph indices" {
+    const testing = std.testing;
+    const body = [_]u8{ 0, 8, 0, 20, 0, 1, 0, 64 };
+    var buffer: layout.Buffer = .{};
+    defer buffer.deinit(testing.allocator);
+    try buffer.glyphs.append(testing.allocator, .{ .id = 20, .cluster_utf8 = 0, .scalar = 'a' });
+    try testing.expectError(error.InvalidFont, applyNoncontextual(&buffer, &body, &.{}, 1, 1, .{ .script = "latn".*, .direction = .left_to_right }, 64));
 }
 
 test "AAT ligature state machine joins three components" {

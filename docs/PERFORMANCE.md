@@ -14,7 +14,7 @@ from implementation style alone.
   releases capacity above its retention threshold on reset.
 - No per-frame GPU resource is created after warm-up.
 - Component reconciliation is limited to invalidated component boundaries.
-  Scene generation visits the current visible retained tree; virtual lists and
+  Layout and scene generation reuse eligible unchanged subtrees; virtual lists and
   spatial canvases expose only visible plus overscan content, never their total
   logical data set.
 - Every framework-owned retained cache and object table has a hard byte or
@@ -53,6 +53,50 @@ not schedule frames or impose a refresh-rate policy. A zero reported refresh
 rate disables only deadline accounting; timestamp and percentile evidence
 remain available.
 Detailed journaling is compile-time optional.
+
+## Retained frame work
+
+`AppConfig.retain_frame_work` enables cached measurement, arrangement, and
+built-in component scenes. It defaults to `true`; setting it to `false` keeps
+the full-work reference path for comparisons. Idle windows still submit no
+frames, and active frames still send a complete scene to the GPU.
+
+Reuse requires matching subtree revisions, constraints or bounds, scale, and
+device generation where applicable. Four fixed measurement slots per node
+retain flex layout's repeated constraint combinations without allocating.
+Glyph reuse checks atlas tile identities
+and records their use for GPU completion. Custom callbacks and portal subtrees
+remain on the ordinary evaluation path because they can depend on mutable
+state or containing geometry. Frequently changing components draw directly;
+scene caches are populated only after their inputs repeat.
+
+The scene cache has a per-window `MemoryBudgets.retained_scene_bytes` limit
+(16 MiB by default), including metadata and glyph references. Zero disables
+scene caching while leaving layout retention enabled. Capacity exhaustion
+uses ordinary painting. Layout caches are fixed fields in node records,
+bounded by the existing `retained_node_count` limit.
+
+Component reconciliation tracks changes automatically. Low-level callers that
+mutate `NodeStore` records or change external measurement-provider state must
+call `invalidateRetainedWork()` before the next retained frame. Low-level
+`LayoutEngine` use remains opt-in through `retain_frame_work`.
+
+`zig build retained-test -Dplatform=headless -Drenderer=null` compares complete
+scenes, layout, hit testing, and accessibility through deterministic changes,
+cache exhaustion, and atlas invalidation. With `-Dplatform=macos
+-Drenderer=metal`, it also compares native Metal readback pixels.
+
+`zig build retained-bench -Dplatform=headless -Drenderer=null
+-Doptimize=ReleaseFast` compares alternating full and retained runs with real
+text, partial updates, all-panel geometry changes, animation, scrolling, and
+resizing. It reports p50/p95 frame times, allocations, memory, scene counts,
+and cache use. These headless CPU measurements do not measure GPU execution
+or input-to-present latency.
+
+`zig build retained-bench-native -Dplatform=macos -Drenderer=metal
+-Doptimize=ReleaseFast` runs the same workload through native windows and Metal.
+Its phase timings cover instrumented CPU work through submission; wall timings
+also include waiting for frame callbacks. Neither is a GPU execution timer.
 
 Allocator byte counters require the caller to wrap its allocator with
 `core.TrackedAllocator`; the remaining framework counters do not. Path cache

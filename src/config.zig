@@ -65,6 +65,12 @@ pub const WindowCloseCallback = struct {
     }
 };
 
+/// Return false to cancel a close without terminating the event loop.
+pub const WindowCloseGuard = struct {
+    context: *anyopaque,
+    callback: *const fn (*anyopaque, handles.WindowId) Error!bool,
+};
+
 pub const AppConfig = struct {
     application_name: []const u8 = "ZigUI application",
     application_version: []const u8 = "",
@@ -74,7 +80,11 @@ pub const AppConfig = struct {
     pointer_event_coalescing: PointerEventCoalescing = .platform_default,
     quit_when_last_window_closes: bool = true,
     window_close_callback: ?WindowCloseCallback = null,
+    window_close_guard: ?WindowCloseGuard = null,
     allow_multiple_apps_for_testing: bool = false,
+    /// Reuse unchanged layout and built-in component drawing work. Disable
+    /// for a full-work reference when profiling or checking frame equivalence.
+    retain_frame_work: bool = true,
 };
 
 pub fn validate(value: AppConfig) Error!void {

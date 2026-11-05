@@ -11,7 +11,7 @@ struct Affine { float m11; float m12; float m21; float m22; float tx; float ty; 
 struct Quad { Rect bounds; Color background; Color border_color; Insets border_widths; Radii radii; };
 struct Shadow { Rect bounds; Color color; Radii radii; Point offset; float blur_radius; float spread; };
 struct Underline { Rect bounds; Color color; float thickness; float wave_amplitude; float wave_period; float reserved; };
-struct Sprite { Rect bounds; Rect uv_bounds; Color color; ulong texture; uint tile_generation; uint format; };
+struct Sprite { Rect bounds; Rect uv_bounds; Color color; ulong texture; uint tile_generation; uint format; uint effect; float effect_radius; float effect_height; uint effect_reserved; };
 struct ExternalSurface { Rect bounds; Rect uv_bounds; ulong surface; uint generation; uint color_space; float opacity; float reserved; };
 struct Material { uint kind; uint stop_start; uint stop_count; uint reserved; Color color; Point start; Point end; Affine gradient_transform; };
 struct GradientStop { float offset; float reserved0; float reserved1; float reserved2; Color color; };
@@ -179,10 +179,12 @@ fragment float4 quad_fragment(VertexOut in [[stage_in]], const device Quad *item
             max(0.0, item.radii.bottom_left - max(item.border_widths.left, item.border_widths.bottom))
         };
         float inner_mask = inner.size.width > 0.0 && inner.size.height > 0.0 ? rounded_mask(in.world, inner, inner_radii) : 0.0;
-        float border_alpha = item.border_color.a * outer_mask;
+        inner_mask = min(inner_mask, outer_mask);
+        // Border and fill occupy disjoint coverage, even when the fill is transparent.
+        float border_alpha = item.border_color.a * (outer_mask - inner_mask);
         float fill_alpha = fill.a * inner_mask;
-        result.a = fill_alpha + border_alpha * (1.0 - fill_alpha);
-        result.rgb = fill.rgb * fill_alpha + float3(item.border_color.r, item.border_color.g, item.border_color.b) * border_alpha * (1.0 - fill_alpha);
+        result.a = fill_alpha + border_alpha;
+        result.rgb = fill.rgb * fill_alpha + float3(item.border_color.r, item.border_color.g, item.border_color.b) * border_alpha;
     }
     float coverage = clip_mask(in.transformed, globals.clip_index, clips) * globals.opacity;
     return float4(result.rgb * coverage, result.a * coverage);
@@ -254,6 +256,23 @@ fragment float4 color_sprite_fragment(VertexOut in [[stage_in]], const device Sp
     Sprite item = items[in.instance];
     float2 uv = float2(item.uv_bounds.origin.x, item.uv_bounds.origin.y) + in.local * float2(item.uv_bounds.size.width, item.uv_bounds.size.height);
     float4 sampled = texture.sample(sample_filter, uv);
+    if (item.effect != 0) {
+        float t = item.effect == 3 ? 1.0 : clamp((in.local.y * item.bounds.size.height - (item.bounds.size.height - item.effect_height)) / max(item.effect_height, 0.001), 0.0, 1.0);
+        t = t * t * (3.0 - 2.0 * t);
+        float2 delta = float2(item.uv_bounds.size.width / max(item.bounds.size.width, 0.001), item.uv_bounds.size.height / max(item.bounds.size.height, 0.001)) * item.effect_radius * t;
+        float2 low = float2(item.uv_bounds.origin.x, item.uv_bounds.origin.y);
+        float2 high = low + float2(item.uv_bounds.size.width, item.uv_bounds.size.height);
+        float4 blurred = sampled * 0.4;
+        blurred += texture.sample(sample_filter, clamp(uv + float2(delta.x, 0.0), low, high)) * 0.15;
+        blurred += texture.sample(sample_filter, clamp(uv - float2(delta.x, 0.0), low, high)) * 0.15;
+        blurred += texture.sample(sample_filter, clamp(uv + float2(0.0, delta.y), low, high)) * 0.15;
+        blurred += texture.sample(sample_filter, clamp(uv - float2(0.0, delta.y), low, high)) * 0.15;
+        float luminance = dot(blurred.rgb, float3(0.2126, 0.7152, 0.0722));
+        if (item.effect == 1) blurred.rgb *= min(1.0, 0.22 / max(luminance, 0.001));
+        else if (item.effect == 2) blurred.rgb = mix(blurred.rgb, float3(1.0), clamp((0.72 - luminance) / max(1.0 - luminance, 0.001), 0.0, 1.0));
+        sampled = blurred;
+        if (item.effect != 3) sampled.a *= t;
+    }
     sampled.rgb *= float3(item.color.r, item.color.g, item.color.b);
     sampled.a *= item.color.a * globals.opacity * clip_mask(in.transformed, globals.clip_index, clips);
     sampled.rgb *= sampled.a;

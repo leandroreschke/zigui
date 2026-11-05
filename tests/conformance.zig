@@ -652,6 +652,62 @@ test "component frame hook follows the platform clock and stops requesting frame
     try testing.expect(!(try app.step(false)));
 }
 
+test "deferred drawable frames keep input live and preserve dirty content" {
+    var text_backend_instance = try ui.InTreeTextBackend.createInstance(testing.allocator, 8 * 1024 * 1024, 16 * 1024 * 1024, 64, 64, 64 * 1024);
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, text_backend_instance.interface());
+    const bundle = harness.bundle;
+    harness.bundle = undefined;
+    const app = try ui.App.createWithBundle(testing.allocator, .{
+        .application_name = "deferred drawable test",
+        .allow_multiple_apps_for_testing = true,
+    }, bundle);
+    defer app.destroy() catch unreachable;
+    var model: CustomEventInvalidationProbe = .{};
+    const window = try app.openWindow(.{ .platform = .{ .title = "deferred", .size = .{ .width = 320, .height = 240 } } }, ui.Component.Descriptor.from(CustomEventInvalidationProbe, &model));
+    while (try app.step(false)) {}
+    const before = try app.metricsSnapshot();
+    const original = app.bundle.renderer.vtable;
+    const Gate = struct {
+        var ready: bool = false;
+        var attempts: usize = 0;
+        var begin: @TypeOf(original.begin_frame) = undefined;
+        fn beginFrame(raw: *anyopaque, descriptor: ui.render.FrameDescriptor) ui.Error!ui.render.FrameToken {
+            attempts += 1;
+            if (!ready) return error.FrameNotReady;
+            return begin(raw, descriptor);
+        }
+    };
+    Gate.ready = false;
+    Gate.attempts = 0;
+    Gate.begin = original.begin_frame;
+    var table = original.*;
+    table.begin_frame = Gate.beginFrame;
+    app.bundle.renderer.vtable = &table;
+    defer app.bundle.renderer.vtable = original;
+    try app.invalidateWindow(window);
+    for (0..4) |_| _ = try app.step(false);
+    try testing.expect(Gate.attempts > 0);
+    try testing.expectEqual(before.frames_submitted, (try app.metricsSnapshot()).frames_submitted);
+    try harness.post(window, .{ .input = .{ .pointer_down = .{ .position = .{ .x = 20, .y = 20 }, .button = .primary } } });
+    for (0..8) |_| {
+        _ = try app.step(false);
+        if (model.events > 0) break;
+    }
+    try testing.expectEqual(@as(usize, 1), model.events);
+    try testing.expectEqual(before.frames_submitted, (try app.metricsSnapshot()).frames_submitted);
+    Gate.ready = true;
+    var settled = false;
+    for (0..16) |_| {
+        if (!try app.step(false)) {
+            settled = true;
+            break;
+        }
+    }
+    try testing.expect(settled);
+    try testing.expectEqual(before.frames_submitted + 1, (try app.metricsSnapshot()).frames_submitted);
+    try testing.expect(!app.coordinator.invalidations.isWindowDirty(window));
+}
+
 test "App records presented timestamps and leaves presentation counters idle" {
     const app = try ui.App.create(testing.allocator, .{
         .application_name = "presentation metrics test",
@@ -4139,6 +4195,86 @@ test "text field setValue preserves committed text across allocation failures" {
     try testing.checkAllAllocationFailures(testing.allocator, textFieldSetValueAllocationProbe, .{});
 }
 
+test "button clicks keep focus without a ring and keyboard navigation restores it" {
+    const Model = struct {
+        button: ui.widgets.Button = undefined,
+        other: ui.widgets.Button = undefined,
+        activations: usize = 0,
+        paint: ui.style.PaintStyle = .{},
+
+        pub fn build(self: *@This(), ctx: *ui.Component.BuildContext) ui.Error!ui.NodeSpec {
+            var first = try self.button.build(ctx);
+            var second = try self.other.build(ctx);
+            // Exercise icon-only controls without depending on installed fonts.
+            first.children = &.{};
+            second.children = &.{};
+            first.style.layout.width = .{ .points = 120 };
+            second.style.layout.width = .{ .points = 120 };
+            self.paint = first.style.paint;
+            return .{
+                .style = .{ .layout = .{ .direction = .column, .align_items = .start } },
+                .children = try ctx.allocator.dupe(ui.NodeSpec, &.{ first.withKey(1), second.withKey(2) }),
+            };
+        }
+
+        pub fn activate(self: *@This(), _: *ui.input.Context) void {
+            self.activations += 1;
+        }
+    };
+    var model: Model = .{};
+    const callback = ui.widgets.Callback.from(Model, &model, "activate");
+    model.button = .{ .label = "Sort direction", .on_activate = callback };
+    model.other = .{ .label = "Other", .on_activate = callback };
+    var text_backend_instance = try ui.InTreeTextBackend.createInstance(testing.allocator, 8 * 1024 * 1024, 16 * 1024 * 1024, 64, 64, 64 * 1024);
+    var harness = try ui.HeadlessPlatform.create(testing.allocator, text_backend_instance.interface());
+    const bundle = harness.bundle;
+    harness.bundle = undefined;
+    const app = try ui.App.createWithBundle(testing.allocator, .{
+        .application_name = "button focus visibility test",
+        .allow_multiple_apps_for_testing = true,
+    }, bundle);
+    defer app.destroy() catch unreachable;
+    const window = try app.openWindow(.{ .platform = .{ .title = "button focus", .size = .{ .width = 320, .height = 240 } } }, ui.Component.Descriptor.from(Model, &model));
+    while (try app.step(false)) {}
+
+    // Repeat after keyboard activation to cover clicking an already focused button.
+    for (0..2) |click| {
+        try harness.post(window, .{ .input = .{ .pointer_down = .{ .position = .{ .x = 10, .y = 10 }, .button = .primary } } });
+        while (try app.step(false)) {}
+        try testing.expect(model.button.focused and model.button.pressed);
+        try testing.expect(!model.button.focusVisible());
+        try testing.expectEqual(model.button.theme.border, model.paint.border.color);
+        try testing.expectEqual(model.button.theme.surface_pressed, model.paint.background.solid);
+
+        try harness.post(window, .{ .input = .{ .pointer_up = .{ .position = .{ .x = 10, .y = 10 }, .button = .primary } } });
+        while (try app.step(false)) {}
+        try testing.expectEqual(click * 2 + 1, model.activations);
+        try testing.expect(model.button.focused and !model.button.pressed);
+        try testing.expect(!model.button.focusVisible());
+        try testing.expectEqual(model.button.theme.surface_hovered, model.paint.background.solid);
+
+        try harness.post(window, .{ .input = .{ .pointer_move = .{ .position = .{ .x = 300, .y = 200 } } } });
+        while (try app.step(false)) {}
+        try testing.expect(!model.button.hovered and !model.button.focusVisible());
+        try testing.expectEqual(model.button.theme.surface, model.paint.background.solid);
+        try testing.expectEqual(model.button.theme.border, model.paint.border.color);
+
+        try harness.post(window, .{ .input = .{ .key_down = .{ .key = .enter, .physical_code = 0 } } });
+        while (try app.step(false)) {}
+        try testing.expectEqual(click * 2 + 2, model.activations);
+        try testing.expect(model.button.focusVisible());
+        try testing.expectEqual(model.button.theme.focus_ring, model.paint.border.color);
+    }
+
+    try harness.post(window, .{ .input = .{ .key_down = .{ .key = .tab, .physical_code = 0 } } });
+    while (try app.step(false)) {}
+    try testing.expect(!model.button.focused and model.other.focusVisible());
+    try harness.post(window, .{ .input = .{ .key_down = .{ .key = .tab, .physical_code = 0, .modifiers = .{ .shift = true } } } });
+    while (try app.step(false)) {}
+    try testing.expect(model.button.focusVisible() and !model.other.focused);
+    try testing.expectEqual(model.button.theme.focus_ring, model.paint.border.color);
+}
+
 test "disabled standard controls expose no invokable accessibility actions" {
     var scratch = std.heap.ArenaAllocator.init(testing.allocator);
     defer scratch.deinit();
@@ -5966,4 +6102,128 @@ fn sceneSnapshotAllocationProbe(allocator: std.mem.Allocator) !void {
     defer snapshot.deinit();
     try testing.expectEqual(source.operations.len, snapshot.view().operations.len);
     try testing.expectEqual(source.quads.len, snapshot.view().quads.len);
+}
+
+test "owned texture pixels survive recovery and retire with their original allocator" {
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    defer renderer.deinit();
+    var resources = ui.resources.Manager.init(testing.allocator, 256, 256);
+    defer resources.deinit();
+    const pixels = try testing.allocator.alloc(u8, 64);
+    @memset(pixels, 127);
+    const id = try resources.createTextureOwned(.{ .width = 4, .height = 4, .format = .rgba8 }, pixels, testing.allocator);
+    try testing.expectEqual(pixels.ptr, resources.get(id).?.cpu_copy.?.ptr);
+    try resources.realize(renderer, id);
+    try renderer.recover(.{});
+    resources.deviceLost();
+    try resources.realize(renderer, id);
+    try resources.markUsed(id, 5);
+    try resources.destroyTextureOnRenderer(renderer, id);
+    resources.collect(4);
+    try testing.expectEqual(@as(usize, 64), resources.stats().cpu_reserved);
+    resources.collect(5);
+    try testing.expectEqual(@as(usize, 0), resources.stats().cpu_reserved);
+}
+
+test "owned texture rejection leaves pixel ownership with caller" {
+    var resources = ui.resources.Manager.init(testing.allocator, 1, 1);
+    defer resources.deinit();
+    const pixels = try testing.allocator.alloc(u8, 64);
+    defer testing.allocator.free(pixels);
+    try testing.expectError(error.BudgetExceeded, resources.createTextureOwned(.{ .width = 4, .height = 4, .format = .rgba8 }, pixels, testing.allocator));
+    try testing.expectEqual(@as(usize, 0), resources.stats().cpu_reserved);
+}
+
+test "atlas eviction notifies the owner with the removed generation" {
+    const Probe = struct {
+        removed: ?ui.core.handles.AtlasTileId = null,
+        fn evicted(raw: *anyopaque, id: ui.core.handles.AtlasTileId) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.removed = id;
+        }
+    };
+    var resources = ui.resources.Manager.init(testing.allocator, 1024, 0);
+    defer resources.deinit();
+    var atlas = try ui.atlas.Atlas.init(testing.allocator, &resources, 4, 1, .a8);
+    defer atlas.deinit();
+    var probe = Probe{};
+    const first = try atlas.allocate(4, 4, 1, 0);
+    const second = try atlas.allocateNotifying(4, 4, 2, 0, .{ .context = &probe, .evicted = Probe.evicted });
+    try testing.expect(probe.removed.?.eql(first));
+    try testing.expect(!second.eql(first));
+    try testing.expect(atlas.get(first) == null);
+}
+
+test "prepared images transfer once including duplicate and rejected uploads" {
+    if (comptime !ui.config.images_enabled) return;
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    defer renderer.deinit();
+    var resources = ui.resources.Manager.init(testing.allocator, 64, 64);
+    defer resources.deinit();
+    var manager = ui.ImageManager.init(testing.allocator, renderer, &resources, .{});
+    defer manager.deinit();
+    const pixels = try testing.allocator.alloc(u8, 64);
+    @memset(pixels, 255);
+    var prepared = try ui.image.Prepared.init(testing.allocator, .{ .width = 4, .height = 4, .stride = 16, .pixels = pixels });
+    defer prepared.deinit();
+    const id = try manager.adopt(&prepared);
+    try testing.expectEqual(@as(usize, 0), prepared.value.pixels.len);
+    try testing.expectEqual(pixels.ptr, resources.get(id).?.cpu_copy.?.ptr);
+    const duplicate = try testing.allocator.alloc(u8, 64);
+    @memset(duplicate, 255);
+    var second = try ui.image.Prepared.init(testing.allocator, .{ .width = 4, .height = 4, .stride = 16, .pixels = duplicate });
+    defer second.deinit();
+    try testing.expect((try manager.adopt(&second)).eql(id));
+    try testing.expectEqual(@as(usize, 0), second.value.pixels.len);
+    const other = try testing.allocator.alloc(u8, 64);
+    @memset(other, 127);
+    var rejected = try ui.image.Prepared.init(testing.allocator, .{ .width = 4, .height = 4, .stride = 16, .pixels = other });
+    defer rejected.deinit();
+    try testing.expectError(error.BudgetExceeded, manager.adopt(&rejected));
+    try testing.expectEqual(@as(usize, 0), rejected.value.pixels.len);
+    try manager.release(id);
+    try manager.release(id);
+    resources.collect(renderer.completedEpoch());
+    try testing.expectEqual(@as(usize, 0), resources.stats().cpu_reserved);
+}
+
+test "continuous zoom keeps glyph metadata bounded by live atlas tiles" {
+    const Valid = struct {
+        fn font(_: *anyopaque, _: ui.text.FontDescriptor) ui.Error!handles.FontId {
+            return handles.FontId.init(0, 1);
+        }
+        fn metrics(_: *anyopaque, _: handles.FontId, _: f32) ui.Error!ui.text.FontMetrics {
+            return .{ .ascent = 10, .descent = 2, .leading = 0, .x_height = 5, .cap_height = 7, .underline_position = 1, .underline_thickness = 1 };
+        }
+        fn shape(raw: *anyopaque, request: ui.text.ShapeRequest, allocator: std.mem.Allocator) ui.Error!ui.text.ShapedRun {
+            var result = try MalformedTextBackend.shape(raw, request, allocator);
+            result.width = 1;
+            return result;
+        }
+        fn rasterize(raw: *anyopaque, request: ui.text.RasterRequest, allocator: std.mem.Allocator) ui.Error!ui.text.RasterizedGlyph {
+            var result = try MalformedTextBackend.rasterize(raw, request, allocator);
+            result.stride = 2;
+            return result;
+        }
+    };
+    var probe = MalformedTextBackend{};
+    var backend = probe.backend();
+    backend.resolve_font_fn = Valid.font;
+    backend.metrics_fn = Valid.metrics;
+    backend.shape_fn = Valid.shape;
+    backend.rasterize_fn = Valid.rasterize;
+    const renderer = try ui.NullRenderer.create(testing.allocator);
+    defer renderer.deinit();
+    var resources = ui.resources.Manager.init(testing.allocator, 16 * 1024 * 1024, 0);
+    defer resources.deinit();
+    var counters = ui.core.metrics.Counters{};
+    var system = try ui.TextSystem.init(testing.allocator, backend, renderer, &resources, try ui.ScaleFactor.init(1), 1024 * 1024, 5 * 1024 * 1024, 4, &counters);
+    defer system.deinit();
+    for (0..512) |index| {
+        system.beginFrame(index + 1, try ui.ScaleFactor.init(1));
+        _ = try system.prepare("A", .{ .font_size = 12 + @as(f32, @floatFromInt(index)) / 128 }, 100);
+        try testing.expect(system.glyphs.count() <= 4);
+        try testing.expectEqual(system.glyphs.count(), system.glyph_keys.count());
+    }
+    try testing.expectEqual(@as(u32, 4), system.glyphs.count());
 }

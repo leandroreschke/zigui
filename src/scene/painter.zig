@@ -10,9 +10,13 @@ const layout = @import("../layout/style.zig");
 const abi = @import("abi.zig");
 const scene = @import("scene.zig");
 const text_api = @import("../text/api.zig");
+const retained = @import("retained.zig");
+const metrics = @import("../core/metrics.zig");
 
 pub const TextPainter = struct {
     context: *anyopaque,
+    glyph_uses_fn: ?*const fn (*anyopaque) []const retained.GlyphUse = null,
+    reuse_glyphs_fn: ?*const fn (*anyopaque, []const retained.GlyphUse) Error!bool = null,
     paint_fn: *const fn (*anyopaque, *scene.Builder, []const u8, compose_style.TextStyle, geometry.Rect) Error!void,
     paint_custom_fn: *const fn (*anyopaque, *anyopaque, []const u8, compose_style.TextStyle, geometry.Rect) Error!void,
     measure_fn: *const fn (*anyopaque, []const u8, compose_style.TextStyle, layout.Constraints) Error!geometry.Size,
@@ -57,8 +61,12 @@ pub const Painter = struct {
     svg: ?custom.SvgServices = null,
     scratch: std.mem.Allocator,
     scale_factor: geometry.ScaleFactor,
+    retained: ?*retained.Cache = null,
+    counters: ?*metrics.Counters = null,
+    device_generation: u32 = 0,
 
     pub fn paint(self: *Painter, nodes: *const compose_store.Store, root: handles.NodeId) Error!void {
+        if (self.retained) |cache| cache.beginFrame();
         var portals: std.ArrayList(PortalCandidate) = .empty;
         defer portals.deinit(self.scratch);
         try self.paintNode(nodes, root, false, &portals);
@@ -99,6 +107,8 @@ pub const Painter = struct {
             });
             return;
         }
+
+        if (try self.paintRetained(nodes, id, record)) return;
 
         const has_transform = !std.meta.eql(borrowed.paint.transform, geometry.Affine2D.identity);
         const has_opacity = borrowed.paint.opacity < 0.9999;
@@ -205,6 +215,71 @@ pub const Painter = struct {
         if (opacity_layer) try self.builder.popLayer();
         if (transform_layer) try self.builder.popLayer();
         if (borrowed.paint.backdrop_effect == null and has_layer) try self.builder.popLayer();
+    }
+
+    fn paintRetained(self: *Painter, nodes: *const compose_store.Store, id: handles.NodeId, record: *const compose_store.Record) Error!bool {
+        const cache = self.retained orelse return false;
+        const counters = self.counters orelse return false;
+        if (!record.retention_safe or !record.component.isValid()) return false;
+        // Component roots provide useful reuse boundaries without allocating
+        // a second cached scene for every label and container in the tree.
+        if (nodes.getConst(record.parent)) |parent| {
+            if (parent.component.eql(record.component)) return false;
+        }
+        if (self.text) |text| {
+            if (text.glyph_uses_fn == null or text.reuse_glyphs_fn == null) return false;
+        }
+        const found = cache.lookup(id, .{
+            .revision = record.subtree_revision,
+            .store_generation = nodes.retainedWorkGeneration(),
+            .layout_result = record.layout,
+            .scale = self.scale_factor,
+            .device_generation = self.device_generation,
+        }, counters) orelse return false;
+        const entry = found.entry;
+        if (entry.valid) {
+            const glyphs_valid = if (self.text) |text|
+                try text.reuse_glyphs_fn.?(text.context, entry.glyphs.items)
+            else
+                entry.glyphs.items.len == 0;
+            if (glyphs_valid) {
+                try self.builder.appendRetained(&entry.scene);
+                counters.retained_scene_hits +|= 1;
+                return true;
+            }
+            entry.valid = false;
+        }
+        if (!found.admit) return false;
+        const denied_before = cache.budget.denied;
+        self.buildRetained(nodes, id, entry) catch |err| {
+            // Cache capacity is optional. Only its own budget exhaustion
+            // takes the ordinary paint path; other failures remain errors.
+            if (err != error.OutOfMemory or cache.budget.denied == denied_before) return err;
+            cache.discard(entry);
+            counters.retained_scene_budget_skips +|= 1;
+            return false;
+        };
+        try self.builder.appendRetained(&entry.scene);
+        return true;
+    }
+
+    fn buildRetained(self: *Painter, nodes: *const compose_store.Store, id: handles.NodeId, entry: *retained.Entry) Error!void {
+        entry.valid = false;
+        const glyph_start = if (self.text) |text| text.glyph_uses_fn.?(text.context).len else 0;
+        var builder = scene.Builder.init(&entry.scene, self.builder.limits);
+        defer builder.deinit();
+        var painter: Painter = .{
+            .builder = &builder,
+            .text = self.text,
+            .svg = self.svg,
+            .scratch = self.scratch,
+            .scale_factor = self.scale_factor,
+        };
+        try painter.paint(nodes, id);
+        try builder.finish();
+        entry.glyphs.clearRetainingCapacity();
+        if (self.text) |text| try entry.glyphs.appendSlice(entry.scene.allocator, text.glyph_uses_fn.?(text.context)[glyph_start..]);
+        entry.valid = true;
     }
 
     fn materialForBrush(self: *Painter, brush: compose_style.Brush, bounds: geometry.Rect) Error!?u32 {

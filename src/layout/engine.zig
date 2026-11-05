@@ -46,10 +46,25 @@ pub const Engine = struct {
     scratch: std.mem.Allocator,
     scale_factor: geometry.ScaleFactor,
     measures: MeasureProvider,
+    /// Retained layout work is opt-in for low-level callers. Applications can
+    /// enable it once they also invalidate the Store after mutable Record
+    /// access. The default keeps the historical always-evaluate behavior.
+    retain_frame_work: bool = false,
     maximum_grid_cells: usize = 1_048_576,
     svg: ?custom.SvgServices = null,
     feedback_context: ?*anyopaque = null,
     request_recompose_fn: ?*const fn (*anyopaque, handles.ComponentId) void = null,
+    retained_tracking_store: ?*compose_store.Store = null,
+    retained_tracking_enabled: ?bool = null,
+
+    fn synchronizeRetainedTracking(self: *Engine, nodes: *compose_store.Store) void {
+        if (self.retained_tracking_store) |tracked| {
+            if (tracked == nodes and self.retained_tracking_enabled == self.retain_frame_work) return;
+        }
+        nodes.setRetainedWorkTracking(self.retain_frame_work);
+        self.retained_tracking_store = nodes;
+        self.retained_tracking_enabled = self.retain_frame_work;
+    }
 
     pub fn layout(
         self: *Engine,
@@ -57,6 +72,7 @@ pub const Engine = struct {
         root: handles.NodeId,
         viewport: geometry.Size,
     ) Error!void {
+        self.synchronizeRetainedTracking(nodes);
         if (!validLayoutSize(viewport)) return error.InvalidLayout;
         const constraints: style.Constraints = .{ .minimum = viewport, .maximum = viewport };
         _ = try self.measureNode(nodes, root, constraints);
@@ -70,11 +86,38 @@ pub const Engine = struct {
         id: handles.NodeId,
         constraints: style.Constraints,
     ) Error!geometry.Size {
+        self.synchronizeRetainedTracking(nodes);
         if (!validConstraints(constraints)) return error.InvalidLayout;
         const record = nodes.get(id) orelse return error.InvalidHandle;
+        const store_generation = if (self.retain_frame_work) nodes.retainedWorkGeneration() else 0;
+        if (self.retain_frame_work) {
+            record.measure_cache.prepare(record.subtree_revision, store_generation, self.scale_factor.value);
+            if (record.retention_safe) {
+                if (record.measure_cache.find(
+                    constraints,
+                    record.subtree_revision,
+                    store_generation,
+                    self.scale_factor.value,
+                )) |cached| {
+                    record.measured_baseline = cached.baseline;
+                    return cached.size;
+                }
+            }
+        }
         const node_style = record.borrowedStyle();
         if (node_style.layout.display == .none) {
-            record.layout.baseline = null;
+            record.measured_baseline = null;
+            if (self.retain_frame_work and record.retention_safe) {
+                record.measure_cache.insert(.{
+                    .valid = true,
+                    .revision = record.subtree_revision,
+                    .store_generation = store_generation,
+                    .constraints = constraints,
+                    .scale_factor = self.scale_factor.value,
+                    .size = .zero,
+                    .baseline = null,
+                });
+            }
             return .zero;
         }
 
@@ -119,10 +162,21 @@ pub const Engine = struct {
         intrinsic = applyDeclaredSize(intrinsic, node_style.layout, constraints.maximum);
         const result = constraints.constrain(intrinsic);
         if (!validLayoutSize(result)) return error.InvalidLayout;
-        record.layout.baseline = if (intrinsic_baseline) |baseline|
+        record.measured_baseline = if (intrinsic_baseline) |baseline|
             std.math.clamp(padding.top + baseline, 0, result.height)
         else
             null;
+        if (self.retain_frame_work and record.retention_safe) {
+            record.measure_cache.insert(.{
+                .valid = true,
+                .revision = record.subtree_revision,
+                .store_generation = store_generation,
+                .constraints = constraints,
+                .scale_factor = self.scale_factor.value,
+                .size = result,
+                .baseline = record.measured_baseline,
+            });
+        }
         return result;
     }
 
@@ -189,7 +243,7 @@ pub const Engine = struct {
                 .shrink = child_style.flex_shrink,
                 .alignment = child_style.align_self,
                 .cross_auto = if (horizontal) std.meta.activeTag(child_style.height) == .auto else std.meta.activeTag(child_style.width) == .auto,
-                .baseline = child_record.layout.baseline,
+                .baseline = child_record.measured_baseline,
                 .minimum_main = minimum_main,
                 .maximum_main = maximum_main,
             });
@@ -232,7 +286,7 @@ pub const Engine = struct {
                 var remeasured = try self.measureNode(nodes, child.id, exact);
                 setMainSize(&remeasured, horizontal, allocated_main);
                 child.size = remeasured;
-                child.baseline = (nodes.getConst(child.id) orelse return error.InvalidHandle).layout.baseline;
+                child.baseline = (nodes.getConst(child.id) orelse return error.InvalidHandle).measured_baseline;
             }
             line.* = makeLine(
                 line_children,
@@ -321,7 +375,7 @@ pub const Engine = struct {
             growIntrinsicTracks(node_style.grid_rows, rows, row, row_span, child_size.height + margins.vertical(), node_style.gap.height);
             const alignment = if (child_style.align_self == .auto) node_style.align_items else child_style.align_self;
             if (alignment == .baseline and row_span == 1) {
-                const baseline = child_record.layout.baseline orelse child_size.height;
+                const baseline = child_record.measured_baseline orelse child_size.height;
                 row_baselines[row] = @max(row_baselines[row], margins.top + baseline);
                 row_below_baselines[row] = @max(row_below_baselines[row], margins.bottom + child_size.height - baseline);
             }
@@ -447,6 +501,7 @@ pub const Engine = struct {
         id: handles.NodeId,
         unsnapped_bounds: geometry.Rect,
     ) Error!void {
+        self.synchronizeRetainedTracking(nodes);
         try self.arrangeNodeIn(nodes, id, unsnapped_bounds, null);
     }
 
@@ -459,11 +514,19 @@ pub const Engine = struct {
     ) Error!void {
         if (!validLayoutRect(unsnapped_bounds)) return error.InvalidLayout;
         const record = nodes.get(id) orelse return error.InvalidHandle;
-        const node_style = record.borrowedStyle();
         const bounds = geometry.snapRect(unsnapped_bounds, self.scale_factor, .nearest);
+        const store_generation = if (self.retain_frame_work) nodes.retainedWorkGeneration() else 0;
+        if (self.retain_frame_work and record.retention_safe and
+            record.arrange_cache.valid and
+            record.arrange_cache.revision == record.subtree_revision and
+            record.arrange_cache.store_generation == store_generation and
+            record.arrange_cache.scale_factor == self.scale_factor.value and
+            std.meta.eql(record.arrange_cache.bounds, bounds) and
+            std.meta.eql(record.arrange_cache.measured_baseline, record.measured_baseline)) return;
+        const node_style = record.borrowedStyle();
         const padding = resolveEdges(node_style.layout.padding, bounds.size);
         const content = bounds.inset(padding);
-        const measured_baseline = record.layout.baseline;
+        const measured_baseline = record.measured_baseline;
         record.layout = .{ .bounds = bounds, .content_bounds = content, .scroll_extent = content.size, .baseline = measured_baseline };
 
         switch (record.kind) {
@@ -483,13 +546,35 @@ pub const Engine = struct {
             else => {},
         }
 
-        if (record.children.items.len == 0 or node_style.layout.display == .none) return;
+        if (record.children.items.len == 0 or node_style.layout.display == .none) {
+            if (self.retain_frame_work and record.retention_safe) {
+                record.arrange_cache = .{
+                    .valid = true,
+                    .revision = record.subtree_revision,
+                    .store_generation = store_generation,
+                    .bounds = bounds,
+                    .measured_baseline = measured_baseline,
+                    .scale_factor = self.scale_factor.value,
+                };
+            }
+            return;
+        }
         switch (node_style.layout.display) {
             .none => {},
             .flex => try self.arrangeFlex(nodes, record, content),
             .grid => try self.arrangeGrid(nodes, record, content),
         }
         try self.arrangeAbsoluteChildren(nodes, record, content);
+        if (self.retain_frame_work and record.retention_safe) {
+            record.arrange_cache = .{
+                .valid = true,
+                .revision = record.subtree_revision,
+                .store_generation = store_generation,
+                .bounds = bounds,
+                .measured_baseline = measured_baseline,
+                .scale_factor = self.scale_factor.value,
+            };
+        }
     }
 
     fn arrangeFlex(
@@ -537,7 +622,7 @@ pub const Engine = struct {
                 .shrink = child_style.flex_shrink,
                 .alignment = child_style.align_self,
                 .cross_auto = if (horizontal) std.meta.activeTag(child_style.height) == .auto else std.meta.activeTag(child_style.width) == .auto,
-                .baseline = child_record.layout.baseline,
+                .baseline = child_record.measured_baseline,
                 .minimum_main = minimum_main,
                 .maximum_main = maximum_main,
             });
@@ -583,7 +668,7 @@ pub const Engine = struct {
                 var remeasured = try self.measureNode(nodes, child.id, exact);
                 setMainSize(&remeasured, horizontal, allocated_main);
                 child.size = remeasured;
-                child.baseline = (nodes.getConst(child.id) orelse return error.InvalidHandle).layout.baseline;
+                child.baseline = (nodes.getConst(child.id) orelse return error.InvalidHandle).measured_baseline;
             }
             line.* = makeLine(
                 line_children,
@@ -693,7 +778,7 @@ pub const Engine = struct {
                 size.height = available.height
             else
                 size.height = @min(size.height, available.height);
-            const baseline = child_record.layout.baseline orelse size.height;
+            const baseline = child_record.measured_baseline orelse size.height;
             measured[item_index] = .{
                 .size = size,
                 .alignment = alignment,
@@ -816,6 +901,10 @@ pub const Engine = struct {
         viewport: geometry.Rect,
     ) Error!void {
         if (!validLayoutRect(viewport)) return error.InvalidLayout;
+        if (self.retain_frame_work) {
+            const record = nodes.getConst(root) orelse return error.InvalidHandle;
+            if (record.retention_safe) return;
+        }
         try self.arrangePortalDescendants(nodes, root, viewport);
     }
 
@@ -989,7 +1078,7 @@ fn firstFlowBaseline(
         const child_record = nodes.getConst(child) orelse continue;
         const child_style = child_record.borrowedStyle().layout;
         if (child_style.display == .none or isOutOfFlow(child_style)) continue;
-        const baseline = child_record.layout.baseline orelse continue;
+        const baseline = child_record.measured_baseline orelse continue;
         return resolveEdges(child_style.margin, available).top + baseline;
     }
     return null;

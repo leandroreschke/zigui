@@ -13,6 +13,9 @@ pub const GpuPolicy = struct {
     preferred_adapter: ?u32 = null,
     maximum_gpu_bytes: usize = 512 * 1024 * 1024,
     frames_in_flight: u8 = 3,
+    /// Metal: acquire display drawables off the UI thread and defer frames
+    /// while either the drawable or a GPU frame slot is unavailable.
+    asynchronous_drawables: bool = false,
 
     pub const PowerPreference = enum { low_power, high_performance };
     pub const SoftwareFallback = enum { forbidden, permitted };
@@ -26,6 +29,9 @@ pub const MemoryBudgets = struct {
     /// Live retained-node strings, style arrays, handlers, semantics, and
     /// child storage. Slot-pool metadata is bounded separately by node count.
     retained_tree_bytes: usize = 256 * 1024 * 1024,
+    /// Per-window CPU scene cache, including its metadata and glyph references.
+    /// Zero disables scene retention; exhausted caches draw normally.
+    retained_scene_bytes: usize = 16 * 1024 * 1024,
     /// Maximum temporary occupancy cells used to place one grid container.
     /// This prevents sparse explicit row indices from consuming an unbounded
     /// frame arena even when the retained node count is small.

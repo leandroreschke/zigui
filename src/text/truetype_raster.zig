@@ -246,14 +246,39 @@ fn finitePoint(point: geometry.Point) bool {
 }
 
 fn inside(segments: []const Segment, point: geometry.Point) bool {
-    var crossings: usize = 0;
+    // OpenType contours use the non-zero winding rule.  Even-odd parity
+    // creates artificial holes when a variable glyph contains overlapping
+    // component contours (SF Pro's large A/a are examples).
+    var winding: i32 = 0;
     for (segments) |segment| {
-        const crosses = (segment.a.y > point.y) != (segment.b.y > point.y);
-        if (!crosses) continue;
-        const x = segment.a.x + (point.y - segment.a.y) * (segment.b.x - segment.a.x) / (segment.b.y - segment.a.y);
-        if (x > point.x) crossings += 1;
+        if (segment.a.y <= point.y) {
+            if (segment.b.y <= point.y) continue;
+            const cross = (segment.b.x - segment.a.x) * (point.y - segment.a.y) -
+                (segment.b.y - segment.a.y) * (point.x - segment.a.x);
+            if (cross > 0) winding += 1;
+        } else {
+            if (segment.b.y > point.y) continue;
+            const cross = (segment.b.x - segment.a.x) * (point.y - segment.a.y) -
+                (segment.b.y - segment.a.y) * (point.x - segment.a.x);
+            if (cross < 0) winding -= 1;
+        }
     }
-    return crossings % 2 == 1;
+    return winding != 0;
+}
+
+test "raster fill keeps overlapping same-direction contours" {
+    const segments = [_]Segment{
+        .{ .a = .{ .x = 0, .y = 0 }, .b = .{ .x = 10, .y = 0 } },
+        .{ .a = .{ .x = 10, .y = 0 }, .b = .{ .x = 10, .y = 10 } },
+        .{ .a = .{ .x = 10, .y = 10 }, .b = .{ .x = 0, .y = 10 } },
+        .{ .a = .{ .x = 0, .y = 10 }, .b = .{ .x = 0, .y = 0 } },
+        .{ .a = .{ .x = 2, .y = 2 }, .b = .{ .x = 8, .y = 2 } },
+        .{ .a = .{ .x = 8, .y = 2 }, .b = .{ .x = 8, .y = 8 } },
+        .{ .a = .{ .x = 8, .y = 8 }, .b = .{ .x = 2, .y = 8 } },
+        .{ .a = .{ .x = 2, .y = 8 }, .b = .{ .x = 2, .y = 2 } },
+    };
+    try std.testing.expect(inside(&segments, .{ .x = 4, .y = 4 }));
+    try std.testing.expect(!inside(&segments, .{ .x = 12, .y = 4 }));
 }
 
 fn scaled(point: opentype.OutlinePoint, scale: f32) geometry.Point {

@@ -180,6 +180,8 @@ pub const WindowOptions = struct {
     position: ?geometry.Point = null,
     visible: bool = true,
     decorated: bool = true,
+    /// macOS: extend content behind transparent window controls and hide title text.
+    full_size_content: bool = false,
     resizable: bool = true,
     transparent: bool = false,
     always_on_top: bool = false,

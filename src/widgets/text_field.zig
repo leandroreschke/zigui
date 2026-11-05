@@ -31,6 +31,9 @@ pub const TextField = struct {
         /// A positive logical line height. Null delegates to the text
         /// backend's normal line height, preserving the previous behavior.
         line_height: ?f32 = null,
+        vertical_alignment: enum { top, center } = .top,
+        selection_color: ?geometry.Color = null,
+        focus_border_color: ?geometry.Color = null,
     };
 
     const DisplayText = struct {
@@ -72,6 +75,7 @@ pub const TextField = struct {
     semantic_role: a11y.Role = .text_field,
     theme: *const Theme = &Theme.dark,
     font_size: f32 = 14,
+    font_weight: text_api.FontWeight = .regular,
     multiline: bool = false,
     password: bool = false,
     /// Ordered family fallback list used for both measurement and painting.
@@ -211,7 +215,7 @@ pub const TextField = struct {
                     .background = .{ .solid = self.surfaceColor() },
                     .border = .{
                         .widths = geometry.Insets.all(if (self.focused) self.theme.focus_ring_width else 1),
-                        .color = if (self.focused) self.theme.focus_ring else self.borderColor(),
+                        .color = if (self.focused) self.visual.focus_border_color orelse self.theme.focus_ring else self.borderColor(),
                     },
                     .radii = geometry.CornerRadii.all(self.radius()),
                     .opacity = if (self.disabled) self.theme.disabled_opacity else 1,
@@ -256,13 +260,18 @@ pub const TextField = struct {
         try self.validateState();
         const services = ctx.text orelse return error.TextUnavailable;
         self.text_services = services;
-        const content = bounds.inset(self.contentInsets());
-        self.last_content_bounds = content;
+        var content = bounds.inset(self.contentInsets());
         const display = try self.displayText(ctx.scratch);
         const empty = display.logical.len == 0;
         const shown = if (empty) self.placeholder else display.shown;
         const style = self.textStyle(empty);
         self.last_text_extent = try self.measureExtent(services, shown, style, content.size.width);
+        if (!self.multiline and self.visual.vertical_alignment == .center) {
+            const extra = @max(0, content.size.height - self.last_text_extent.height);
+            content.origin.y += extra * 0.5;
+            content.size.height -= extra;
+        }
+        self.last_content_bounds = content;
         try self.ensureCaretVisible(services, shown, style, display, content.size);
         const text_origin = content.origin.sub(self.scroll_offset);
         const text_bounds: geometry.Rect = .{ .origin = text_origin, .size = content.size };
@@ -281,7 +290,7 @@ pub const TextField = struct {
             try services.selectionRects(shown, style, content.size.width, selection_start, selection_end, &rectangles, ctx.scratch);
             for (rectangles.items) |local| try ctx.quad(.{
                 .bounds = local.translated(text_origin),
-                .background = geometry.Color.rgba(self.theme.accent.r, self.theme.accent.g, self.theme.accent.b, 0.38),
+                .background = self.visual.selection_color orelse geometry.Color.rgba(self.theme.accent.r, self.theme.accent.g, self.theme.accent.b, 0.38),
                 .border_color = .transparent,
                 .border_widths = .{},
                 .radii = .{},
@@ -823,6 +832,7 @@ pub const TextField = struct {
         return .{
             .font_families = self.font_families,
             .font_size = self.font_size,
+            .font_weight = self.font_weight,
             .line_height = self.visual.line_height,
             .color = if (placeholder_text) self.placeholderColor() else self.textColor(),
             .wrap = if (self.multiline) .word else .none,

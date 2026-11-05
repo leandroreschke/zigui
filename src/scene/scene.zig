@@ -460,6 +460,256 @@ pub const Builder = struct {
         }
     }
 
+    /// Replays a complete, balanced scene that was built independently of
+    /// this builder. Every index owned by the source scene is rebased into
+    /// the destination scene; source-root clip and layer references inherit
+    /// the stacks active at the call site.
+    ///
+    /// The source is validated before any destination storage is changed and
+    /// all capacity and budget checks are completed before appending. This is
+    /// important for retained caches: a rejected cache must not leave a
+    /// partially appended frame behind.
+    pub fn appendRetained(self: *Builder, source: *const Scene) Error!void {
+        if (@intFromPtr(source) == @intFromPtr(self.scene)) return error.InvalidScene;
+        try validate(source.view());
+        for (source.custom_passes.items) |pass| {
+            const extension = handles.RenderExtensionId{
+                .index = @truncate(pass.extension),
+                .generation = @truncate(pass.extension >> 32),
+            };
+            if (!extension.isValid()) return error.InvalidScene;
+        }
+
+        const inherited_clip = self.currentClip();
+        const inherited_layer = self.currentLayer();
+        const bases = RetainedBases{
+            .materials = self.scene.materials.items.len,
+            .gradient_stops = self.scene.gradient_stops.items.len,
+            .clips = self.scene.clips.items.len,
+            .layers = self.scene.layers.items.len,
+            .shadows = self.scene.shadows.items.len,
+            .quads = self.scene.quads.items.len,
+            .paths = self.scene.paths.items.len,
+            .path_vertices = self.scene.path_vertices.items.len,
+            .underlines = self.scene.underlines.items.len,
+            .monochrome_sprites = self.scene.monochrome_sprites.items.len,
+            .color_sprites = self.scene.color_sprites.items.len,
+            .external_surfaces = self.scene.external_surfaces.items.len,
+            .custom_passes = self.scene.custom_passes.items.len,
+            .custom_payload = self.scene.custom_payload.items.len,
+            .backdrop_effects = self.scene.backdrop_effects.items.len,
+        };
+
+        // A Scene's public view does not include native media placements. They
+        // still participate in cache ownership and must retain Builder's
+        // duplicate-ID and positive-bounds invariants when copied.
+        try validateNativeMedia(source.native_media_placements.items);
+        try validateNativeMedia(self.scene.native_media_placements.items);
+        for (source.native_media_placements.items) |placement| {
+            for (self.scene.native_media_placements.items) |existing| {
+                if (placement.id.eql(existing.id)) return error.InvalidScene;
+            }
+        }
+        try self.ensure(source.native_media_placements.items.len, 0, self.limits.native_media_placements);
+        try self.ensure(self.scene.native_media_placements.items.len, source.native_media_placements.items.len, self.limits.native_media_placements);
+
+        try self.ensure(self.scene.materials.items.len, source.materials.items.len, self.limits.materials);
+        try self.ensure(self.scene.gradient_stops.items.len, source.gradient_stops.items.len, self.limits.gradient_stops);
+        try self.ensure(self.scene.clips.items.len, source.clips.items.len, self.limits.clips);
+        try self.ensure(self.scene.layers.items.len, source.layers.items.len, self.limits.layers);
+        try self.ensure(self.scene.shadows.items.len, source.shadows.items.len, self.limits.primitives);
+        try self.ensure(self.scene.quads.items.len, source.quads.items.len, self.limits.primitives);
+        try self.ensure(self.scene.paths.items.len, source.paths.items.len, self.limits.primitives);
+        try self.ensure(self.scene.path_vertices.items.len, source.path_vertices.items.len, self.limits.path_vertices);
+        try self.ensure(self.scene.underlines.items.len, source.underlines.items.len, self.limits.primitives);
+        try self.ensure(self.scene.monochrome_sprites.items.len, source.monochrome_sprites.items.len, self.limits.primitives);
+        try self.ensure(self.scene.color_sprites.items.len, source.color_sprites.items.len, self.limits.primitives);
+        try self.ensure(self.scene.external_surfaces.items.len, source.external_surfaces.items.len, self.limits.primitives);
+        try self.ensure(self.scene.custom_passes.items.len, source.custom_passes.items.len, self.limits.custom_passes);
+        try self.ensure(self.scene.custom_payload.items.len, source.custom_payload.items.len, self.limits.custom_payload_bytes);
+        try self.ensure(self.scene.backdrop_effects.items.len, source.backdrop_effects.items.len, self.limits.backdrop_effects);
+
+        var additional_primitives: usize = 0;
+        var additional_operations: usize = 0;
+        var simulated_previous: ?abi.Operation = if (self.scene.operations.items.len == 0)
+            null
+        else
+            self.scene.operations.items[self.scene.operations.items.len - 1];
+        for (source.operations.items) |source_operation| {
+            if (source_operation.target != self.target) return error.InvalidScene;
+            const operation = try self.remapRetainedOperation(source_operation, bases, inherited_clip, inherited_layer);
+            if (isPrimitive(std.enums.fromInt(abi.OperationKind, source_operation.kind) orelse return error.InvalidScene)) {
+                additional_primitives = std.math.add(usize, additional_primitives, source_operation.count) catch return error.BudgetExceeded;
+            }
+            if (simulated_previous) |previous| {
+                if (canMerge(previous, operation)) {
+                    var merged = previous;
+                    merged.count = std.math.add(u32, merged.count, operation.count) catch return error.BudgetExceeded;
+                    simulated_previous = merged;
+                    continue;
+                }
+            }
+            additional_operations = std.math.add(usize, additional_operations, 1) catch return error.BudgetExceeded;
+            simulated_previous = operation;
+        }
+        try self.ensure(self.primitive_count, additional_primitives, self.limits.primitives);
+        try self.ensure(self.scene.operations.items.len, additional_operations, self.limits.operations);
+
+        // The source is balanced, but its maximum depth must fit on top of
+        // the inherited stacks. The normal push APIs cap each stack at 63.
+        var clip_depth = self.clip_stack.items.len;
+        var layer_depth = self.layer_stack.items.len;
+        var max_clip_depth = clip_depth;
+        var max_layer_depth = layer_depth;
+        for (source.operations.items) |source_operation| {
+            switch (std.enums.fromInt(abi.OperationKind, source_operation.kind) orelse return error.InvalidScene) {
+                .push_clip => {
+                    clip_depth += 1;
+                    max_clip_depth = @max(max_clip_depth, clip_depth);
+                },
+                .pop_clip => clip_depth -= 1,
+                .push_layer => {
+                    layer_depth += 1;
+                    max_layer_depth = @max(max_layer_depth, layer_depth);
+                },
+                .pop_layer => layer_depth -= 1,
+                else => {},
+            }
+        }
+        if (clip_depth != self.clip_stack.items.len or layer_depth != self.layer_stack.items.len or
+            max_clip_depth > 63 or max_layer_depth > 63)
+            return error.InvalidScene;
+
+        try self.scene.operations.ensureUnusedCapacity(self.scene.allocator, additional_operations);
+        try self.scene.materials.ensureUnusedCapacity(self.scene.allocator, source.materials.items.len);
+        try self.scene.gradient_stops.ensureUnusedCapacity(self.scene.allocator, source.gradient_stops.items.len);
+        try self.scene.clips.ensureUnusedCapacity(self.scene.allocator, source.clips.items.len);
+        try self.scene.layers.ensureUnusedCapacity(self.scene.allocator, source.layers.items.len);
+        try self.scene.shadows.ensureUnusedCapacity(self.scene.allocator, source.shadows.items.len);
+        try self.scene.quads.ensureUnusedCapacity(self.scene.allocator, source.quads.items.len);
+        try self.scene.paths.ensureUnusedCapacity(self.scene.allocator, source.paths.items.len);
+        try self.scene.path_vertices.ensureUnusedCapacity(self.scene.allocator, source.path_vertices.items.len);
+        try self.scene.underlines.ensureUnusedCapacity(self.scene.allocator, source.underlines.items.len);
+        try self.scene.monochrome_sprites.ensureUnusedCapacity(self.scene.allocator, source.monochrome_sprites.items.len);
+        try self.scene.color_sprites.ensureUnusedCapacity(self.scene.allocator, source.color_sprites.items.len);
+        try self.scene.external_surfaces.ensureUnusedCapacity(self.scene.allocator, source.external_surfaces.items.len);
+        try self.scene.custom_passes.ensureUnusedCapacity(self.scene.allocator, source.custom_passes.items.len);
+        try self.scene.custom_payload.ensureUnusedCapacity(self.scene.allocator, source.custom_payload.items.len);
+        try self.scene.backdrop_effects.ensureUnusedCapacity(self.scene.allocator, source.backdrop_effects.items.len);
+        try self.scene.native_media_placements.ensureUnusedCapacity(self.scene.allocator, source.native_media_placements.items.len);
+        try self.clip_stack.ensureUnusedCapacity(self.scene.allocator, max_clip_depth - self.clip_stack.items.len);
+        try self.layer_stack.ensureUnusedCapacity(self.scene.allocator, max_layer_depth - self.layer_stack.items.len);
+
+        for (source.gradient_stops.items) |stop| self.scene.gradient_stops.appendAssumeCapacity(stop);
+        for (source.materials.items) |source_material| {
+            var material = source_material;
+            const kind = std.enums.fromInt(abi.MaterialKind, material.kind) orelse unreachable;
+            if (kind == .linear_gradient or kind == .radial_gradient)
+                material.stop_start = @intCast(bases.gradient_stops + @as(usize, source_material.stop_start));
+            self.scene.materials.appendAssumeCapacity(material);
+        }
+        for (source.clips.items) |source_clip| {
+            var clip = source_clip;
+            clip.parent = try remapRetainedIndex(source_clip.parent, bases.clips, inherited_clip);
+            clip.layer = try remapRetainedIndex(source_clip.layer, bases.layers, inherited_layer);
+            self.scene.clips.appendAssumeCapacity(clip);
+        }
+        for (source.layers.items) |source_layer| {
+            var layer = source_layer;
+            layer.parent = try remapRetainedIndex(source_layer.parent, bases.layers, inherited_layer);
+            self.scene.layers.appendAssumeCapacity(layer);
+        }
+        for (source.shadows.items) |value| self.scene.shadows.appendAssumeCapacity(value);
+        for (source.quads.items) |value| self.scene.quads.appendAssumeCapacity(value);
+        for (source.paths.items) |source_path| {
+            var value = source_path;
+            value.vertex_start = @intCast(bases.path_vertices + @as(usize, source_path.vertex_start));
+            self.scene.paths.appendAssumeCapacity(value);
+        }
+        for (source.path_vertices.items) |value| self.scene.path_vertices.appendAssumeCapacity(value);
+        for (source.underlines.items) |value| self.scene.underlines.appendAssumeCapacity(value);
+        for (source.monochrome_sprites.items) |value| self.scene.monochrome_sprites.appendAssumeCapacity(value);
+        for (source.color_sprites.items) |value| self.scene.color_sprites.appendAssumeCapacity(value);
+        for (source.external_surfaces.items) |value| self.scene.external_surfaces.appendAssumeCapacity(value);
+        for (source.custom_payload.items) |value| self.scene.custom_payload.appendAssumeCapacity(value);
+        for (source.custom_passes.items) |source_pass| {
+            var value = source_pass;
+            value.payload_start = @intCast(bases.custom_payload + @as(usize, source_pass.payload_start));
+            self.scene.custom_passes.appendAssumeCapacity(value);
+        }
+        for (source.backdrop_effects.items) |value| self.scene.backdrop_effects.appendAssumeCapacity(value);
+        for (source.native_media_placements.items) |value| self.scene.native_media_placements.appendAssumeCapacity(value);
+
+        for (source.operations.items) |source_operation| {
+            const operation = self.remapRetainedOperation(source_operation, bases, inherited_clip, inherited_layer) catch unreachable;
+            self.commitRetainedOperation(operation);
+            switch (std.enums.fromInt(abi.OperationKind, source_operation.kind) orelse unreachable) {
+                .push_clip => self.clip_stack.appendAssumeCapacity(operation.start),
+                .pop_clip => _ = self.clip_stack.pop(),
+                .push_layer => self.layer_stack.appendAssumeCapacity(operation.start),
+                .pop_layer => _ = self.layer_stack.pop(),
+                else => {},
+            }
+        }
+    }
+
+    const RetainedBases = struct {
+        materials: usize,
+        gradient_stops: usize,
+        clips: usize,
+        layers: usize,
+        shadows: usize,
+        quads: usize,
+        paths: usize,
+        path_vertices: usize,
+        underlines: usize,
+        monochrome_sprites: usize,
+        color_sprites: usize,
+        external_surfaces: usize,
+        custom_passes: usize,
+        custom_payload: usize,
+        backdrop_effects: usize,
+    };
+
+    fn remapRetainedOperation(
+        _: *const Builder,
+        source: abi.Operation,
+        bases: RetainedBases,
+        inherited_clip: u32,
+        inherited_layer: u32,
+    ) Error!abi.Operation {
+        const kind = std.enums.fromInt(abi.OperationKind, source.kind) orelse return error.InvalidScene;
+        const start_base = switch (kind) {
+            .push_clip, .pop_clip => bases.clips,
+            .push_layer, .pop_layer => bases.layers,
+            .shadows => bases.shadows,
+            .quads => bases.quads,
+            .paths => bases.paths,
+            .underlines => bases.underlines,
+            .monochrome_sprites => bases.monochrome_sprites,
+            .color_sprites => bases.color_sprites,
+            .external_surfaces => bases.external_surfaces,
+            .custom_passes => bases.custom_passes,
+            .backdrop_effect => bases.backdrop_effects,
+        };
+        var result = source;
+        result.start = try remapRetainedIndex(source.start, start_base, none_index);
+        result.clip = try remapRetainedIndex(source.clip, bases.clips, inherited_clip);
+        result.layer = try remapRetainedIndex(source.layer, bases.layers, inherited_layer);
+        result.material = try remapRetainedIndex(source.material, bases.materials, none_index);
+        return result;
+    }
+
+    fn commitRetainedOperation(self: *Builder, operation: abi.Operation) void {
+        const kind = std.enums.fromInt(abi.OperationKind, operation.kind) orelse unreachable;
+        if (self.scene.operations.items.len != 0 and canMerge(self.scene.operations.items[self.scene.operations.items.len - 1], operation)) {
+            self.scene.operations.items[self.scene.operations.items.len - 1].count += operation.count;
+        } else {
+            self.scene.operations.appendAssumeCapacity(operation);
+        }
+        if (isPrimitive(kind)) self.primitive_count += operation.count;
+    }
+
     fn currentClip(self: *const Builder) u32 {
         return if (self.clip_stack.items.len == 0) none_index else self.clip_stack.items[self.clip_stack.items.len - 1];
     }
@@ -730,6 +980,9 @@ fn validateSprite(sprite: abi.Sprite) Error!void {
     if (!validRect(sprite.bounds) or !validRect(sprite.uv_bounds) or !finiteColor(sprite.color) or
         sprite.texture == 0 or sprite.tile_generation == 0) return error.InvalidScene;
     _ = std.enums.fromInt(abi.TextureFormat, sprite.format) orelse return error.InvalidScene;
+    if (!std.math.isFinite(sprite.effect_radius) or sprite.effect_radius < 0 or sprite.effect_radius > 32 or
+        !std.math.isFinite(sprite.effect_height) or sprite.effect_height < 0 or
+        (sprite.effect != .none and sprite.effect_height <= 0)) return error.InvalidScene;
 }
 
 fn finitePoint(value: geometry.Point) bool {
@@ -857,6 +1110,30 @@ fn isMergeable(kind: abi.OperationKind) bool {
         .shadows, .quads, .paths, .underlines, .monochrome_sprites, .color_sprites, .external_surfaces => true,
         else => false,
     };
+}
+
+fn remapRetainedIndex(index: u32, base: usize, inherited: u32) Error!u32 {
+    if (index == none_index) return inherited;
+    const result = std.math.add(usize, base, index) catch return error.BudgetExceeded;
+    if (result > std.math.maxInt(u32)) return error.BudgetExceeded;
+    return @intCast(result);
+}
+
+fn canMerge(previous: abi.Operation, next: abi.Operation) bool {
+    const kind = std.enums.fromInt(abi.OperationKind, next.kind) orelse return false;
+    if (!isMergeable(kind) or previous.kind != next.kind) return false;
+    const contiguous = std.math.add(u32, previous.start, previous.count) catch return false;
+    return contiguous == next.start and previous.clip == next.clip and previous.layer == next.layer and
+        previous.material == next.material and previous.target == next.target and previous.reserved == next.reserved;
+}
+
+fn validateNativeMedia(placements: []const native_media.Placement) Error!void {
+    for (placements, 0..) |placement, index| {
+        if (!placement.id.isValid() or !validRect(placement.bounds) or
+            placement.bounds.size.width <= 0 or placement.bounds.size.height <= 0)
+            return error.InvalidScene;
+        for (placements[0..index]) |previous| if (placement.id.eql(previous.id)) return error.InvalidScene;
+    }
 }
 
 fn isPrimitive(kind: abi.OperationKind) bool {

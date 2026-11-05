@@ -19,3 +19,8 @@ Standards tables and registry facts are data, not executable third-party
 libraries. Their applicable upstream notices must accompany a distributed
 source release even though they do not change ZigUI's zero-dependency runtime
 or build closure.
+
+Retained-rendering tests and benchmarks embed `tests/fixtures/Abel-Regular.ttf`
+from the [Google Fonts Abel distribution](https://github.com/google/fonts/tree/main/ofl/abel).
+It is test data under the SIL Open Font License 1.1; the accompanying notice is
+`tests/fixtures/Abel-OFL.txt`. Framework and application builds do not embed it.

@@ -334,6 +334,8 @@ pub const Renderer = struct {
         return self.vtable.device_generation(self.context);
     }
 
+    /// FrameNotReady is transient backpressure: preserve invalidations and
+    /// retry on a later display tick without consuming a frame token.
     pub fn beginFrame(self: Renderer, descriptor: FrameDescriptor) Error!FrameToken {
         try validateFrameDescriptor(descriptor);
         const result = try self.vtable.begin_frame(self.context, descriptor);
